@@ -1,0 +1,119 @@
+{
+  "document": {
+    "title": "PaperLens synthetic fixture explanation",
+    "sections": [
+      {
+        "section_id": "research_question",
+        "heading": "Research question",
+        "sentences": [
+          {
+            "sentence_id": "s-001",
+            "text": "The fixture identifies the first page as page one."
+          }
+        ]
+      },
+      {
+        "section_id": "methods",
+        "heading": "Methods and data",
+        "sentences": [
+          {
+            "sentence_id": "s-002",
+            "text": "The first page states that its text is synthetic and contains no private paper content."
+          }
+        ]
+      },
+      {
+        "section_id": "results",
+        "heading": "Main result",
+        "sentences": [
+          {
+            "sentence_id": "s-003",
+            "text": "The fixture identifies the second page as page two."
+          }
+        ]
+      },
+      {
+        "section_id": "limitations",
+        "heading": "Limitation",
+        "sentences": [
+          {
+            "sentence_id": "s-004",
+            "text": "The second page is used for zero-based page mapping."
+          }
+        ]
+      },
+      {
+        "section_id": "plain_explanation",
+        "heading": "Plain explanation",
+        "sentences": [
+          {
+            "sentence_id": "s-005",
+            "text": "In plain terms, this is a short synthetic PDF for parser tests."
+          }
+        ]
+      }
+    ]
+  },
+  "claims": [
+    {
+      "claim_id": "c-001",
+      "sentence_id": "s-001",
+      "text": "The fixture identifies the first page as page one.",
+      "claim_type": "background",
+      "importance": "critical",
+      "qualifiers": ["first page"],
+      "numeric_entities": [],
+      "auditability": "auditable",
+      "candidate_block_ids": ["p01-b001"],
+      "candidate_quote": "PaperLens fixture - page one"
+    },
+    {
+      "claim_id": "c-002",
+      "sentence_id": "s-002",
+      "text": "The first page states that its text is synthetic and contains no private paper content.",
+      "claim_type": "method",
+      "importance": "critical",
+      "qualifiers": ["first page"],
+      "numeric_entities": [],
+      "auditability": "auditable",
+      "candidate_block_ids": ["p01-b002"],
+      "candidate_quote": "Synthetic test text. No private paper content."
+    },
+    {
+      "claim_id": "c-003",
+      "sentence_id": "s-003",
+      "text": "The fixture identifies the second page as page two.",
+      "claim_type": "result",
+      "importance": "noncritical",
+      "qualifiers": ["second page"],
+      "numeric_entities": [],
+      "auditability": "needs_review",
+      "candidate_block_ids": ["p02-b001"],
+      "candidate_quote": "PaperLens fixture - page two"
+    },
+    {
+      "claim_id": "c-004",
+      "sentence_id": "s-004",
+      "text": "The second page is used for zero-based page mapping.",
+      "claim_type": "limitation",
+      "importance": "critical",
+      "qualifiers": ["second page", "zero-based"],
+      "numeric_entities": [],
+      "auditability": "auditable",
+      "candidate_block_ids": ["p02-b002"],
+      "candidate_quote": "Second synthetic page for zero-based mapping."
+    },
+    {
+      "claim_id": "c-005",
+      "sentence_id": "s-005",
+      "text": "In plain terms, this is a short synthetic PDF for parser tests.",
+      "claim_type": "explanation",
+      "importance": "noncritical",
+      "qualifiers": [],
+      "numeric_entities": [],
+      "auditability": "non_auditable",
+      "candidate_block_ids": [],
+      "candidate_quote": null
+    }
+  ]
+}

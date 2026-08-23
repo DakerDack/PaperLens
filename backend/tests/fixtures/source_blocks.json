@@ -1,0 +1,42 @@
+[
+  {
+    "block_id": "p01-b001",
+    "page_index": 0,
+    "type": "title",
+    "text": "PaperLens fixture - page one",
+    "bbox": [0.112, 0.074, 0.415, 0.097],
+    "reading_order": 0,
+    "parser": "mineru",
+    "parser_version": "3.4.5"
+  },
+  {
+    "block_id": "p01-b002",
+    "page_index": 0,
+    "type": "text",
+    "text": "Synthetic test text. No private paper content.",
+    "bbox": [0.112, 0.108, 0.441, 0.126],
+    "reading_order": 1,
+    "parser": "mineru",
+    "parser_version": "3.4.5"
+  },
+  {
+    "block_id": "p02-b001",
+    "page_index": 1,
+    "type": "title",
+    "text": "PaperLens fixture - page two",
+    "bbox": [0.112, 0.074, 0.413, 0.095],
+    "reading_order": 2,
+    "parser": "mineru",
+    "parser_version": "3.4.5"
+  },
+  {
+    "block_id": "p02-b002",
+    "page_index": 1,
+    "type": "text",
+    "text": "Second synthetic page for zero-based mapping.",
+    "bbox": [0.112, 0.108, 0.465, 0.126],
+    "reading_order": 3,
+    "parser": "mineru",
+    "parser_version": "3.4.5"
+  }
+]

@@ -1,0 +1,21 @@
+[
+  {
+    "claim_id": "c-001",
+    "block_id": "p01-b001",
+    "relation": "supports",
+    "scope_status": "preserved",
+    "terminology_status": "correct",
+    "severity": "none",
+    "reason": "证据直接说明了研究问题。"
+  },
+  {
+    "claim_id": "c-002",
+    "block_id": "p02-b001",
+    "relation": "supports",
+    "scope_status": "preserved",
+    "terminology_status": "correct",
+    "severity": "none",
+    "reason": "样本数量与原文一致。"
+  }
+]
+

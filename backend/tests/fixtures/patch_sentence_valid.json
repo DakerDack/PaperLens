@@ -1,0 +1,13 @@
+{
+  "patch_id": "patch-001",
+  "base_version": 1,
+  "scope": "sentence",
+  "target_sentence_ids": ["s-001"],
+  "before_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "before_text": "该研究考察一个问题。",
+  "after_text": "该研究考察结构化阅读提示是否帮助学生识别研究限制。",
+  "reason": "补充研究问题的具体对象。",
+  "fact_changed": false,
+  "evidence_changed": false
+}
+

@@ -1,0 +1,104 @@
+:root {
+  color: #18201c;
+  background: #f4f6f5;
+  font-family:
+    Inter, "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+.app-shell {
+  width: min(100% - 32px, 1120px);
+  margin: 0 auto;
+  padding: 24px 0;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 64px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #ccd4cf;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 24px;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+
+.app-header p,
+.status-panel p {
+  margin: 4px 0 0;
+  color: #58635d;
+  font-size: 14px;
+}
+
+.mode-badge {
+  min-width: 56px;
+  padding: 5px 8px;
+  border: 1px solid #9b7a28;
+  border-radius: 4px;
+  color: #6a5013;
+  background: #fff8df;
+  font-size: 12px;
+  text-align: center;
+}
+
+.status-panel {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 72px;
+  margin-top: 24px;
+  padding: 16px;
+  border: 1px solid #ccd4cf;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.status-dot {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #8a938e;
+}
+
+.status-dot--ready {
+  background: #247a4d;
+}
+
+.status-dot--unavailable {
+  background: #b33a32;
+}
+
+@media (max-width: 600px) {
+  .app-shell {
+    width: min(100% - 24px, 1120px);
+    padding-top: 16px;
+  }
+
+  .app-header {
+    align-items: flex-start;
+  }
+}
+

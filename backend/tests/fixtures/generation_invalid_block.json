@@ -1,0 +1,47 @@
+{
+  "document": {
+    "title": "面向本科生的论文解读",
+    "sections": [
+      {
+        "section_id": "research_question",
+        "heading": "研究问题",
+        "sentences": [{"sentence_id": "s-001", "text": "该研究考察一个问题。"}]
+      },
+      {
+        "section_id": "methods",
+        "heading": "方法与数据",
+        "sentences": [{"sentence_id": "s-002", "text": "研究使用本科生样本。"}]
+      },
+      {
+        "section_id": "results",
+        "heading": "主要结果",
+        "sentences": [{"sentence_id": "s-003", "text": "研究报告了一项结果。"}]
+      },
+      {
+        "section_id": "limitations",
+        "heading": "限制条件",
+        "sentences": [{"sentence_id": "s-004", "text": "研究存在场景限制。"}]
+      },
+      {
+        "section_id": "plain_explanation",
+        "heading": "通俗解释",
+        "sentences": [{"sentence_id": "s-005", "text": "该研究需要谨慎理解。"}]
+      }
+    ]
+  },
+  "claims": [
+    {
+      "claim_id": "c-001",
+      "sentence_id": "s-001",
+      "text": "该研究考察一个问题。",
+      "claim_type": "background",
+      "importance": "critical",
+      "qualifiers": [],
+      "numeric_entities": [],
+      "auditability": "auditable",
+      "candidate_block_ids": ["p99-b999"],
+      "candidate_quote": "不存在的来源"
+    }
+  ]
+}
+
