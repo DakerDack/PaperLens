@@ -22,7 +22,7 @@
 1. 将工作目录设为 D:\Hy3。
 2. 阅读 AGENTS.md、docs/DEV_PLAN.md 的第 2、3、5、7、8.1、9、10、12 节，以及现有 models.py、settings.py 和相关测试。
 3. 运行 `.venv313\Scripts\python.exe -m pytest backend/tests -q -p no:cacheprovider`，确认阶段 0 未回归。
-4. 检查当前 Python、MinerU、pdfplumber 版本和实际文件状态。涉及 MinerU 当前安装方式和 CLI 参数时，先查官方最新文档，不凭记忆猜版本。
+4. 检查当前 Python、`./.venv-mineru312/Scripts/mineru.exe`、pdfplumber 版本和实际文件状态。涉及 MinerU 当前安装方式和 CLI 参数时，先查官方最新文档，不凭记忆猜版本。
 5. 先给出阶段任务清单；随后逐个完成原子任务。除非需要用户安装软件、确认外部决策或提供权限，不要只给方案而不实施。
 
 每次编辑前必须先输出：本次唯一目标、最多 4 个允许修改文件、禁止修改范围、固定输入输出与错误码、精确验证命令。先补失败测试，再写最小实现；完成一个原子任务后先跑针对性测试，再跑阶段回归测试。
@@ -44,8 +44,8 @@
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath "D:\Hy3"
 $Python = (Resolve-Path ".\.venv313\Scripts\python.exe").Path
-$MinerU = Get-Command "mineru" -ErrorAction Stop
-& $MinerU.Source --version
+$MinerU = (Resolve-Path ".\.venv-mineru312\Scripts\mineru.exe").Path
+& $MinerU -v
 if ($LASTEXITCODE -ne 0) { throw "MinerU version check failed: $LASTEXITCODE" }
 & $Python -m pytest "backend/tests/test_document_service.py" -q -p no:cacheprovider
 if ($LASTEXITCODE -ne 0) { throw "Stage 1 focused tests failed: $LASTEXITCODE" }
@@ -64,9 +64,11 @@ if ($LASTEXITCODE -ne 0) { throw "Stage 1 regression tests failed: $LASTEXITCODE
 
 项目定位：PaperLens 是基于 Hy3 的可信学术解读、主张级证据审计与受约束修订工具。工程必须保持扁平、简单、可测；不得增加多 Agent、向量数据库、队列、微服务或计划外功能。Hy3 只能生成五区解读、候选主张、语义判断和修订建议，不能成为页码、bbox、已验证引文、分数或合格结论的事实来源。请使用中文并清楚区分 Mock、Live、设计完成和真实验证。
 
+已知工程基线：阶段 1 已完成；MinerU 使用 `./.venv-mineru312/Scripts/mineru.exe`；应用 Python 依赖由根目录 `requirements.lock` 锁定。不要把这些结论直接当成当前事实，先检查工作区、CLI、锁文件和测试。
+
 开始时必须：
 1. 将工作目录设为 D:\Hy3，阅读 AGENTS.md、DEV_PLAN 第 2、4、5、6、7、8.2、9、10、12 节，以及现有 models.py、settings.py、document_service.py 和测试。
-2. 复核阶段 1 的代码和测试；运行 `.venv313\Scripts\python.exe -m pytest backend/tests/test_document_service.py backend/tests/test_models.py -q -p no:cacheprovider`。未通过则先停止并说明，不能在阶段 2 偷修无关模块。
+2. 复核阶段 1 的代码和测试；运行 `.venv313\Scripts\python.exe -m pip check`，确认 `requirements.lock` 与 `.venv313\Scripts\python.exe -m pip freeze --exclude-editable` 一致，并运行 `.venv313\Scripts\python.exe -m pytest backend/tests/test_document_service.py backend/tests/test_models.py -q -p no:cacheprovider`。未通过则先停止并说明，不能在阶段 2 偷修无关模块。
 3. 检查 `.env` 和 HY3_API_KEY 是否存在时只能判断“已配置/未配置”，绝不打印、记录或提交 Key。
 4. TokenHub 和 Hy3 接口可能变化，先查腾讯云官方当前文档，核对 base URL、模型 ID、/v1/models、json_schema 和请求参数，并在报告中给出官方来源。
 5. 先列出阶段任务，再逐个完成原子任务；每次编辑前输出唯一目标、最多 4 个文件、禁止范围、固定契约/错误码和验证命令。

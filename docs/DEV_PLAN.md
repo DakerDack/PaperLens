@@ -96,7 +96,7 @@ PAPERLENS_ENV=development
 PAPERLENS_DATA_DIR=./data
 PAPERLENS_MODEL_MODE=mock
 MAX_PDF_MB=30
-MINERU_COMMAND=mineru
+MINERU_COMMAND=./.venv-mineru312/Scripts/mineru.exe
 MINERU_BACKEND=pipeline
 MINERU_TIMEOUT_SECONDS=300
 HY3_BASE_URL=https://tokenhub.tencentmaas.com/v1
@@ -111,7 +111,8 @@ HY3_MAX_RETRIES=2
 - `HY3_API_KEY` 不提供默认值，不进入前端和测试快照。
 - `PAPERLENS_MODEL_MODE` 只允许 `mock/live`。
 - 最终真实演示必须显式设为 `live`；测试默认显式注入 `mock`。
-- 路径由 `settings.py` 解析为绝对路径并验证位于项目数据目录内。
+- `PAPERLENS_DATA_DIR` 由 `settings.py` 解析为绝对路径并验证位于项目数据目录内。
+- `MINERU_COMMAND` 默认指向仓库内 `./.venv-mineru312/Scripts/mineru.exe`；相对路径由 `settings.py` 按项目根目录解析。
 
 ### 2.3 最小依赖清单
 
@@ -130,6 +131,8 @@ rank-bm25
 
 开发依赖只包含 `pytest` 和 FastAPI TestClient 所需的 `httpx`。MinerU 体积较大，按官方方式单独安装并由 CLI 适配，不作为应用包的普通依赖自动下载。
 
+应用 Python 环境的完整锁定结果保存在根目录 `requirements.lock`，并且只能由 `.venv313\Scripts\python.exe -m pip freeze --exclude-editable` 的实际输出生成。锁文件使用 UTF-8 无 BOM，不得包含 editable 项目、`file:///`、本机绝对路径或任何密钥。MinerU 独立环境不写入该锁文件，其安装版本和重建命令单独记录在 README。
+
 前端运行依赖只包含 `react`、`react-dom`、`pdfjs-dist` 和 `lucide-react`；开发依赖使用 Vite、TypeScript、Vitest、Testing Library 与 Playwright。状态由 React 自带能力管理，不增加 Redux、MobX、Zustand 或第二套请求库。
 
 初始化后必须提交 Python 和 npm 锁定结果。若某个包只是为了一个很短的工具函数而引入，应改用标准库或本地函数。
@@ -142,6 +145,7 @@ paperlens/
 ├─ LICENSE
 ├─ .env.example
 ├─ pyproject.toml
+├─ requirements.lock
 ├─ AGENTS.md
 ├─ frontend/
 │  ├─ package.json
@@ -535,7 +539,7 @@ user_instruction: {{user_instruction}}
 
 任务：
 
-1. 检查 `python --version`、`node --version`、`npm --version` 和 `mineru --version`。
+1. 检查 `python --version`、`node --version`、`npm --version` 和 `.\.venv-mineru312\Scripts\mineru.exe -v`。
 2. 初始化 FastAPI 和 React/Vite，但不写业务界面。
 3. 实现第 5 章的 Pydantic 模型和对应 TypeScript 类型。
 4. 建立统一错误响应：`{"error_code":"...","message":"...","retryable":false}`。
@@ -562,7 +566,7 @@ npm run build
 
 任务：
 
-1. 使用参数数组调用 MinerU CLI，不拼接 shell 字符串。
+1. 使用参数数组调用 `./.venv-mineru312/Scripts/mineru.exe`，不拼接 shell 字符串。
 2. 每次解析使用独立临时目录，设置超时并捕获退出码和 stderr 摘要。
 3. 将 MinerU 输出转换为 `SourceBlock[]`，统一页码、阅读顺序和可空 bbox。
 4. 实现文本型 PDF 的 pdfplumber 降级。
@@ -921,6 +925,7 @@ AI 必须先输出以下五项，再允许编辑代码：
 - Mock 与 Live 的差异被明确标记。
 - 界面存在等待、失败和证据不足状态。
 - 没有新增未经批准的依赖、目录和功能。
+- `requirements.lock` 与应用环境的非 editable `pip freeze` 一致，且不含本机路径或密钥。
 - README 中有真实可执行的安装、运行和验证命令。
 
 PaperLens 的工程目标不是堆叠模块，而是用最少的稳定组件完成“解析、生成、核验、审计、修改、复核、回退和评测”闭环。任何不能提高这条闭环可靠性或可验证性的功能，都不进入 V1.0。
