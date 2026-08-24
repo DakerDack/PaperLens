@@ -42,8 +42,16 @@ def valid_risk_findings_payload() -> list[dict[str, object]]:
             "category": category,
             "status": "not_detected",
             "locations": [],
-            "reason": "No risk was detected.",
-            "remediation": "No change is required.",
+            "reason": (
+                "No sensitive-content risk was detected."
+                if category == "sensitive_information"
+                else "No risk was detected."
+            ),
+            "remediation": (
+                "No sensitive-content remediation is required."
+                if category == "sensitive_information"
+                else "No change is required."
+            ),
         }
         for category in (
             "sensitive_information",
@@ -62,25 +70,26 @@ def valid_risk_assessment_payload(*, level_points: int = 4) -> dict[str, object]
 
 
 def valid_dimensions_payload(*, risk_level_points: int = 4) -> list[dict[str, object]]:
-    return [
-        {
+    dimensions: list[dict[str, object]] = []
+    for dimension_id in DimensionId:
+        level_points = (
+            risk_level_points
+            if dimension_id == DimensionId.RISK_COMPLIANCE
+            else 4
+        )
+        dimensions.append({
             "dimension_id": dimension_id.value,
-            "raw_metrics": {
-                "level_points": (
-                    risk_level_points
-                    if dimension_id == DimensionId.RISK_COMPLIANCE
-                    else 4
-                )
-            },
-            "score": (
-                risk_level_points * 25.0
-                if dimension_id == DimensionId.RISK_COMPLIANCE
-                else 100.0
+            "raw_metrics": {"level_points": level_points},
+            "score": level_points * 25.0,
+            "level": (
+                "good"
+                if level_points >= 4
+                else "acceptable"
+                if level_points >= 2
+                else "poor"
             ),
-            "level": "good" if risk_level_points >= 4 else "poor",
-        }
-        for dimension_id in DimensionId
-    ]
+        })
+    return dimensions
 
 
 def test_source_blocks_fixture_is_valid() -> None:
@@ -416,6 +425,28 @@ def test_risk_assessment_rejects_missing_or_duplicate_categories(mode: str) -> N
         RiskAssessment.model_validate(payload)
 
 
+def test_risk_assessment_rejects_inconsistent_code_computed_level() -> None:
+    payload = valid_risk_assessment_payload(level_points=4)
+    context = payload["compliance_context"]
+    assert isinstance(context, dict)
+    context["rights_or_license_confirmed"] = False
+
+    with pytest.raises(ValidationError, match="code-computed risk level"):
+        RiskAssessment.model_validate(payload)
+
+
+def test_risk_assessment_rejects_provider_sensitive_free_text() -> None:
+    payload = valid_risk_assessment_payload()
+    findings = payload["risk_findings"]
+    assert isinstance(findings, list)
+    sensitive = findings[0]
+    assert isinstance(sensitive, dict)
+    sensitive["reason"] = "Supplier-provided sensitive explanation."
+
+    with pytest.raises(ValidationError, match="code-owned redacted text"):
+        RiskAssessment.model_validate(payload)
+
+
 def test_deep_audit_v2_nested_models_reject_extra_fields() -> None:
     payload = load_json("deep_audit_valid.json")
     payload["risk_findings"][0]["locations"] = [
@@ -465,6 +496,167 @@ def test_quick_and_deep_audit_require_matching_risk_assessment_state() -> None:
     deep_payload["risk_assessment"] = valid_risk_assessment_payload(level_points=2)
     with pytest.raises(ValidationError, match="level_points"):
         AuditReport.model_validate(deep_payload)
+
+
+def test_audit_report_rejects_detected_risk_without_fixed_hard_failure() -> None:
+    findings = valid_risk_findings_payload()
+    findings[1] = {
+        "category": "author_impersonation",
+        "status": "detected",
+        "locations": [
+            {
+                "location_type": "document",
+                "sentence_id": None,
+                "evidence_excerpt": None,
+            }
+        ],
+        "reason": "A structured risk was detected.",
+        "remediation": "Revise the generated content.",
+    }
+    payload = {
+        "audit_status": "deep_complete",
+        "dimensions": valid_dimensions_payload(risk_level_points=0),
+        "risk_assessment": {
+            "compliance_context": valid_compliance_payload(),
+            "risk_findings": findings,
+            "level_points": 0,
+        },
+        "hard_failures": [],
+        "core_gate_passed": False,
+        "overall_score": 95.0,
+        "decision": "needs_revision",
+    }
+
+    with pytest.raises(ValidationError, match="fixed risk hard failures"):
+        AuditReport.model_validate(payload)
+
+
+def test_audit_report_rejects_spurious_risk_hard_failure() -> None:
+    payload = {
+        "audit_status": "deep_complete",
+        "dimensions": valid_dimensions_payload(),
+        "risk_assessment": valid_risk_assessment_payload(),
+        "hard_failures": ["SENSITIVE_INFORMATION"],
+        "core_gate_passed": False,
+        "overall_score": 95.0,
+        "decision": "unqualified",
+    }
+
+    with pytest.raises(ValidationError, match="fixed risk hard failures"):
+        AuditReport.model_validate(payload)
+
+
+def test_audit_report_rejects_hard_failure_with_non_unqualified_decision() -> None:
+    findings = valid_risk_findings_payload()
+    findings[1] = {
+        "category": "author_impersonation",
+        "status": "detected",
+        "locations": [
+            {
+                "location_type": "document",
+                "sentence_id": None,
+                "evidence_excerpt": None,
+            }
+        ],
+        "reason": "A structured risk was detected.",
+        "remediation": "Revise the generated content.",
+    }
+    payload = {
+        "audit_status": "deep_complete",
+        "dimensions": valid_dimensions_payload(risk_level_points=0),
+        "risk_assessment": {
+            "compliance_context": valid_compliance_payload(),
+            "risk_findings": findings,
+            "level_points": 0,
+        },
+        "hard_failures": ["AUTHOR_IMPERSONATION"],
+        "core_gate_passed": False,
+        "overall_score": 95.0,
+        "decision": "needs_revision",
+    }
+
+    with pytest.raises(ValidationError, match="code-computed decision"):
+        AuditReport.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("core_gate_passed", "decision"),
+    [
+        (True, "needs_revision"),
+        (False, "qualified"),
+    ],
+)
+def test_audit_report_rejects_forged_generated_label_gate_or_decision(
+    core_gate_passed: bool,
+    decision: str,
+) -> None:
+    context = valid_compliance_payload()
+    context["generated_content_label_applicability"] = "applicable"
+    context["generated_content_label_status"] = "missing"
+    payload = {
+        "audit_status": "deep_complete",
+        "dimensions": valid_dimensions_payload(risk_level_points=0),
+        "risk_assessment": {
+            "compliance_context": context,
+            "risk_findings": valid_risk_findings_payload(),
+            "level_points": 0,
+        },
+        "hard_failures": [],
+        "core_gate_passed": core_gate_passed,
+        "overall_score": 95.0,
+        "decision": decision,
+    }
+
+    error = "code-computed core gate" if core_gate_passed else "code-computed decision"
+    with pytest.raises(ValidationError, match=error):
+        AuditReport.model_validate(payload)
+
+
+@pytest.mark.parametrize("forged_field", ["score", "level"])
+def test_audit_report_rejects_forged_risk_dimension_display(
+    forged_field: str,
+) -> None:
+    context = valid_compliance_payload()
+    context["generated_content_label_applicability"] = "applicable"
+    context["generated_content_label_status"] = "missing"
+    dimensions = valid_dimensions_payload(risk_level_points=0)
+    risk_dimension = next(
+        item
+        for item in dimensions
+        if item["dimension_id"] == DimensionId.RISK_COMPLIANCE.value
+    )
+    risk_dimension[forged_field] = 100.0 if forged_field == "score" else "good"
+    payload = {
+        "audit_status": "deep_complete",
+        "dimensions": dimensions,
+        "risk_assessment": {
+            "compliance_context": context,
+            "risk_findings": valid_risk_findings_payload(),
+            "level_points": 0,
+        },
+        "hard_failures": [],
+        "core_gate_passed": False,
+        "overall_score": 95.0,
+        "decision": "needs_revision",
+    }
+
+    with pytest.raises(ValidationError, match="code-computed dimension"):
+        AuditReport.model_validate(payload)
+
+
+def test_audit_report_rejects_inconsistent_weighted_overall_score() -> None:
+    payload = {
+        "audit_status": "deep_complete",
+        "dimensions": valid_dimensions_payload(),
+        "risk_assessment": valid_risk_assessment_payload(),
+        "hard_failures": [],
+        "core_gate_passed": True,
+        "overall_score": 99.0,
+        "decision": "qualified",
+    }
+
+    with pytest.raises(ValidationError, match="code-computed overall score"):
+        AuditReport.model_validate(payload)
 
 
 def test_audit_report_json_round_trip_preserves_complete_risk_details() -> None:

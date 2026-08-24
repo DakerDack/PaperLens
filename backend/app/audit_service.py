@@ -16,6 +16,7 @@ from backend.app.models import (
     ClaimType,
     ComplianceContext,
     ContentDraft,
+    DIMENSION_WEIGHTS,
     DeepAuditResult,
     Decision,
     DimensionId,
@@ -36,6 +37,12 @@ from backend.app.models import (
     Severity,
     SourceBlock,
     TerminologyStatus,
+    code_owned_sensitive_text,
+    compute_audit_outcome,
+    compute_risk_level_points,
+    dimension_level,
+    dimension_score,
+    fixed_risk_hard_failures,
 )
 
 
@@ -125,10 +132,6 @@ _UNIT = re.compile(
     rf"(?<![\w.])[-+]?(?:\d+(?:[.,]\d+)*|\.\d+)\s*"
     rf"({_UNIT_ALTERNATION})(?![A-Za-z])",
     re.IGNORECASE,
-)
-_SENSITIVE_VALUE = re.compile(
-    r"(?:[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
-    r"(?<!\w)\+?\d[\d\s().-]{7,}\d(?!\w))"
 )
 _ENGLISH_STOP_WORDS = {
     "a",
@@ -235,19 +238,6 @@ _EVIDENCE_FRAGMENT_BOUNDARY = re.compile(
     r"(?<=\.)(?=\s+[A-Z])\s+|[\r\n]+"
 )
 
-
-DIMENSION_WEIGHTS: dict[DimensionId, float] = {
-    DimensionId.FACTUAL_CONSISTENCY: 0.20,
-    DimensionId.CITATION_CORRECTNESS: 0.15,
-    DimensionId.CITATION_COMPLETENESS: 0.15,
-    DimensionId.METHOD_SCOPE: 0.15,
-    DimensionId.CONCLUSION_LIMITATIONS: 0.15,
-    DimensionId.TERMINOLOGY: 0.07,
-    DimensionId.READER_ADAPTATION: 0.08,
-    DimensionId.RISK_COMPLIANCE: 0.05,
-}
-if sum(DIMENSION_WEIGHTS.values()) != 1.0:
-    raise RuntimeError("PaperLens dimension weights must sum to exactly 1")
 
 _DETERMINISTIC_CONTRADICTION_PREFIXES = (
     "NUMBER_MISMATCH:",
@@ -377,6 +367,23 @@ class AuditService:
         evidence_records: list[EvidenceRecord],
         compliance_context: ComplianceContext,
     ) -> tuple[DeepAuditResult, AuditReport]:
+        try:
+            validated_context = ComplianceContext.model_validate(
+                compliance_context.model_dump(mode="json")
+            )
+        except (AttributeError, ValidationError) as exc:
+            raise AuditServiceError(
+                "AUDIT_INCOMPLETE",
+                "Deep audit compliance context is incomplete.",
+                retryable=False,
+            ) from exc
+        if not validated_context.rights_or_license_confirmed:
+            raise AuditServiceError(
+                "RIGHTS_NOT_CONFIRMED",
+                "Document processing rights or permission are not confirmed.",
+                retryable=False,
+            )
+
         pairs = self.semantic_pairs(bundle, evidence_records)
         result = self.hy3_service.deep_audit(
             document=bundle.document,
@@ -386,9 +393,19 @@ class AuditService:
             bundle,
             evidence_records,
             result,
-            compliance_context,
+            validated_context,
         )
-        return result, report
+        if report.risk_assessment is None:
+            raise AuditServiceError(
+                "AUDIT_INCOMPLETE",
+                "Deep audit risk assessment is missing.",
+                retryable=False,
+            )
+        safe_result = DeepAuditResult(
+            semantic_judgments=result.semantic_judgments,
+            risk_findings=report.risk_assessment.risk_findings,
+        )
+        return safe_result, report
 
     def score(
         self,
@@ -432,14 +449,17 @@ class AuditService:
             )
 
         _validate_risk_findings(bundle.document, validated_result.risk_findings)
+        safe_risk_findings = _redact_sensitive_risk_findings(
+            validated_result.risk_findings
+        )
         risk_points, risk_metrics = _risk_level(
             validated_context,
-            validated_result.risk_findings,
+            safe_risk_findings,
         )
         try:
             risk_assessment = RiskAssessment(
                 compliance_context=validated_context,
-                risk_findings=validated_result.risk_findings,
+                risk_findings=safe_risk_findings,
                 level_points=risk_points,
             )
         except ValidationError as exc:
@@ -466,25 +486,12 @@ class AuditService:
         hard_failures = _deduplicate(
             _rule_hard_failures(bundle, evidence_records)
             + _semantic_hard_failures(bundle, semantic_judgments)
-            + _risk_hard_failures(validated_result.risk_findings)
+            + _risk_hard_failures(safe_risk_findings)
         )
-        core_gate_passed = not hard_failures and all(
-            level_points[dimension_id] >= minimum
-            for dimension_id, minimum in _CORE_DIMENSION_GATES.items()
+        overall_score, core_gate_passed, decision = compute_audit_outcome(
+            dimensions,
+            hard_failures,
         )
-        overall_score = round(
-            sum(
-                dimension.score * DIMENSION_WEIGHTS[dimension.dimension_id]
-                for dimension in dimensions
-            ),
-            2,
-        )
-        if hard_failures:
-            decision = Decision.UNQUALIFIED
-        elif core_gate_passed and overall_score >= 75:
-            decision = Decision.QUALIFIED
-        else:
-            decision = Decision.NEEDS_REVISION
 
         return AuditReport(
             audit_status=AuditStatus.DEEP_COMPLETE,
@@ -794,18 +801,6 @@ def _claim_source_flags(claim: AtomicClaim, source_text: str) -> list[str]:
 
 def _deduplicate(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
-
-
-_CORE_DIMENSION_GATES: dict[DimensionId, int] = {
-    DimensionId.FACTUAL_CONSISTENCY: 3,
-    DimensionId.CITATION_CORRECTNESS: 3,
-    DimensionId.CITATION_COMPLETENESS: 3,
-    DimensionId.METHOD_SCOPE: 3,
-    DimensionId.CONCLUSION_LIMITATIONS: 3,
-    DimensionId.TERMINOLOGY: 2,
-    DimensionId.READER_ADAPTATION: 2,
-    DimensionId.RISK_COMPLIANCE: 3,
-}
 
 
 def _build_dimensions(
@@ -1217,11 +1212,6 @@ def _validate_risk_findings(
         for section in document.sections
         for sentence in section.sentences
     }
-    document_texts = [
-        document.title,
-        *(section.heading for section in document.sections),
-        *sentence_texts.values(),
-    ]
     for finding in risk_findings:
         if finding.status == RiskStatus.DETECTED and not finding.locations:
             raise AuditServiceError(
@@ -1292,21 +1282,6 @@ def _validate_risk_findings(
                     retryable=True,
                 )
 
-        if finding.category == RiskCategory.SENSITIVE_INFORMATION:
-            protected_values = {
-                match.group(0)
-                for source_text in document_texts
-                for match in _SENSITIVE_VALUE.finditer(source_text)
-            }
-            explanation = f"{finding.reason}\n{finding.remediation}".casefold()
-            if any(value.casefold() in explanation for value in protected_values):
-                raise AuditServiceError(
-                    "AUDIT_INCOMPLETE",
-                    "Sensitive risk explanations must remain redacted.",
-                    retryable=True,
-                )
-
-
 def _risk_level(
     compliance_context: ComplianceContext,
     risk_findings: list[RiskFinding],
@@ -1331,17 +1306,7 @@ def _risk_level(
         and compliance_context.generated_content_label_status.value == "missing"
     )
 
-    points = 4
-    if missing_disclosures == 1:
-        points = min(points, 3)
-    elif missing_disclosures >= 2:
-        points = min(points, 2)
-    if unclear_findings:
-        points = min(points, 2)
-    if rights_missing:
-        points = min(points, 1)
-    if required_label_missing or detected_findings:
-        points = 0
+    points = compute_risk_level_points(compliance_context, risk_findings)
 
     return points, {
         "missing_disclosures": missing_disclosures,
@@ -1360,16 +1325,27 @@ def _risk_level(
 
 
 def _risk_hard_failures(risk_findings: list[RiskFinding]) -> list[str]:
-    failure_by_category = {
-        RiskCategory.SENSITIVE_INFORMATION: "SENSITIVE_INFORMATION",
-        RiskCategory.AUTHOR_IMPERSONATION: "AUTHOR_IMPERSONATION",
-        RiskCategory.ACADEMIC_INTEGRITY: "ACADEMIC_INTEGRITY",
-    }
-    return [
-        failure_by_category[finding.category]
-        for finding in risk_findings
-        if finding.status == RiskStatus.DETECTED
-    ]
+    return fixed_risk_hard_failures(risk_findings)
+
+
+def _redact_sensitive_risk_findings(
+    risk_findings: list[RiskFinding],
+) -> list[RiskFinding]:
+    redacted: list[RiskFinding] = []
+    for finding in risk_findings:
+        if finding.category != RiskCategory.SENSITIVE_INFORMATION:
+            redacted.append(finding)
+            continue
+        reason, remediation = code_owned_sensitive_text(finding.status)
+        redacted.append(
+            finding.model_copy(
+                update={
+                    "reason": reason,
+                    "remediation": remediation,
+                }
+            )
+        )
+    return redacted
 
 
 def _dimension_result(
@@ -1377,17 +1353,11 @@ def _dimension_result(
     raw_metrics: dict[str, int | float],
     level_points: int,
 ) -> DimensionResult:
-    if level_points >= 4:
-        level = "good"
-    elif level_points >= 2:
-        level = "acceptable"
-    else:
-        level = "poor"
     return DimensionResult(
         dimension_id=dimension_id,
         raw_metrics={**raw_metrics, "level_points": level_points},
-        score=float(level_points * 25),
-        level=level,
+        score=dimension_score(level_points),
+        level=dimension_level(level_points),
     )
 
 

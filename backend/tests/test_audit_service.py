@@ -509,6 +509,25 @@ def test_deep_audit_batches_once_and_code_builds_all_eight_dimensions() -> None:
     assert report.risk_assessment.level_points == 4
 
 
+def test_run_deep_audit_rejects_unconfirmed_rights_before_hy3_call() -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    recording = RecordingDeepAudit()
+    service = AuditService(hy3_service=recording)
+
+    with pytest.raises(AuditServiceError) as exc_info:
+        service.run_deep_audit(
+            bundle,
+            records,
+            compliance_context(rights_or_license_confirmed=False),
+        )
+
+    assert exc_info.value.error_code == "RIGHTS_NOT_CONFIRMED"
+    assert exc_info.value.retryable is False
+    assert recording.calls == []
+    assert recording.documents == []
+
+
 def test_deep_audit_rejects_incomplete_semantic_batch_without_score() -> None:
     bundle = generated_bundle()
     records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
@@ -1182,16 +1201,12 @@ def test_logically_incomplete_risk_finding_is_audit_incomplete(
         status,
         locations=locations,
     )
-    result = RecordingDeepAudit(risk_findings=findings).deep_audit(
-        document=bundle.document,
-        claim_evidence_pairs=AuditService().semantic_pairs(bundle, records),
-    )
-
     with pytest.raises(AuditServiceError) as exc_info:
-        AuditService().score(
+        AuditService(
+            hy3_service=RecordingDeepAudit(risk_findings=findings)
+        ).run_deep_audit(
             bundle,
             records,
-            result,
             compliance_context(),
         )
 
@@ -1403,9 +1418,21 @@ def test_non_auditable_content_still_enters_document_risk_check() -> None:
     assert report.risk_assessment is not None
 
 
-def test_sensitive_information_reason_cannot_repeat_full_sensitive_value() -> None:
+@pytest.mark.parametrize(
+    "sensitive_value",
+    [
+        "private.person@example.test",
+        "+1 (555) 010-2468",
+        "978-3-16-148410-0",
+        "10.1234.56789",
+        "1234-56789",
+    ],
+    ids=["email", "phone", "isbn", "doi", "trial-number"],
+)
+def test_sensitive_free_text_is_redacted_by_public_entry(
+    sensitive_value: str,
+) -> None:
     bundle = generated_bundle()
-    sensitive_value = "private.person@example.test"
     sections = list(bundle.document.sections)
     last_section = sections[-1]
     sensitive_sentence = last_section.sentences[0].model_copy(
@@ -1419,7 +1446,7 @@ def test_sensitive_information_reason_cannot_repeat_full_sensitive_value() -> No
         sensitive_bundle,
         source_blocks_fixture(),
     )
-    bad_findings = risk_findings_with(
+    findings = risk_findings_with(
         "sensitive_information",
         "detected",
         locations=[
@@ -1430,26 +1457,39 @@ def test_sensitive_information_reason_cannot_repeat_full_sensitive_value() -> No
             }
         ],
         reason=f"The document exposes {sensitive_value}.",
-        remediation="Remove the sensitive contact value.",
+        remediation=f"Remove or generalize {sensitive_value}.",
     )
-    result = RecordingDeepAudit(risk_findings=bad_findings).deep_audit(
-        document=sensitive_bundle.document,
-        claim_evidence_pairs=AuditService().semantic_pairs(
-            sensitive_bundle,
-            records,
-        ),
+    result, report = AuditService(
+        hy3_service=RecordingDeepAudit(risk_findings=findings)
+    ).run_deep_audit(
+        sensitive_bundle,
+        records,
+        compliance_context(),
     )
 
-    with pytest.raises(AuditServiceError) as exc_info:
-        AuditService().score(
-            sensitive_bundle,
-            records,
-            result,
-            compliance_context(),
-        )
-
-    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
-    assert sensitive_value not in exc_info.value.message
+    assert report.risk_assessment is not None
+    assert sensitive_value not in result.model_dump_json()
+    assert sensitive_value not in report.model_dump_json()
+    returned = next(
+        finding
+        for finding in result.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    saved = next(
+        finding
+        for finding in report.risk_assessment.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    assert returned.status.value == "detected"
+    assert len(returned.locations) == 1
+    assert returned.locations[0].location_type.value == "sentence"
+    assert returned.locations[0].sentence_id == "s-005"
+    assert returned.locations[0].evidence_excerpt is None
+    assert returned.reason == "A sensitive-content risk was detected."
+    assert returned.remediation == (
+        "Remove or generalize the flagged content before release."
+    )
+    assert saved == returned
 
 
 @pytest.mark.parametrize(
@@ -1469,10 +1509,9 @@ def test_sensitive_information_reason_cannot_repeat_full_sensitive_value() -> No
     ],
     ids=["document-location", "unclear-without-location"],
 )
-def test_document_level_sensitive_reason_cannot_echo_full_value(
+def test_document_level_sensitive_reason_is_redacted_by_public_entry(
     status: str,
     locations: list[dict[str, object]],
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     bundle = generated_bundle()
     sensitive_value = "whole.document@example.test"
@@ -1495,6 +1534,400 @@ def test_document_level_sensitive_reason_cannot_echo_full_value(
         locations=locations,
         reason=f"The full document exposes {sensitive_value}.",
     )
+    result, report = AuditService(
+        hy3_service=RecordingDeepAudit(risk_findings=findings)
+    ).run_deep_audit(
+        sensitive_bundle,
+        records,
+        compliance_context(),
+    )
+
+    assert report.risk_assessment is not None
+    assert sensitive_value not in result.model_dump_json()
+    assert sensitive_value not in report.model_dump_json()
+    returned = next(
+        finding
+        for finding in result.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    saved = next(
+        finding
+        for finding in report.risk_assessment.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    assert returned.status.value == status
+    assert len(returned.locations) == len(locations)
+    if locations:
+        assert returned.locations[0].location_type.value == "document"
+        assert returned.locations[0].sentence_id is None
+        assert returned.locations[0].evidence_excerpt is None
+    expected_text = {
+        "detected": (
+            "A sensitive-content risk was detected.",
+            "Remove or generalize the flagged content before release.",
+        ),
+        "unclear": (
+            "The sensitive-content risk remains unclear.",
+            "Review the generated content before release.",
+        ),
+    }[status]
+    assert (returned.reason, returned.remediation) == expected_text
+    assert saved == returned
+
+
+@pytest.mark.parametrize(
+    ("sensitive_value", "field_name"),
+    [
+        ("REC-Q7M4-91ZX", "reason"),
+        ("PX7M42FAKE", "remediation"),
+        ("COVID19", "reason"),
+        ("SARS-CoV-2", "remediation"),
+        ("GPT4Model", "reason"),
+        ("BRCA1Variant", "remediation"),
+    ],
+    ids=[
+        "mixed-record-number",
+        "passport-style-identifier",
+        "covid19",
+        "sars-cov-2",
+        "gpt4-model",
+        "brca1-variant",
+    ],
+)
+def test_alphanumeric_text_is_redacted_and_accepted(
+    sensitive_value: str,
+    field_name: str,
+) -> None:
+    bundle = generated_bundle()
+    sections = list(bundle.document.sections)
+    last_section = sections[-1]
+    sensitive_sentence = last_section.sentences[0].model_copy(
+        update={"text": f"Synthetic document term: {sensitive_value}."}
+    )
+    sections[-1] = last_section.model_copy(update={"sentences": [sensitive_sentence]})
+    sensitive_bundle = bundle.model_copy(
+        update={"document": bundle.document.model_copy(update={"sections": sections})}
+    )
+    records, _ = AuditService().quick_check(
+        sensitive_bundle,
+        source_blocks_fixture(),
+    )
+    explanation = {
+        "reason": "A private identifier is present.",
+        "remediation": "Remove the private identifier.",
+    }
+    explanation[field_name] = f"The exposed value is {sensitive_value}."
+    findings = risk_findings_with(
+        "sensitive_information",
+        "unclear",
+        reason=explanation["reason"],
+        remediation=explanation["remediation"],
+    )
+    result, report = AuditService(
+        hy3_service=RecordingDeepAudit(risk_findings=findings)
+    ).run_deep_audit(
+        sensitive_bundle,
+        records,
+        compliance_context(),
+    )
+
+    assert report.risk_assessment is not None
+    assert sensitive_value not in result.model_dump_json()
+    assert sensitive_value not in report.model_dump_json()
+    returned = next(
+        finding
+        for finding in result.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    saved = next(
+        finding
+        for finding in report.risk_assessment.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    assert returned.status.value == "unclear"
+    assert returned.locations == []
+    assert returned.reason == "The sensitive-content risk remains unclear."
+    assert returned.remediation == "Review the generated content before release."
+    assert saved == returned
+
+
+def test_sensitive_phone_reason_is_redacted_by_public_entry() -> None:
+    bundle = generated_bundle()
+    sensitive_value = "+1 (555) 010-2468"
+    sections = list(bundle.document.sections)
+    last_section = sections[-1]
+    sensitive_sentence = last_section.sentences[0].model_copy(
+        update={"text": f"Synthetic private telephone: {sensitive_value}."}
+    )
+    sections[-1] = last_section.model_copy(update={"sentences": [sensitive_sentence]})
+    sensitive_bundle = bundle.model_copy(
+        update={"document": bundle.document.model_copy(update={"sections": sections})}
+    )
+    records, _ = AuditService().quick_check(
+        sensitive_bundle,
+        source_blocks_fixture(),
+    )
+    findings = risk_findings_with(
+        "sensitive_information",
+        "unclear",
+        reason=f"The exposed telephone is {sensitive_value}.",
+        remediation="Remove the private telephone.",
+    )
+    result, report = AuditService(
+        hy3_service=RecordingDeepAudit(risk_findings=findings)
+    ).run_deep_audit(
+        sensitive_bundle,
+        records,
+        compliance_context(),
+    )
+
+    assert report.risk_assessment is not None
+    assert sensitive_value not in result.model_dump_json()
+    assert sensitive_value not in report.model_dump_json()
+    returned = next(
+        finding
+        for finding in result.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    saved = next(
+        finding
+        for finding in report.risk_assessment.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    assert returned.status.value == "unclear"
+    assert returned.locations == []
+    assert returned.reason == "The sensitive-content risk remains unclear."
+    assert returned.remediation == "Review the generated content before release."
+    assert saved == returned
+
+
+def test_year_range_is_redacted_and_accepted() -> None:
+    bundle = generated_bundle()
+    sensitive_value = "2020-2024"
+    sections = list(bundle.document.sections)
+    last_section = sections[-1]
+    range_sentence = last_section.sentences[0].model_copy(
+        update={"text": f"The study period was {sensitive_value}."}
+    )
+    sections[-1] = last_section.model_copy(update={"sentences": [range_sentence]})
+    range_bundle = bundle.model_copy(
+        update={"document": bundle.document.model_copy(update={"sections": sections})}
+    )
+    records, _ = AuditService().quick_check(
+        range_bundle,
+        source_blocks_fixture(),
+    )
+    findings = risk_findings_with(
+        "sensitive_information",
+        "unclear",
+        reason=f"The supplier repeated the study period {sensitive_value}.",
+        remediation=f"The supplier recommended reviewing {sensitive_value}.",
+    )
+
+    result, report = AuditService(
+        hy3_service=RecordingDeepAudit(risk_findings=findings)
+    ).run_deep_audit(
+        range_bundle,
+        records,
+        compliance_context(),
+    )
+
+    assert report.risk_assessment is not None
+    assert sensitive_value not in result.model_dump_json()
+    assert sensitive_value not in report.model_dump_json()
+    returned = next(
+        finding
+        for finding in result.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    saved = next(
+        finding
+        for finding in report.risk_assessment.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    assert returned.status.value == "unclear"
+    assert returned.locations == []
+    assert returned.reason == "The sensitive-content risk remains unclear."
+    assert returned.remediation == "Review the generated content before release."
+    assert saved == returned
+
+
+@pytest.mark.parametrize(
+    ("sensitive_value", "field_name"),
+    [
+        ("Avery Quill", "reason"),
+        ("42 Fictional Avenue", "remediation"),
+    ],
+    ids=["synthetic-name", "synthetic-address"],
+)
+def test_sensitive_name_or_address_is_redacted_and_accepted(
+    sensitive_value: str,
+    field_name: str,
+) -> None:
+    bundle = generated_bundle()
+    sections = list(bundle.document.sections)
+    last_section = sections[-1]
+    sensitive_sentence = last_section.sentences[0].model_copy(
+        update={"text": f"Synthetic private subject: {sensitive_value}."}
+    )
+    sections[-1] = last_section.model_copy(update={"sentences": [sensitive_sentence]})
+    sensitive_bundle = bundle.model_copy(
+        update={"document": bundle.document.model_copy(update={"sections": sections})}
+    )
+    records, _ = AuditService().quick_check(
+        sensitive_bundle,
+        source_blocks_fixture(),
+    )
+    explanation = {
+        "reason": "Private personal content is present.",
+        "remediation": "Generalize the private personal content.",
+    }
+    explanation[field_name] = f"The document repeats {sensitive_value}."
+    findings = risk_findings_with(
+        "sensitive_information",
+        "unclear",
+        reason=explanation["reason"],
+        remediation=explanation["remediation"],
+    )
+    result, report = AuditService(
+        hy3_service=RecordingDeepAudit(risk_findings=findings)
+    ).run_deep_audit(
+        sensitive_bundle,
+        records,
+        compliance_context(),
+    )
+
+    assert report.risk_assessment is not None
+    assert sensitive_value not in result.model_dump_json()
+    assert sensitive_value not in report.model_dump_json()
+    returned = next(
+        finding
+        for finding in result.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    saved = next(
+        finding
+        for finding in report.risk_assessment.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    assert returned.status.value == "unclear"
+    assert returned.locations == []
+    assert returned.reason == "The sensitive-content risk remains unclear."
+    assert returned.remediation == "Review the generated content before release."
+    assert saved == returned
+
+
+@pytest.mark.parametrize(
+    "risk_phrase",
+    [
+        "Personal Information",
+        "Confidential Information",
+        "Sensitive Data",
+        "Privacy Risk",
+    ],
+    ids=[
+        "personal-information",
+        "confidential-information",
+        "sensitive-data",
+        "privacy-risk",
+    ],
+)
+def test_generic_sensitive_risk_phrase_is_redacted_and_accepted(
+    risk_phrase: str,
+) -> None:
+    bundle = generated_bundle()
+    sections = list(bundle.document.sections)
+    last_section = sections[-1]
+    generic_sentence = last_section.sentences[0].model_copy(
+        update={"text": f"The document heading is {risk_phrase}."}
+    )
+    sections[-1] = last_section.model_copy(update={"sentences": [generic_sentence]})
+    generic_bundle = bundle.model_copy(
+        update={"document": bundle.document.model_copy(update={"sections": sections})}
+    )
+    records, _ = AuditService().quick_check(
+        generic_bundle,
+        source_blocks_fixture(),
+    )
+    raw_reason = f"The supplier categorized this as {risk_phrase}."
+    raw_remediation = f"The supplier recommends reviewing {risk_phrase}."
+    findings = risk_findings_with(
+        "sensitive_information",
+        "unclear",
+        reason=raw_reason,
+        remediation=raw_remediation,
+    )
+
+    result, report = AuditService(
+        hy3_service=RecordingDeepAudit(risk_findings=findings)
+    ).run_deep_audit(
+        generic_bundle,
+        records,
+        compliance_context(),
+    )
+
+    assert report.risk_assessment is not None
+    result_json = result.model_dump_json()
+    report_json = report.model_dump_json()
+    assert raw_reason not in result_json
+    assert raw_remediation not in result_json
+    assert raw_reason not in report_json
+    assert raw_remediation not in report_json
+    returned = next(
+        finding
+        for finding in result.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    saved = next(
+        finding
+        for finding in report.risk_assessment.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    assert returned.status.value == "unclear"
+    assert returned.locations == []
+    assert returned.reason == "The sensitive-content risk remains unclear."
+    assert returned.remediation == "Review the generated content before release."
+    assert saved == returned
+
+
+def test_sensitive_reason_allows_generic_redacted_explanation() -> None:
+    bundle = generated_bundle()
+    synthetic_values = (
+        "private.person@example.test",
+        "+1 (555) 010-2468",
+        "REC-Q7M4-91ZX",
+        "PX7M42FAKE",
+        "Avery Quill",
+        "42 Fictional Avenue",
+    )
+    sections = list(bundle.document.sections)
+    last_section = sections[-1]
+    sensitive_sentence = last_section.sentences[0].model_copy(
+        update={
+            "text": "Synthetic private data: " + "; ".join(synthetic_values) + "."
+        }
+    )
+    sections[-1] = last_section.model_copy(update={"sentences": [sensitive_sentence]})
+    sensitive_bundle = bundle.model_copy(
+        update={"document": bundle.document.model_copy(update={"sections": sections})}
+    )
+    records, _ = AuditService().quick_check(
+        sensitive_bundle,
+        source_blocks_fixture(),
+    )
+    findings = risk_findings_with(
+        "sensitive_information",
+        "detected",
+        locations=[
+            {
+                "location_type": "document",
+                "sentence_id": None,
+                "evidence_excerpt": None,
+            }
+        ],
+        reason="Sensitive personal content was detected.",
+        remediation="Remove or generalize the identified content before release.",
+    )
     result = RecordingDeepAudit(risk_findings=findings).deep_audit(
         document=sensitive_bundle.document,
         claim_evidence_pairs=AuditService().semantic_pairs(
@@ -1503,17 +1936,279 @@ def test_document_level_sensitive_reason_cannot_echo_full_value(
         ),
     )
 
-    with pytest.raises(AuditServiceError) as exc_info:
-        AuditService().score(
+    report = AuditService().score(
+        sensitive_bundle,
+        records,
+        result,
+        compliance_context(),
+    )
+
+    serialized = report.model_dump_json()
+    assert all(value not in serialized for value in synthetic_values)
+    assert "SENSITIVE_INFORMATION" in report.hard_failures
+
+
+@pytest.mark.parametrize(
+    "sensitive_value",
+    [
+        "Zorblen",
+        "测试甲",
+        "73194628",
+        "QWERTYZX",
+        "虚构市测试区样例路",
+    ],
+    ids=[
+        "single-word-name",
+        "chinese-name",
+        "eight-digit-record",
+        "letters-only-identifier",
+        "chinese-address-without-number",
+    ],
+)
+def test_score_redacts_unrecognized_sensitive_text_from_report(
+    sensitive_value: str,
+) -> None:
+    bundle = generated_bundle()
+    sections = list(bundle.document.sections)
+    last_section = sections[-1]
+    sensitive_sentence = last_section.sentences[0].model_copy(
+        update={"text": f"Synthetic confidential value: {sensitive_value}."}
+    )
+    sections[-1] = last_section.model_copy(update={"sentences": [sensitive_sentence]})
+    sensitive_bundle = bundle.model_copy(
+        update={"document": bundle.document.model_copy(update={"sections": sections})}
+    )
+    records, _ = AuditService().quick_check(
+        sensitive_bundle,
+        source_blocks_fixture(),
+    )
+    findings = risk_findings_with(
+        "sensitive_information",
+        "unclear",
+        reason=f"Supplier reason includes {sensitive_value}.",
+        remediation=f"Supplier remediation includes {sensitive_value}.",
+    )
+    result = RecordingDeepAudit(risk_findings=findings).deep_audit(
+        document=sensitive_bundle.document,
+        claim_evidence_pairs=AuditService().semantic_pairs(
             sensitive_bundle,
             records,
-            result,
-            compliance_context(),
-        )
+        ),
+    )
 
-    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
-    assert sensitive_value not in exc_info.value.message
-    assert sensitive_value not in caplog.text
+    report = AuditService().score(
+        sensitive_bundle,
+        records,
+        result,
+        compliance_context(),
+    )
+
+    assert sensitive_value not in report.model_dump_json()
+    assert report.risk_assessment is not None
+    saved = next(
+        finding
+        for finding in report.risk_assessment.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    assert saved.status.value == "unclear"
+    assert saved.locations == []
+    assert saved.reason == "The sensitive-content risk remains unclear."
+    assert saved.remediation == "Review the generated content before release."
+
+
+@pytest.mark.parametrize(
+    "sensitive_value",
+    [
+        "Zorblen",
+        "测试甲",
+        "73194628",
+        "QWERTYZX",
+        "虚构市测试区样例路",
+    ],
+)
+def test_run_deep_audit_redacts_sensitive_text_from_result_and_report(
+    sensitive_value: str,
+) -> None:
+    bundle = generated_bundle()
+    sections = list(bundle.document.sections)
+    last_section = sections[-1]
+    sensitive_sentence = last_section.sentences[0].model_copy(
+        update={"text": f"Synthetic confidential value: {sensitive_value}."}
+    )
+    sections[-1] = last_section.model_copy(update={"sentences": [sensitive_sentence]})
+    sensitive_bundle = bundle.model_copy(
+        update={"document": bundle.document.model_copy(update={"sections": sections})}
+    )
+    records, _ = AuditService().quick_check(
+        sensitive_bundle,
+        source_blocks_fixture(),
+    )
+    raw_findings = risk_findings_with(
+        "sensitive_information",
+        "unclear",
+        reason=f"Supplier reason includes {sensitive_value}.",
+        remediation=f"Supplier remediation includes {sensitive_value}.",
+    )
+
+    result, report = AuditService(
+        hy3_service=RecordingDeepAudit(risk_findings=raw_findings)
+    ).run_deep_audit(
+        sensitive_bundle,
+        records,
+        compliance_context(),
+    )
+
+    assert sensitive_value not in result.model_dump_json()
+    assert sensitive_value not in report.model_dump_json()
+    returned = next(
+        finding
+        for finding in result.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    assert returned.status.value == "unclear"
+    assert returned.locations == []
+    assert returned.reason == "The sensitive-content risk remains unclear."
+    assert returned.remediation == "Review the generated content before release."
+
+
+def test_code_owned_sensitive_explanation_survives_generic_document_phrase() -> None:
+    bundle = generated_bundle()
+    sections = list(bundle.document.sections)
+    last_section = sections[-1]
+    generic_sentence = last_section.sentences[0].model_copy(
+        update={"text": "The heading is Sensitive Information."}
+    )
+    sections[-1] = last_section.model_copy(update={"sentences": [generic_sentence]})
+    generic_bundle = bundle.model_copy(
+        update={"document": bundle.document.model_copy(update={"sections": sections})}
+    )
+    records, _ = AuditService().quick_check(
+        generic_bundle,
+        source_blocks_fixture(),
+    )
+    raw_findings = risk_findings_with(
+        "sensitive_information",
+        "unclear",
+        reason="A protected-content review is required.",
+        remediation="Review the generated content before release.",
+    )
+
+    result, report = AuditService(
+        hy3_service=RecordingDeepAudit(risk_findings=raw_findings)
+    ).run_deep_audit(
+        generic_bundle,
+        records,
+        compliance_context(),
+    )
+    rescored = AuditService().score(
+        generic_bundle,
+        records,
+        result,
+        compliance_context(),
+    )
+
+    assert report == rescored
+    assert report.risk_assessment is not None
+    saved = next(
+        finding
+        for finding in report.risk_assessment.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    assert saved.reason == "The sensitive-content risk remains unclear."
+
+
+def test_safe_sensitive_phrase_matching_document_title_is_redacted_and_accepted(
+) -> None:
+    bundle = generated_bundle()
+    generic_bundle = bundle.model_copy(
+        update={
+            "document": bundle.document.model_copy(
+                update={"title": "Sensitive Information: Sensitive-Content Risk"}
+            )
+        }
+    )
+    records, _ = AuditService().quick_check(
+        generic_bundle,
+        source_blocks_fixture(),
+    )
+    raw_findings = risk_findings_with(
+        "sensitive_information",
+        "unclear",
+        reason="Sensitive information and sensitive-content risk require review.",
+        remediation="Review generated content before release.",
+    )
+
+    result, report = AuditService(
+        hy3_service=RecordingDeepAudit(risk_findings=raw_findings)
+    ).run_deep_audit(
+        generic_bundle,
+        records,
+        compliance_context(),
+    )
+
+    assert report.risk_assessment is not None
+    returned = next(
+        finding
+        for finding in result.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    saved = next(
+        finding
+        for finding in report.risk_assessment.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    assert returned.status.value == "unclear"
+    assert returned.locations == []
+    assert returned.reason == "The sensitive-content risk remains unclear."
+    assert returned.remediation == "Review the generated content before release."
+    assert saved == returned
+
+
+def test_safe_sensitive_phrase_matching_section_heading_is_redacted_and_accepted(
+) -> None:
+    bundle = generated_bundle()
+    sections = list(bundle.document.sections)
+    sections[0] = sections[0].model_copy(
+        update={"heading": "Review Generated Content"}
+    )
+    generic_bundle = bundle.model_copy(
+        update={"document": bundle.document.model_copy(update={"sections": sections})}
+    )
+    records, _ = AuditService().quick_check(
+        generic_bundle,
+        source_blocks_fixture(),
+    )
+    raw_findings = risk_findings_with(
+        "sensitive_information",
+        "unclear",
+        reason="The sensitive-content risk remains unclear.",
+        remediation="Review generated content before release.",
+    )
+
+    result, report = AuditService(
+        hy3_service=RecordingDeepAudit(risk_findings=raw_findings)
+    ).run_deep_audit(
+        generic_bundle,
+        records,
+        compliance_context(),
+    )
+
+    assert report.risk_assessment is not None
+    returned = next(
+        finding
+        for finding in result.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    saved = next(
+        finding
+        for finding in report.risk_assessment.risk_findings
+        if finding.category.value == "sensitive_information"
+    )
+    assert returned.status.value == "unclear"
+    assert returned.locations == []
+    assert returned.reason == "The sensitive-content risk remains unclear."
+    assert returned.remediation == "Review the generated content before release."
+    assert saved == returned
 
 
 def test_invalid_compliance_context_is_audit_incomplete() -> None:

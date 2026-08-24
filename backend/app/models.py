@@ -130,6 +130,31 @@ class DimensionId(str, Enum):
     RISK_COMPLIANCE = "risk_compliance"
 
 
+DIMENSION_WEIGHTS: dict[DimensionId, float] = {
+    DimensionId.FACTUAL_CONSISTENCY: 0.20,
+    DimensionId.CITATION_CORRECTNESS: 0.15,
+    DimensionId.CITATION_COMPLETENESS: 0.15,
+    DimensionId.METHOD_SCOPE: 0.15,
+    DimensionId.CONCLUSION_LIMITATIONS: 0.15,
+    DimensionId.TERMINOLOGY: 0.07,
+    DimensionId.READER_ADAPTATION: 0.08,
+    DimensionId.RISK_COMPLIANCE: 0.05,
+}
+if sum(DIMENSION_WEIGHTS.values()) != 1.0:
+    raise RuntimeError("PaperLens dimension weights must sum to exactly 1")
+
+CORE_DIMENSION_GATES: dict[DimensionId, int] = {
+    DimensionId.FACTUAL_CONSISTENCY: 3,
+    DimensionId.CITATION_CORRECTNESS: 3,
+    DimensionId.CITATION_COMPLETENESS: 3,
+    DimensionId.METHOD_SCOPE: 3,
+    DimensionId.CONCLUSION_LIMITATIONS: 3,
+    DimensionId.TERMINOLOGY: 2,
+    DimensionId.READER_ADAPTATION: 2,
+    DimensionId.RISK_COMPLIANCE: 3,
+}
+
+
 class AuditStatus(str, Enum):
     QUICK_COMPLETE = "quick_complete"
     DEEP_COMPLETE = "deep_complete"
@@ -333,6 +358,77 @@ class RiskFinding(StrictModel):
     remediation: str = Field(min_length=1, max_length=300)
 
 
+_CODE_OWNED_SENSITIVE_TEXT = {
+    RiskStatus.NOT_DETECTED: (
+        "No sensitive-content risk was detected.",
+        "No sensitive-content remediation is required.",
+    ),
+    RiskStatus.UNCLEAR: (
+        "The sensitive-content risk remains unclear.",
+        "Review the generated content before release.",
+    ),
+    RiskStatus.DETECTED: (
+        "A sensitive-content risk was detected.",
+        "Remove or generalize the flagged content before release.",
+    ),
+}
+
+
+def code_owned_sensitive_text(status: RiskStatus) -> tuple[str, str]:
+    return _CODE_OWNED_SENSITIVE_TEXT[status]
+
+
+_FIXED_RISK_HARD_FAILURE_BY_CATEGORY = {
+    RiskCategory.SENSITIVE_INFORMATION: "SENSITIVE_INFORMATION",
+    RiskCategory.AUTHOR_IMPERSONATION: "AUTHOR_IMPERSONATION",
+    RiskCategory.ACADEMIC_INTEGRITY: "ACADEMIC_INTEGRITY",
+}
+_FIXED_RISK_HARD_FAILURE_CODES = frozenset(
+    _FIXED_RISK_HARD_FAILURE_BY_CATEGORY.values()
+)
+
+
+def compute_risk_level_points(
+    compliance_context: ComplianceContext,
+    risk_findings: list[RiskFinding],
+) -> int:
+    missing_disclosures = sum(
+        status == DisclosureStatus.MISSING
+        for status in (
+            compliance_context.source_disclosure_status,
+            compliance_context.ai_assistance_disclosure_status,
+        )
+    )
+    points = 4
+    if missing_disclosures == 1:
+        points = 3
+    elif missing_disclosures >= 2:
+        points = 2
+    if any(finding.status == RiskStatus.UNCLEAR for finding in risk_findings):
+        points = min(points, 2)
+    if not compliance_context.rights_or_license_confirmed:
+        points = min(points, 1)
+    required_label_missing = (
+        compliance_context.generated_content_label_applicability
+        == GeneratedContentLabelApplicability.APPLICABLE
+        and compliance_context.generated_content_label_status
+        == GeneratedContentLabelStatus.MISSING
+    )
+    if required_label_missing or any(
+        finding.status == RiskStatus.DETECTED for finding in risk_findings
+    ):
+        points = 0
+    return points
+
+
+def fixed_risk_hard_failures(risk_findings: list[RiskFinding]) -> list[str]:
+    return [
+        _FIXED_RISK_HARD_FAILURE_BY_CATEGORY[finding.category]
+        for finding in risk_findings
+        if finding.status == RiskStatus.DETECTED
+    ]
+
+
 class DeepAuditResult(StrictModel):
     semantic_judgments: list[SemanticJudgment]
     risk_findings: list[RiskFinding]
@@ -352,6 +448,29 @@ class RiskAssessment(StrictModel):
             raise ValueError(
                 "risk findings must contain each required category exactly once"
             )
+        expected_level = compute_risk_level_points(
+            self.compliance_context,
+            self.risk_findings,
+        )
+        if self.level_points != expected_level:
+            raise ValueError(
+                "level_points must match the code-computed risk level"
+            )
+        sensitive_finding = next(
+            finding
+            for finding in self.risk_findings
+            if finding.category == RiskCategory.SENSITIVE_INFORMATION
+        )
+        expected_reason, expected_remediation = code_owned_sensitive_text(
+            sensitive_finding.status
+        )
+        if (
+            sensitive_finding.reason != expected_reason
+            or sensitive_finding.remediation != expected_remediation
+        ):
+            raise ValueError(
+                "sensitive_information explanations must use code-owned redacted text"
+            )
         return self
 
 
@@ -363,6 +482,59 @@ class DimensionResult(StrictModel):
     raw_metrics: dict[str, MetricValue]
     score: float = Field(ge=0, le=100)
     level: str = Field(pattern="^(good|acceptable|poor)$")
+
+
+def dimension_score(level_points: int) -> float:
+    return float(level_points * 25)
+
+
+def dimension_level(level_points: int) -> str:
+    if level_points >= 4:
+        return "good"
+    if level_points >= 2:
+        return "acceptable"
+    return "poor"
+
+
+def dimension_level_points(dimension: DimensionResult) -> int:
+    level_points = dimension.raw_metrics.get("level_points")
+    if (
+        isinstance(level_points, bool)
+        or not isinstance(level_points, int)
+        or not 0 <= level_points <= 4
+    ):
+        raise ValueError("dimension level_points must be an integer from 0 to 4")
+    return level_points
+
+
+def compute_audit_outcome(
+    dimensions: list[DimensionResult],
+    hard_failures: list[str],
+) -> tuple[float, bool, Decision]:
+    level_points = {
+        dimension.dimension_id: dimension_level_points(dimension)
+        for dimension in dimensions
+    }
+    if set(level_points) != set(DimensionId):
+        raise ValueError("all eight dimensions are required to compute an outcome")
+    overall_score = round(
+        sum(
+            dimension.score * DIMENSION_WEIGHTS[dimension.dimension_id]
+            for dimension in dimensions
+        ),
+        2,
+    )
+    core_gate_passed = not hard_failures and all(
+        level_points[dimension_id] >= minimum
+        for dimension_id, minimum in CORE_DIMENSION_GATES.items()
+    )
+    if hard_failures:
+        decision = Decision.UNQUALIFIED
+    elif core_gate_passed and overall_score >= 75:
+        decision = Decision.QUALIFIED
+    else:
+        decision = Decision.NEEDS_REVISION
+    return overall_score, core_gate_passed, decision
 
 
 class AuditReport(StrictModel):
@@ -398,6 +570,23 @@ class AuditReport(StrictModel):
             raise ValueError("deep audit requires gates and overall score")
         if self.risk_assessment is None:
             raise ValueError("deep audit requires a risk assessment")
+        for dimension in self.dimensions:
+            level_points = dimension_level_points(dimension)
+            if (
+                dimension.score != dimension_score(level_points)
+                or dimension.level != dimension_level(level_points)
+            ):
+                raise ValueError(
+                    "dimension score and level must match the code-computed dimension display"
+                )
+        expected_risk_level = compute_risk_level_points(
+            self.risk_assessment.compliance_context,
+            self.risk_assessment.risk_findings,
+        )
+        if self.risk_assessment.level_points != expected_risk_level:
+            raise ValueError(
+                "risk assessment level_points must match the code-computed risk level"
+            )
         risk_dimension = next(
             item
             for item in self.dimensions
@@ -410,8 +599,36 @@ class AuditReport(StrictModel):
             raise ValueError(
                 "risk assessment level_points must match risk_compliance dimension"
             )
+        expected_risk_failures = set(
+            fixed_risk_hard_failures(self.risk_assessment.risk_findings)
+        )
+        actual_risk_failures = [
+            failure
+            for failure in self.hard_failures
+            if failure in _FIXED_RISK_HARD_FAILURE_CODES
+        ]
+        if (
+            set(actual_risk_failures) != expected_risk_failures
+            or len(actual_risk_failures) != len(set(actual_risk_failures))
+        ):
+            raise ValueError(
+                "fixed risk hard failures must exactly match detected risk findings"
+            )
         if self.decision == Decision.PENDING_DEEP_AUDIT:
             raise ValueError("deep audit cannot remain pending")
+        expected_overall, expected_core_gate, expected_decision = (
+            compute_audit_outcome(self.dimensions, self.hard_failures)
+        )
+        if self.overall_score != expected_overall:
+            raise ValueError(
+                "overall_score must match the code-computed overall score"
+            )
+        if self.core_gate_passed != expected_core_gate:
+            raise ValueError(
+                "core_gate_passed must match the code-computed core gate"
+            )
+        if self.decision != expected_decision:
+            raise ValueError("decision must match the code-computed decision")
         return self
 
 
