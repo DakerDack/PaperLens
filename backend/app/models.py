@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 
 Identifier = Annotated[str, Field(min_length=1, max_length=100)]
@@ -179,6 +180,24 @@ class ProjectStage(str, Enum):
     QUICK_CHECKED = "quick_checked"
     DEEP_AUDITED = "deep_audited"
     PATCH_PENDING = "patch_pending"
+    FAILED = "failed"
+
+
+class RunOperation(str, Enum):
+    PARSE = "parse"
+    GENERATE = "generate"
+    QUICK_CHECK = "quick_check"
+    DEEP_AUDIT = "deep_audit"
+
+
+class RunMode(str, Enum):
+    LOCAL = "local"
+    MOCK = "mock"
+    LIVE = "live"
+
+
+class RunStatus(str, Enum):
+    SUCCEEDED = "succeeded"
     FAILED = "failed"
 
 
@@ -650,6 +669,190 @@ class EditPatch(StrictModel):
             raise ValueError("sentence patches require exactly one target sentence")
         if self.scope == PatchScope.DOCUMENT and self.target_sentence_ids:
             raise ValueError("document patches cannot contain target sentence ids")
+        return self
+
+
+def _require_utc(value: datetime) -> datetime:
+    if value.utcoffset() != timedelta(0):
+        raise ValueError("datetime must use UTC timezone")
+    return value.astimezone(timezone.utc)
+
+
+UtcDatetime = Annotated[AwareDatetime, AfterValidator(_require_utc)]
+ModelMode = Literal["mock", "live"]
+
+
+class ParseQualitySnapshot(StrictModel):
+    page_count: int = Field(ge=0)
+    block_count: int = Field(ge=0)
+    empty_page_rate: float = Field(ge=0, le=1)
+    abnormal_character_rate: float = Field(ge=0, le=1)
+    page_number_completeness_rate: float = Field(ge=0, le=1)
+    bbox_availability_rate: float = Field(ge=0, le=1)
+
+
+class ParseSnapshot(StrictModel):
+    blocks: list[SourceBlock]
+    quality: ParseQualitySnapshot
+
+    @model_validator(mode="after")
+    def validate_block_snapshot(self) -> ParseSnapshot:
+        block_ids = [block.block_id for block in self.blocks]
+        reading_orders = [block.reading_order for block in self.blocks]
+        if len(block_ids) != len(set(block_ids)):
+            raise ValueError("parse snapshot block_id values must be unique")
+        if len(reading_orders) != len(set(reading_orders)):
+            raise ValueError("parse snapshot reading_order values must be unique")
+        if self.quality.block_count != len(self.blocks):
+            raise ValueError("parse quality block_count must match blocks")
+        return self
+
+
+class ClaimsSnapshot(StrictModel):
+    claims: list[AtomicClaim]
+
+    @model_validator(mode="after")
+    def validate_claim_ids(self) -> ClaimsSnapshot:
+        claim_ids = [claim.claim_id for claim in self.claims]
+        if len(claim_ids) != len(set(claim_ids)):
+            raise ValueError("claims snapshot claim_id values must be unique")
+        return self
+
+
+class EvidenceSnapshot(StrictModel):
+    evidence_records: list[EvidenceRecord]
+
+
+class UsageSnapshot(StrictModel):
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    completion_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+
+
+class RunMetadata(StrictModel):
+    message: str | None = Field(default=None, max_length=500)
+    retryable: bool
+    retryable_stage: ProjectStage | None = None
+    model: str | None = Field(default=None, max_length=100)
+    prompt_version: str | None = Field(default=None, max_length=100)
+    schema_version: str | None = Field(default=None, max_length=100)
+
+
+class ProjectCreateResponse(StrictModel):
+    project_id: Identifier
+    stage: Literal[ProjectStage.PARSED]
+    parse_quality: ParseQualitySnapshot
+    source_block_count: int = Field(ge=0)
+    created_at: UtcDatetime
+
+    @model_validator(mode="after")
+    def validate_source_block_count(self) -> ProjectCreateResponse:
+        if self.source_block_count != self.parse_quality.block_count:
+            raise ValueError("source_block_count must match parse quality block_count")
+        return self
+
+
+class VersionSummary(StrictModel):
+    version_id: Identifier
+    version_no: int = Field(ge=1)
+    parent_version_id: Identifier | None
+    reason: str = Field(min_length=1)
+    created_at: UtcDatetime
+
+
+class ProjectView(StrictModel):
+    project_id: Identifier
+    stage: ProjectStage
+    model_mode: ModelMode
+    parse_quality: ParseQualitySnapshot | None
+    source_block_count: int = Field(ge=0)
+    current_version_id: Identifier | None
+    current_version_no: int | None = Field(default=None, ge=1)
+    document: ContentDraft | None
+    claims: list[AtomicClaim]
+    evidence_records: list[EvidenceRecord]
+    audit_report: AuditReport | None
+    versions: list[VersionSummary]
+    error_code: str | None
+    retryable_stage: ProjectStage | None
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
+
+    @model_validator(mode="after")
+    def validate_project_view(self) -> ProjectView:
+        expected_count = self.parse_quality.block_count if self.parse_quality else 0
+        if self.source_block_count != expected_count:
+            raise ValueError("source_block_count must match parse quality block_count")
+        version_fields = (
+            self.current_version_id,
+            self.current_version_no,
+            self.document,
+        )
+        if any(value is None for value in version_fields) != all(
+            value is None for value in version_fields
+        ):
+            raise ValueError("current version fields must be present or null together")
+        if self.current_version_id is None and (
+            self.claims or self.evidence_records or self.audit_report is not None
+        ):
+            raise ValueError("version snapshots require a current version")
+        if self.current_version_id is not None and not any(
+            version.version_id == self.current_version_id
+            and version.version_no == self.current_version_no
+            for version in self.versions
+        ):
+            raise ValueError("current version must be present in version summaries")
+        return self
+
+
+class GenerationResponse(StrictModel):
+    project_id: Identifier
+    version_id: Identifier
+    stage: Literal[ProjectStage.QUICK_CHECKED]
+    model_mode: ModelMode
+    document: ContentDraft
+    claims: list[AtomicClaim]
+    evidence_records: list[EvidenceRecord]
+    quick_report: AuditReport
+
+    @model_validator(mode="after")
+    def validate_quick_report(self) -> GenerationResponse:
+        if self.quick_report.audit_status != AuditStatus.QUICK_COMPLETE:
+            raise ValueError("generation response requires a quick audit report")
+        GeneratedBundle(document=self.document, claims=self.claims)
+        return self
+
+
+class DeepAuditRequest(StrictModel):
+    source_disclosure_status: DisclosureStatus
+    ai_assistance_disclosure_status: DisclosureStatus
+    generated_content_label_applicability: GeneratedContentLabelApplicability
+    generated_content_label_status: GeneratedContentLabelStatus
+
+    @model_validator(mode="after")
+    def validate_generated_content_label(self) -> DeepAuditRequest:
+        ComplianceContext(
+            rights_or_license_confirmed=True,
+            source_disclosure_status=self.source_disclosure_status,
+            ai_assistance_disclosure_status=self.ai_assistance_disclosure_status,
+            generated_content_label_applicability=(
+                self.generated_content_label_applicability
+            ),
+            generated_content_label_status=self.generated_content_label_status,
+        )
+        return self
+
+
+class DeepAuditResponse(StrictModel):
+    project_id: Identifier
+    version_id: Identifier
+    stage: Literal[ProjectStage.DEEP_AUDITED]
+    audit_report: AuditReport
+
+    @model_validator(mode="after")
+    def validate_deep_report(self) -> DeepAuditResponse:
+        if self.audit_report.audit_status != AuditStatus.DEEP_COMPLETE:
+            raise ValueError("deep audit response requires a deep audit report")
         return self
 
 

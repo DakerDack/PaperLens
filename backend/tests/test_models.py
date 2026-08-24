@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -6,16 +7,31 @@ from pydantic import ValidationError
 
 from backend.app.models import (
     AuditReport,
+    ClaimsSnapshot,
     ComplianceContext,
+    DeepAuditRequest,
+    DeepAuditResponse,
     DeepAuditResult,
     DimensionId,
     EditPatch,
     EvidenceRecord,
+    EvidenceSnapshot,
+    GenerationResponse,
     GeneratedBundle,
+    ParseQualitySnapshot,
+    ParseSnapshot,
+    ProjectCreateResponse,
+    ProjectView,
     RiskAssessment,
     RiskFinding,
     RiskLocation,
+    RunMetadata,
+    RunMode,
+    RunOperation,
+    RunStatus,
     SourceBlock,
+    UsageSnapshot,
+    VersionSummary,
 )
 
 
@@ -703,3 +719,256 @@ def test_audit_report_json_round_trip_preserves_complete_risk_details() -> None:
     assert restored == report
     assert restored.risk_assessment is not None
     assert len(restored.risk_assessment.risk_findings[1].locations) == 2
+
+
+def valid_parse_quality_payload() -> dict[str, object]:
+    return {
+        "page_count": 2,
+        "block_count": 4,
+        "empty_page_rate": 0.0,
+        "abnormal_character_rate": 0.0,
+        "page_number_completeness_rate": 1.0,
+        "bbox_availability_rate": 1.0,
+    }
+
+
+def test_stage_four_snapshot_contracts_round_trip_strictly() -> None:
+    bundle = GeneratedBundle.model_validate(load_json("generation_valid.json"))
+    blocks = [SourceBlock.model_validate(item) for item in load_json("source_blocks.json")]
+    evidence = EvidenceRecord(
+        claim_id="c-001",
+        block_id="p01-b001",
+        page_index=0,
+        quote="PaperLens fixture - page one",
+        bbox=blocks[0].bbox,
+        match_method="model_candidate",
+        quote_verified=True,
+        rule_flags=[],
+    )
+
+    parse_snapshot = ParseSnapshot(
+        blocks=blocks,
+        quality=ParseQualitySnapshot.model_validate(valid_parse_quality_payload()),
+    )
+    claims_snapshot = ClaimsSnapshot(claims=bundle.claims)
+    evidence_snapshot = EvidenceSnapshot(evidence_records=[evidence])
+    usage_snapshot = UsageSnapshot(
+        prompt_tokens=10,
+        completion_tokens=None,
+        total_tokens=15,
+    )
+    metadata = RunMetadata(
+        message="Generation failed safely.",
+        retryable=True,
+        retryable_stage="generated",
+        model="hy3",
+        prompt_version="generation-v1",
+        schema_version="generated-bundle-v1",
+    )
+
+    assert ParseSnapshot.model_validate_json(parse_snapshot.model_dump_json()) == parse_snapshot
+    assert ClaimsSnapshot.model_validate_json(claims_snapshot.model_dump_json()) == claims_snapshot
+    assert EvidenceSnapshot.model_validate_json(evidence_snapshot.model_dump_json()) == evidence_snapshot
+    assert UsageSnapshot.model_validate_json(usage_snapshot.model_dump_json()) == usage_snapshot
+    assert RunMetadata.model_validate_json(metadata.model_dump_json()) == metadata
+    assert set(RunOperation) == {"parse", "generate", "quick_check", "deep_audit"}
+    assert set(RunMode) == {"local", "mock", "live"}
+    assert set(RunStatus) == {"succeeded", "failed"}
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (
+            ParseQualitySnapshot,
+            {**valid_parse_quality_payload(), "page_count": -1},
+        ),
+        (
+            ParseQualitySnapshot,
+            {**valid_parse_quality_payload(), "empty_page_rate": 1.01},
+        ),
+        (
+            UsageSnapshot,
+            {
+                "prompt_tokens": -1,
+                "completion_tokens": None,
+                "total_tokens": None,
+            },
+        ),
+        (
+            RunMetadata,
+            {
+                "message": None,
+                "retryable": False,
+                "retryable_stage": None,
+                "model": None,
+                "prompt_version": None,
+                "schema_version": None,
+                "provider_response": "must not be stored",
+            },
+        ),
+    ],
+)
+def test_stage_four_snapshot_contracts_reject_invalid_values(
+    model: type,
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        model.model_validate(payload)
+
+
+def test_stage_four_core_api_models_enforce_fixed_contracts() -> None:
+    bundle = GeneratedBundle.model_validate(load_json("generation_valid.json"))
+    blocks = [SourceBlock.model_validate(item) for item in load_json("source_blocks.json")]
+    quality = ParseQualitySnapshot.model_validate(valid_parse_quality_payload())
+    evidence = EvidenceRecord(
+        claim_id="c-001",
+        block_id="p01-b001",
+        page_index=0,
+        quote="PaperLens fixture - page one",
+        bbox=blocks[0].bbox,
+        match_method="model_candidate",
+        quote_verified=True,
+        rule_flags=[],
+    )
+    quick_report = AuditReport(
+        audit_status="quick_complete",
+        dimensions=[],
+        risk_assessment=None,
+        hard_failures=[],
+        core_gate_passed=None,
+        overall_score=None,
+        decision="pending_deep_audit",
+    )
+    now = datetime(2026, 8, 24, 1, 2, 3, tzinfo=timezone.utc)
+    version = VersionSummary(
+        version_id="version-001",
+        version_no=1,
+        parent_version_id=None,
+        reason="initial_generation",
+        created_at=now,
+    )
+
+    created = ProjectCreateResponse(
+        project_id="project-001",
+        stage="parsed",
+        parse_quality=quality,
+        source_block_count=len(blocks),
+        created_at=now,
+    )
+    view = ProjectView(
+        project_id="project-001",
+        stage="quick_checked",
+        model_mode="mock",
+        parse_quality=quality,
+        source_block_count=len(blocks),
+        current_version_id="version-001",
+        current_version_no=1,
+        document=bundle.document,
+        claims=bundle.claims,
+        evidence_records=[evidence],
+        audit_report=quick_report,
+        versions=[version],
+        error_code=None,
+        retryable_stage=None,
+        created_at=now,
+        updated_at=now,
+    )
+    generation = GenerationResponse(
+        project_id="project-001",
+        version_id="version-001",
+        stage="quick_checked",
+        model_mode="mock",
+        document=bundle.document,
+        claims=bundle.claims,
+        evidence_records=[evidence],
+        quick_report=quick_report,
+    )
+    audit_request = DeepAuditRequest(
+        source_disclosure_status="present",
+        ai_assistance_disclosure_status="present",
+        generated_content_label_applicability="not_applicable",
+        generated_content_label_status="not_applicable",
+    )
+
+    assert created.stage.value == "parsed"
+    assert view.versions == [version]
+    assert generation.stage.value == "quick_checked"
+    assert audit_request.generated_content_label_status.value == "not_applicable"
+
+
+@pytest.mark.parametrize(
+    ("model", "payload", "message"),
+    [
+        (
+            ProjectCreateResponse,
+            {
+                "project_id": "project-001",
+                "stage": "created",
+                "parse_quality": valid_parse_quality_payload(),
+                "source_block_count": 4,
+                "created_at": "2026-08-24T01:02:03Z",
+            },
+            "stage",
+        ),
+        (
+            VersionSummary,
+            {
+                "version_id": "version-001",
+                "version_no": 1,
+                "parent_version_id": None,
+                "reason": "initial_generation",
+                "created_at": "2026-08-24T01:02:03+08:00",
+            },
+            "UTC",
+        ),
+        (
+            DeepAuditRequest,
+            {
+                "source_disclosure_status": "present",
+                "ai_assistance_disclosure_status": "present",
+                "generated_content_label_applicability": "applicable",
+                "generated_content_label_status": "not_applicable",
+            },
+            "generated content",
+        ),
+        (
+            DeepAuditRequest,
+            {
+                "source_disclosure_status": "present",
+                "ai_assistance_disclosure_status": "present",
+                "generated_content_label_applicability": "not_applicable",
+                "generated_content_label_status": "not_applicable",
+                "rights_or_license_confirmed": True,
+            },
+            "Extra inputs",
+        ),
+    ],
+)
+def test_stage_four_api_models_reject_wrong_stage_time_or_request(
+    model: type,
+    payload: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        model.model_validate(payload)
+
+
+def test_stage_four_deep_audit_response_requires_deep_audited_stage() -> None:
+    payload = {
+        "project_id": "project-001",
+        "version_id": "version-001",
+        "stage": "quick_checked",
+        "audit_report": {
+            "audit_status": "quick_complete",
+            "dimensions": [],
+            "risk_assessment": None,
+            "hard_failures": [],
+            "core_gate_passed": None,
+            "overall_score": None,
+            "decision": "pending_deep_audit",
+        },
+    }
+
+    with pytest.raises(ValidationError, match="stage"):
+        DeepAuditResponse.model_validate(payload)
