@@ -226,7 +226,7 @@ created -> parsed -> generated -> quick_checked -> deep_audited
 | `GET /api/projects/{id}` | 读取完整当前状态 | 当前文档、审计、版本列表 | `PROJECT_NOT_FOUND` |
 | `GET /api/projects/{id}/pdf` | 读取本地 PDF | PDF 文件流 | `PDF_NOT_FOUND` |
 | `POST /api/projects/{id}/generate` | 联合生成并自动快速检查 | 文档、主张、规则结果 | `HY3_UNAVAILABLE`、`SCHEMA_INVALID` |
-| `POST /api/projects/{id}/audit` | 批量运行完整语义审计和评分 | 完整 `AuditReport` | `EVIDENCE_NOT_READY`、`HY3_UNAVAILABLE` |
+| `POST /api/projects/{id}/audit` | 批量运行完整语义审计和评分 | 完整 `AuditReport` | `EVIDENCE_NOT_READY`、`SCHEMA_INVALID`、`AUDIT_INCOMPLETE`、`HY3_UNAVAILABLE` |
 | `POST /api/projects/{id}/revisions` | 生成补丁预览，不改当前版本 | `EditPatch` | `TARGET_STALE`、`PATCH_INVALID` |
 | `POST /api/projects/{id}/revisions/{patch_id}/accept` | 接受补丁并生成新版本 | 新版本和快速检查结果 | `TARGET_STALE`、`PATCH_INVALID` |
 | `POST /api/projects/{id}/versions/{version_id}/restore` | 复制历史版本为新当前版本 | 新版本 | `VERSION_NOT_FOUND` |
@@ -357,7 +357,207 @@ created -> parsed -> generated -> quick_checked -> deep_audited
 - `terminology_status`: `correct/misused/unclear`
 - `severity`: `none/minor/major/critical`
 
-### 5.5 AuditReport
+`SemanticJudgment` 只描述单个已验证 `claim/evidence` 配对的事实关系、范围和术语判断。`severity` 只修饰该语义问题，不得被解释为风险合规类别或最终风险等级，也不得通过解析 `reason` 推断风险。阶段 3 的深审 v2 迁移完成后，`SemanticJudgment[]` v1 不再作为独立顶层响应；不得并行保留两套生产协议。
+
+### 5.5 深审 v2 风险合规契约
+
+#### 5.5.1 ComplianceContext
+
+`ComplianceContext` 由代码构造并验证，不是 Hy3 输出：
+
+```json
+{
+  "rights_or_license_confirmed": true,
+  "source_disclosure_status": "present",
+  "ai_assistance_disclosure_status": "present",
+  "generated_content_label_applicability": "not_applicable",
+  "generated_content_label_status": "not_applicable"
+}
+```
+
+固定枚举与约束：
+
+- `rights_or_license_confirmed`: 必填布尔值
+- `source_disclosure_status`、`ai_assistance_disclosure_status`: `present/missing`
+- `generated_content_label_applicability`: `applicable/not_applicable`
+- `generated_content_label_status`: `present/missing/not_applicable`
+- `generated_content_label_applicability=not_applicable` 时，`generated_content_label_status` 必须为 `not_applicable`。
+- `generated_content_label_applicability=applicable` 时，`generated_content_label_status` 只能为 `present/missing`。
+- Hy3 不得推断用户是否拥有处理权限、来源或 AI 辅助说明是否存在、生成内容标识是否适用或存在。
+
+#### 5.5.2 RiskLocation
+
+`RiskLocation` 只定位完整 `ContentDraft` 中的内容，不是 PDF 来源证据：
+
+```json
+{
+  "location_type": "sentence",
+  "sentence_id": "s-001",
+  "evidence_excerpt": "该句中可核验的风险片段"
+}
+```
+
+三个字段全部必填，固定约束如下：
+
+- `location_type`: `sentence/title/document`
+- `sentence_id`: `string|null`
+- `evidence_excerpt`: `string|null`，非空时最长 160 个字符
+- `location_type=sentence` 时，`sentence_id` 必须引用当前完整 `ContentDraft` 中真实存在的句子。
+- `location_type=title` 或 `location_type=document` 时，`sentence_id` 必须为 `null`。
+- `evidence_excerpt` 非空时，必须能在对应句子或标题中执行 Unicode、空白、换行和断词规范化匹配；不得带入对应位置以外的内容。
+- `location_type=document` 只表达无法缩小到标题或单句的文档级判断，`evidence_excerpt` 必须为 `null`。
+- 所有位置只能来自完整 `ContentDraft`；不得返回页码、bbox、`SourceBlock` 引文或其他 PDF 位置信息。
+
+#### 5.5.3 RiskFinding
+
+Hy3 只对完整生成文档执行三类语义风险检查，并为每类恰好返回一条 `RiskFinding`：
+
+```json
+{
+  "category": "author_impersonation",
+  "status": "detected",
+  "locations": [
+    {
+      "location_type": "sentence",
+      "sentence_id": "s-001",
+      "evidence_excerpt": "作者声称亲自完成了该实验"
+    }
+  ],
+  "reason": "该表述可能冒充论文作者身份。",
+  "remediation": "改为第三人称的论文解读表述。"
+}
+```
+
+五个字段全部必填，固定约束如下：
+
+- `category`: `sensitive_information/author_impersonation/academic_integrity`
+- `status`: `detected/not_detected/unclear`
+- `locations`: `RiskLocation[]`，允许保存同类风险在完整文档中的多个实际位置
+- `reason`: 必填，1 至 500 个字符
+- `remediation`: 必填，1 至 300 个字符
+- 三个 `category` 必须各出现一次，不能缺失、重复或额外增加类别。
+- `status=detected` 时 `locations` 至少包含一个合法位置。
+- `status=not_detected` 时 `locations` 必须为空数组。
+- `status=unclear` 是合法结果，`locations` 可以为空；非空时每个位置仍必须满足 `RiskLocation` 的全部核验规则。
+- `category=sensitive_information` 时，每个 `RiskLocation.evidence_excerpt` 必须为 `null`；`reason` 和 `remediation` 不得复述完整敏感值，只能说明风险类型与安全修改方式。
+
+Hy3 不得返回最终风险等级、风险维度分数、权重、硬失败、`core_gate_passed`、`decision`、页码、bbox，也不得判断许可、披露或标识的适用性。
+
+#### 5.5.4 DeepAuditResult v2
+
+现有深审协议从顶层 `SemanticJudgment[]` v1 原子升级为唯一的 `DeepAuditResult` v2：
+
+```json
+{
+  "semantic_judgments": [
+    {
+      "claim_id": "c-001",
+      "block_id": "p01-b003",
+      "relation": "supports",
+      "scope_status": "preserved",
+      "terminology_status": "correct",
+      "severity": "none",
+      "reason": "证据直接支持该主张。"
+    }
+  ],
+  "risk_findings": [
+    {
+      "category": "sensitive_information",
+      "status": "not_detected",
+      "locations": [],
+      "reason": "未发现敏感信息。",
+      "remediation": "无需修改。"
+    },
+    {
+      "category": "author_impersonation",
+      "status": "not_detected",
+      "locations": [],
+      "reason": "未发现作者身份冒充。",
+      "remediation": "无需修改。"
+    },
+    {
+      "category": "academic_integrity",
+      "status": "not_detected",
+      "locations": [],
+      "reason": "未发现鼓励违反学术诚信的内容。",
+      "remediation": "无需修改。"
+    }
+  ]
+}
+```
+
+`DeepAuditResult` 顶层只能包含必填的 `semantic_judgments` 和 `risk_findings`。`DeepAuditResult`、`SemanticJudgment`、`RiskFinding`、`RiskLocation` 和嵌套对象全部使用严格 JSON Schema，`additionalProperties=false`。深审 v2 固定使用：
+
+- Prompt 版本：`audit-v2`
+- Schema 版本：`deep-audit-result-v2`
+- Schema 名称：`paperlens_deep_audit_result_v2`
+
+深审输入同时包含完整 `ContentDraft` 和已验证 `claim/evidence` 配对。完整文档包含 `non_auditable` 句子；它们不进入事实支持率分母，但必须进入三类文档级风险检查。`ComplianceContext` 由 `AuditService` 单独接收和合并，不发送给 Hy3 让其重新判断。
+
+责任与错误边界固定如下：
+
+- Hy3 只返回 `semantic_judgments` 和三类结构化 `risk_findings`。
+- 代码核验语义配对、风险类别完整性、所有 `RiskLocation` 和 `evidence_excerpt`，再合并 `ComplianceContext`。
+- 非 JSON、对象缺字段、额外字段或非法枚举属于结构错误，经过受限重试后返回 `SCHEMA_INVALID`。
+- JSON 结构合法但 `ComplianceContext`、语义配对、风险类别覆盖、位置、摘录、检查结果或代码生成的 `RiskAssessment` 缺失、不完整、重复、额外或无法验证时，`AuditService` 返回 `AUDIT_INCOMPLETE`，不得生成完整八维分数、核心门槛或最终结论。
+- Live 供应商调用失败返回 `HY3_UNAVAILABLE`，禁止回退 Mock。
+
+#### 5.5.5 RiskAssessment
+
+`RiskAssessment` 由代码在完整校验 `ComplianceContext` 和 `DeepAuditResult.risk_findings` 后生成，不是 Hy3 输出：
+
+```json
+{
+  "compliance_context": {
+    "rights_or_license_confirmed": true,
+    "source_disclosure_status": "present",
+    "ai_assistance_disclosure_status": "present",
+    "generated_content_label_applicability": "not_applicable",
+    "generated_content_label_status": "not_applicable"
+  },
+  "risk_findings": [
+    {
+      "category": "sensitive_information",
+      "status": "not_detected",
+      "locations": [],
+      "reason": "未发现敏感信息。",
+      "remediation": "无需修改。"
+    },
+    {
+      "category": "author_impersonation",
+      "status": "not_detected",
+      "locations": [],
+      "reason": "未发现作者身份冒充。",
+      "remediation": "无需修改。"
+    },
+    {
+      "category": "academic_integrity",
+      "status": "not_detected",
+      "locations": [],
+      "reason": "未发现鼓励违反学术诚信的内容。",
+      "remediation": "无需修改。"
+    }
+  ],
+  "level_points": 4
+}
+```
+
+三个字段全部必填；`risk_findings` 必须保存校验通过的三个类别及其全部位置、理由和修复建议，`level_points` 必须是代码按下表计算的 0 至 4 整数。任何缺失或不一致均为 `AUDIT_INCOMPLETE`。
+
+风险与合规的代码映射按严重信号优先，通用 `SemanticJudgment.severity` 不参与该维度：
+
+| 结构化信号 | 代码风险信号 | 风险等级 | 硬失败 |
+|---|---|---:|---|
+| 全部操作检查通过；三类风险均 `not_detected` | 无 | 4 | 否 |
+| 来源说明或 AI 辅助披露恰好 1 项 `missing` | 1 项提示缺失 | 3 | 否 |
+| 来源说明与 AI 辅助披露均 `missing`，或任一风险为 `unclear` | 2 项提示缺失或中风险 | 2 | 否 |
+| `rights_or_license_confirmed=false` | 高风险 | 1 | 否；上传/API 仍应优先返回 `RIGHTS_NOT_CONFIRMED` |
+| 标识适用但 `generated_content_label_status=missing` | 严重风险 | 0 | 否；单独缺失标识不加入 `hard_failures` |
+| 任一三类风险为 `detected` | 严重风险 | 0 | 按类别生成 `SENSITIVE_INFORMATION`、`AUTHOR_IMPERSONATION` 或 `ACADEMIC_INTEGRITY` |
+
+多个信号同时出现时取最低等级；任何 0 级信号优先于其他项。标识适用但缺失会使风险合规维度为 0 级并令核心门槛不通过，但它本身不构成硬失败；没有其他硬失败时最终 `decision=needs_revision`，不得判为 `unqualified`。只有三类风险的 `detected` 状态分别生成 `SENSITIVE_INFORMATION`、`AUTHOR_IMPERSONATION`、`ACADEMIC_INTEGRITY` 硬失败。代码仍按风险与合规权重 5%、核心门槛最低 3 级计算总分和双门槛。快速检查保持 `dimensions=[]`、`overall_score=null`、`core_gate_passed=null`、`decision=pending_deep_audit`。
+
+### 5.6 AuditReport
 
 ```json
 {
@@ -370,6 +570,39 @@ created -> parsed -> generated -> quick_checked -> deep_audited
       "level": "good"
     }
   ],
+  "risk_assessment": {
+    "compliance_context": {
+      "rights_or_license_confirmed": true,
+      "source_disclosure_status": "present",
+      "ai_assistance_disclosure_status": "present",
+      "generated_content_label_applicability": "not_applicable",
+      "generated_content_label_status": "not_applicable"
+    },
+    "risk_findings": [
+      {
+        "category": "sensitive_information",
+        "status": "not_detected",
+        "locations": [],
+        "reason": "未发现敏感信息。",
+        "remediation": "无需修改。"
+      },
+      {
+        "category": "author_impersonation",
+        "status": "not_detected",
+        "locations": [],
+        "reason": "未发现作者身份冒充。",
+        "remediation": "无需修改。"
+      },
+      {
+        "category": "academic_integrity",
+        "status": "not_detected",
+        "locations": [],
+        "reason": "未发现鼓励违反学术诚信的内容。",
+        "remediation": "无需修改。"
+      }
+    ],
+    "level_points": 4
+  },
   "hard_failures": [],
   "core_gate_passed": true,
   "overall_score": 82.5,
@@ -383,6 +616,7 @@ created -> parsed -> generated -> quick_checked -> deep_audited
 {
   "audit_status": "quick_complete",
   "dimensions": [],
+  "risk_assessment": null,
   "hard_failures": [],
   "core_gate_passed": null,
   "overall_score": null,
@@ -390,9 +624,11 @@ created -> parsed -> generated -> quick_checked -> deep_audited
 }
 ```
 
+`AuditReport.risk_assessment` 的类型固定为 `RiskAssessment|null`。`quick_complete` 必须为 `null`；`deep_complete` 必须包含非空 `RiskAssessment`，且其 `level_points` 必须与 `risk_compliance` 维度 `raw_metrics.level_points` 一致。阶段 4 的 API 返回完整 `AuditReport`，`audits.report_json` 保存同一完整对象，因此风险位置、理由和修复建议必须随报告持久化，不能在 API 或存储边界丢失。
+
 完整八维分数、核心门槛和总分只能由 `audit_service.py` 根据规则与语义结果计算，Hy3 不得直接返回。
 
-### 5.6 EditPatch
+### 5.7 EditPatch
 
 ```json
 {
@@ -468,14 +704,21 @@ allowed_source_blocks: {{source_blocks_json}}
 ### 6.4 深度审计模板
 
 ```text
-逐条判断 claim 是否被给定 evidence 支持。
+任务一：逐条判断 claim 是否被给定 evidence 支持。
 不得参考分数、预设质量档位、攻击标签或其他 claim 的最终判断。
 重点检查：事实关系、相关性与因果、样本和适用范围、术语语境、关键限定条件。
 证据不能直接支持时选择 insufficient，不得依靠常识补足。
 
+任务二：检查完整生成文档中的 sensitive_information、author_impersonation 和 academic_integrity。
+每个风险类别恰好返回一条 RiskFinding；用 RiskLocation[] 保存所有实际位置，non_auditable 句子也必须检查。
+RiskLocation 只能定位完整 ContentDraft 的 sentence/title/document；摘录最长 160 字符且必须可核验，敏感信息摘录必须为 null。
+不得判断许可、来源披露、AI 辅助披露或生成内容标识是否适用和存在。
+不得返回风险等级、分数、权重、硬失败、合格结论、页码或 bbox。
+
+document: {{content_draft_json}}
 items: {{verified_claim_evidence_pairs_json}}
 
-输出：严格符合 SemanticJudgment[] JSON Schema。
+输出：严格符合 DeepAuditResult v2 JSON Schema 的单个 JSON 对象。
 ```
 
 ### 6.5 修订模板
@@ -507,7 +750,7 @@ user_instruction: {{user_instruction}}
 | `generation_valid.json` | 合法联合生成响应 |
 | `generation_invalid_block.json` | 引用不存在 block 的响应 |
 | `generation_invalid_schema.json` | 缺少必填字段的响应 |
-| `deep_audit_valid.json` | 合法语义审计响应 |
+| `deep_audit_valid.json` | 合法 `DeepAuditResult` v2 响应，含精确语义配对和三类风险检查 |
 | `patch_sentence_valid.json` | 合法句子补丁 |
 | `patch_out_of_scope.json` | 修改越界补丁 |
 
@@ -622,7 +865,7 @@ python -m pytest backend/tests/test_models.py backend/tests/test_hy3_service.py 
 
 ### 阶段 3：证据核验、快速检查和评分
 
-**允许修改**：`audit_service.py`、`test_audit_service.py`，必要时补充 `models.py`。
+**允许修改**：常规任务为 `audit_service.py`、`test_audit_service.py`，必要时补充 `models.py`。深审 v2 属于一次原子协议迁移；只有用户明确授权时，才允许在同一任务同步修改 `models.py`、`prompts.py`、`hy3_service.py`、`audit_service.py`、`deep_audit_valid.json`、`test_models.py`、`test_hy3_service.py` 和 `test_audit_service.py`。该例外只用于将 v1 原子替换为 v2，不得新增并行协议、API、数据库或前端改动。
 
 任务：
 
@@ -631,12 +874,14 @@ python -m pytest backend/tests/test_models.py backend/tests/test_hy3_service.py 
 3. 候选无效时使用 BM25 + 数字/单位/否定词精确匹配召回 Top-3。
 4. 实现页码、引文、数字、单位、否定词、比较方向和必需区检查。
 5. 实现条件拆分触发器，但不对所有句子递归调用。
-6. 批量调用 `Hy3Service.deep_audit`，并由代码计算八维分数和双门槛。
+6. 批量调用 `Hy3Service.deep_audit` 获取唯一的 `DeepAuditResult` v2；输入包含完整 `ContentDraft` 和已验证语义配对，代码合并 `ComplianceContext`、生成 `RiskAssessment` 后计算八维分数和双门槛。
+7. non-auditable 内容不进入事实支持率分母，但必须进入完整文档的风险检查。
+8. 风险合规不得复用通用 `SemanticJudgment.severity`，不得解析 `reason` 猜类别；只有结构化 `ComplianceContext` 与 `RiskFinding` 可进入风险等级映射。
 
 测试：
 
 ```powershell
-python -m pytest backend/tests/test_audit_service.py -q
+python -m pytest backend/tests/test_models.py backend/tests/test_hy3_service.py backend/tests/test_audit_service.py -q
 ```
 
 必须覆盖：
@@ -649,8 +894,14 @@ python -m pytest backend/tests/test_audit_service.py -q
 - 只有八维语义结果齐全时才生成完整总分。
 - 硬失败不能被其他维度高分抵消。
 - 权重总和严格等于 1。
+- 纯事实、范围或术语问题不会重复扣风险合规分。
+- 三类风险检查缺失、重复、额外，`RiskLocation` 类型/句子/摘录无效，或 `RiskAssessment` 缺失、不完整、等级不一致时返回 `AUDIT_INCOMPLETE`，不生成完整结论。
+- `detected/not_detected/unclear` 的位置数量约束、多位置保存、敏感信息摘录为空及脱敏理由/修复建议均有测试。
+- 一项提示缺失、两项提示缺失/中风险、高风险和严重风险分别稳定映射为 3、2、1、0 级；三类 `detected` 触发对应代码硬失败。
+- 标识适用但缺失稳定映射为 0 级但不生成硬失败；没有其他硬失败时结论为 `needs_revision`。
+- `quick_complete` 的 `risk_assessment=null`；`deep_complete` 保存完整 `RiskAssessment`，且其 `level_points` 与风险合规维度一致并能随 `AuditReport` JSON 往返保留。
 
-通过门槛：黄金主张与证据样例全部符合预期，评分公式和双门槛测试全绿。
+通过门槛：黄金主张与证据样例全部符合预期；深审 v2 的语义配对、三类风险检查、完整位置模型和摘录全部可核验；`RiskAssessment` 可完整持久化且等级与维度一致；风险评分公式、权重、严格硬失败映射和双门槛测试全绿；Hy3 未直接控制风险等级、分数或最终结论。
 
 ### 阶段 4：存储和 API 闭环
 

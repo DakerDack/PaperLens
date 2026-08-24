@@ -118,11 +118,23 @@ finally {
 
 开始时必须：
 1. 将工作目录设为 D:\Hy3，阅读 AGENTS.md、DEV_PLAN 第 1、2、5、6、7、8.3、9、10、12 节，以及 proposal 中评分、八维和双门槛的有效技术定义。
-2. 阅读 models.py、hy3_service.py、现有夹具和测试，运行阶段 2 回归：`.venv313\Scripts\python.exe -m pytest backend/tests/test_models.py backend/tests/test_hy3_service.py -q -p no:cacheprovider`。
-3. 先给出阶段任务清单；每个原子任务编辑前输出唯一目标、最多 4 个文件、禁止范围、输入输出/错误码和测试命令。
+2. 阅读 models.py、prompts.py、hy3_service.py、audit_service.py、现有夹具和测试，运行阶段 2 回归：`.venv313\Scripts\python.exe -m pytest backend/tests/test_models.py backend/tests/test_hy3_service.py -q -p no:cacheprovider`。
+3. 先给出阶段任务清单；每个普通原子任务编辑前输出唯一目标、最多 4 个文件、禁止范围、输入输出/错误码和测试命令。经用户明确授权的深审 v2 原子迁移是唯一八文件例外，必须一次同步切换且不得扩展范围。
 4. 先测试失败样例，再写最小实现；规则层和语义层必须可分别测试。
 
-阶段允许范围：audit_service.py、test_audit_service.py；只有契约确实缺失时才补 models.py。不得修改前端、API、数据库和 Hy3 客户端公共协议，不得增加嵌入模型或向量库。
+阶段允许范围：常规任务为 audit_service.py、test_audit_service.py；只有契约确实缺失时才补 models.py。深审 v2 已冻结为单一 `DeepAuditResult` 原子替换；经用户单独授权后，可同步修改 models.py、prompts.py、hy3_service.py、audit_service.py、deep_audit_valid.json、test_models.py、test_hy3_service.py 和 test_audit_service.py。不得保留并行 v1/v2 生产入口，不得修改前端、API、数据库，不得增加嵌入模型或向量库。
+
+深审 v2 固定契约：
+- 唯一输出为 `DeepAuditResult {semantic_judgments, risk_findings}`，Prompt/Schema/名称版本固定为 `audit-v2`、`deep-audit-result-v2`、`paperlens_deep_audit_result_v2`。
+- `ComplianceContext` 由代码提供，包含处理权限或许可确认、来源说明、AI 辅助披露、生成内容标识适用性与存在状态；Hy3 不得判断这些字段。
+- Hy3 读取完整 `ContentDraft`，对 `sensitive_information/author_impersonation/academic_integrity` 各返回一条 `RiskFinding`；状态只允许 `detected/not_detected/unclear`。
+- `RiskLocation` 固定为 `{location_type, sentence_id, evidence_excerpt}`：`location_type` 只允许 `sentence/title/document`，摘录为 `null` 或最长 160 字符；sentence 必须引用真实生成句，title/document 的 sentence_id 必须为 `null`，document 的摘录必须为 `null`，非空摘录必须在对应标题或句子中规范化匹配。
+- `RiskFinding` 固定为 `{category, status, locations, reason, remediation}`。`detected` 至少一个合法位置，`not_detected` 的位置为空，`unclear` 可为空；同类风险可保存多个位置。敏感信息位置的摘录必须为 `null`，理由和修复建议不得复述完整敏感值。所有位置只来自完整 `ContentDraft`，不得使用页码、bbox 或 SourceBlock 引文。
+- Hy3 不得返回最终风险等级、pass/fail、分数、权重、硬失败、decision、页码或 bbox。代码核验语义配对、三类风险完整性、所有位置和摘录，合并 `ComplianceContext` 后生成 `RiskAssessment {compliance_context, risk_findings, level_points}`，再计算 0 至 4 级、硬失败、5% 权重、核心门槛和最终结论。
+- `AuditReport.risk_assessment` 固定为 `RiskAssessment|null`：`quick_complete` 必须为 `null`，`deep_complete` 必须非空，且 `level_points` 必须与风险合规维度一致。阶段 4 API 返回并由 `audits.report_json` 保存完整 `AuditReport`，位置、理由和修复建议不得丢失。
+- 非 JSON、对象缺字段、额外字段或非法枚举为 `SCHEMA_INVALID`；结构合法但 ComplianceContext、配对、风险类别、位置、摘录、检查结果或 RiskAssessment 不完整为 `AUDIT_INCOMPLETE`，且不得生成分数；Live 供应商失败为 `HY3_UNAVAILABLE`，禁止回退 Mock。
+- `non_auditable` 内容不进入事实支持率分母，但仍随完整文档接受风险检查。
+- 风险映射固定为：全通过=4；一项来源/AI 提示缺失=3；两项提示缺失或任一 `unclear`=2；处理权限或许可未确认=1；必要标识缺失或任一三类风险 `detected`=0。必要标识单独缺失不进入 hard_failures，没有其他硬失败时 decision 必须为 `needs_revision`；三类 `detected` 才分别生成 `SENSITIVE_INFORMATION`、`AUTHOR_IMPERSONATION`、`ACADEMIC_INTEGRITY`。通用 SemanticJudgment.severity 不参与风险合规。
 
 必须完成：
 - 核验候选 source_block_id 是否存在；模型候选只是一条线索，不是证据事实。
@@ -130,21 +142,21 @@ finally {
 - 候选无效时使用 rank-bm25 加数字、单位、否定词精确约束召回 Top-3。
 - 实现页码、引文、数字、单位、否定词、比较方向和五区必需内容检查。
 - 实现条件拆分触发器，只拆真正包含多个可独立核验事实的句子，不递归调用所有句子。
-- 批量调用 Hy3Service.deep_audit 获取语义结果；由代码计算八维分数、权重、总分、硬失败和双门槛。
+- 批量调用 Hy3Service.deep_audit 获取 DeepAuditResult v2；由代码检查完整性、合并 ComplianceContext、生成 RiskAssessment，并计算八维分数、权重、总分、硬失败和双门槛。
 - quick_complete 时总分和合格状态必须为 null/pending_deep_audit；只有八维结果齐全才计算完整结论。
 
-必须覆盖：正确 block/引文、假 block、假引用、数字改变、单位改变、否定反转、换行/连字符规范化、无证据 insufficient、快速与完整状态、权重严格为 1、硬失败不可被高分抵消。测试不能只断言总分，还要断言问题定位和状态。
+必须覆盖：正确 block/引文、假 block、假引用、数字改变、单位改变、否定反转、换行/连字符规范化、无证据 insufficient、快速与完整状态、权重严格为 1、硬失败不可被高分抵消；还要覆盖纯术语 severity 不扣风险分、non_auditable 风险检查、三类风险完整性、RiskLocation 三种位置约束、同类多位置、摘录规范化核验、敏感信息脱敏、4/3/2/1/0 映射、标识缺失无硬失败且为 needs_revision、三类 detected 硬失败、quick/deep RiskAssessment 状态、等级一致及 AuditReport JSON 往返。测试不能只断言总分，还要断言问题定位、原始指标、错误码和状态。
 
 最终验收使用以下完整 PowerShell 指令：
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath "D:\Hy3"
 $Python = (Resolve-Path ".\.venv313\Scripts\python.exe").Path
-& $Python -m pytest "backend/tests/test_audit_service.py" -q -p no:cacheprovider
-if ($LASTEXITCODE -ne 0) { throw "Stage 3 focused tests failed: $LASTEXITCODE" }
+& $Python -m pytest "backend/tests/test_models.py" "backend/tests/test_hy3_service.py" "backend/tests/test_audit_service.py" -q -p no:cacheprovider
+if ($LASTEXITCODE -ne 0) { throw "Stage 3 focused contract and audit tests failed: $LASTEXITCODE" }
 & $Python -m pytest "backend/tests" -q -p no:cacheprovider
 if ($LASTEXITCODE -ne 0) { throw "Stage 3 backend regression failed: $LASTEXITCODE" }
 
-阶段完成条件：黄金主张和证据样例全部符合预期；假引用和数字篡改稳定检出；评分公式、权重和双门槛测试全绿；Hy3 未直接控制最终分数或 pass/fail；无计划外目录、依赖、API 或 Schema。
+阶段完成条件：黄金主张和证据样例全部符合预期；假引用和数字篡改稳定检出；DeepAuditResult v2 的严格 Schema、语义配对、三类风险检查、完整位置模型和敏感信息脱敏全绿；RiskAssessment 完整持久化且等级与风险合规维度一致；标识缺失与三类 detected 的硬失败映射、评分公式、权重和双门槛测试全绿；Hy3 未直接控制风险等级、最终分数或 pass/fail；无计划外目录、依赖、API 或 Schema。
 
 结束时只提交阶段报告：规则层、语义层、评分层完成情况，修改文件，关键测试样例，测试结果，残余风险，是否通过门槛。报告必须附上完整且无占位符的 PowerShell 验收脚本。停在阶段边界，等待阶段 4 新会话。
 ```

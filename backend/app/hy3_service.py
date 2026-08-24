@@ -9,12 +9,24 @@ from typing import Any
 from openai import OpenAI, OpenAIError
 from pydantic import ValidationError
 
-from backend.app.models import GeneratedBundle, SourceBlock
+from backend.app.models import (
+    AtomicClaim,
+    ContentDraft,
+    DeepAuditResult,
+    EvidenceRecord,
+    GeneratedBundle,
+    SourceBlock,
+)
 from backend.app.prompts import (
     COMMON_SYSTEM_PROMPT,
+    DEEP_AUDIT_SYSTEM_PROMPT,
+    DEEP_AUDIT_PROMPT_VERSION,
+    DEEP_AUDIT_SCHEMA_NAME,
+    DEEP_AUDIT_SCHEMA_VERSION,
     GENERATION_PROMPT_VERSION,
     GENERATION_SCHEMA_NAME,
     GENERATION_SCHEMA_VERSION,
+    render_deep_audit_prompt,
     render_generation_prompt,
 )
 from backend.app.settings import Settings, settings as app_settings
@@ -28,12 +40,23 @@ MOCK_GENERATION_FIXTURE = (
     / "fixtures"
     / "generation_valid.json"
 )
+MOCK_DEEP_AUDIT_FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "tests"
+    / "fixtures"
+    / "deep_audit_valid.json"
+)
 GENERATION_TEMPERATURE = 0
 GENERATION_MAX_COMPLETION_TOKENS = 4096
 GENERATION_THINKING = "disabled"
+DEEP_AUDIT_TEMPERATURE = 0
+DEEP_AUDIT_MAX_COMPLETION_TOKENS = 4096
+DEEP_AUDIT_THINKING = "disabled"
 
 
 UsageTuple = tuple[int | None, int | None, int | None]
+SemanticPair = tuple[AtomicClaim, EvidenceRecord]
+SemanticPairKey = tuple[str, str]
 
 
 class Hy3ServiceError(RuntimeError):
@@ -102,6 +125,55 @@ class Hy3Service:
             error_code="NONE",
         )
         return bundle
+
+    def deep_audit(
+        self,
+        *,
+        document: ContentDraft,
+        claim_evidence_pairs: list[SemanticPair],
+    ) -> DeepAuditResult:
+        started_at = time.perf_counter()
+        usage: UsageTuple = (None, None, None)
+        retries = 0
+        try:
+            self._validate_deep_audit_input(claim_evidence_pairs)
+            if self.settings.paperlens_model_mode == "mock":
+                result = self._validate_deep_audit_result(
+                    self._load_mock_deep_audit_response()
+                )
+            else:
+                self._require_live_config()
+                prompt = self._build_deep_audit_prompt(
+                    document,
+                    claim_evidence_pairs,
+                )
+                result, retries, usage = self._deep_audit_live(prompt)
+        except Hy3ServiceError as exc:
+            self._log_run(
+                started_at=started_at,
+                retries=exc.retries,
+                usage=exc.usage,
+                error_code=exc.error_code,
+                prompt_version=DEEP_AUDIT_PROMPT_VERSION,
+                schema_version=DEEP_AUDIT_SCHEMA_VERSION,
+                temperature=DEEP_AUDIT_TEMPERATURE,
+                max_completion_tokens=DEEP_AUDIT_MAX_COMPLETION_TOKENS,
+                thinking=DEEP_AUDIT_THINKING,
+            )
+            raise
+
+        self._log_run(
+            started_at=started_at,
+            retries=retries,
+            usage=usage,
+            error_code="NONE",
+            prompt_version=DEEP_AUDIT_PROMPT_VERSION,
+            schema_version=DEEP_AUDIT_SCHEMA_VERSION,
+            temperature=DEEP_AUDIT_TEMPERATURE,
+            max_completion_tokens=DEEP_AUDIT_MAX_COMPLETION_TOKENS,
+            thinking=DEEP_AUDIT_THINKING,
+        )
+        return result
 
     def check_model_online(self) -> bool:
         self._require_live_config()
@@ -199,6 +271,70 @@ class Hy3Service:
 
         raise AssertionError("unreachable schema retry state")
 
+    def _deep_audit_live(
+        self,
+        original_prompt: str,
+    ) -> tuple[DeepAuditResult, int, UsageTuple]:
+        field_error_summary: str | None = None
+        cumulative_usage: UsageTuple | None = None
+        for attempt in range(self.settings.hy3_max_retries + 1):
+            prompt = original_prompt
+            if field_error_summary is not None:
+                prompt += f"\n\n字段错误摘要：{field_error_summary}"
+
+            try:
+                response = self._get_client().chat.completions.create(
+                    model=self.settings.hy3_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": DEEP_AUDIT_SYSTEM_PROMPT,
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format=self._deep_audit_response_format(),
+                    stream=False,
+                    temperature=DEEP_AUDIT_TEMPERATURE,
+                    max_completion_tokens=DEEP_AUDIT_MAX_COMPLETION_TOKENS,
+                    extra_body={
+                        "thinking": {"type": DEEP_AUDIT_THINKING}
+                    },
+                )
+            except OpenAIError as exc:
+                raise Hy3ServiceError(
+                    "HY3_UNAVAILABLE",
+                    "The Hy3 provider request failed.",
+                    retryable=True,
+                    retries=attempt,
+                    usage=(
+                        cumulative_usage
+                        if cumulative_usage is not None
+                        else (None, None, None)
+                    ),
+                ) from exc
+
+            cumulative_usage = self._accumulate_usage(
+                cumulative_usage,
+                self._extract_usage(response),
+            )
+            raw_response = self._extract_response_content(response)
+            try:
+                return (
+                    self._validate_deep_audit_result(raw_response),
+                    attempt,
+                    cumulative_usage,
+                )
+            except Hy3ServiceError as exc:
+                exc.retries = attempt
+                exc.usage = cumulative_usage
+                if attempt >= self.settings.hy3_max_retries:
+                    raise
+                field_error_summary = (
+                    exc.field_error_summary or "$ [schema_invalid]"
+                )
+
+        raise AssertionError("unreachable schema retry state")
+
     def _require_live_config(self) -> None:
         if self.settings.hy3_api_key.strip():
             return
@@ -240,6 +376,27 @@ class Hy3Service:
         )
 
     @staticmethod
+    def _build_deep_audit_prompt(
+        document: ContentDraft,
+        claim_evidence_pairs: list[SemanticPair],
+    ) -> str:
+        items = [
+            {
+                "claim": claim.model_dump(mode="json"),
+                "evidence": evidence.model_dump(mode="json"),
+            }
+            for claim, evidence in claim_evidence_pairs
+        ]
+        return render_deep_audit_prompt(
+            content_draft_json=document.model_dump_json(),
+            verified_claim_evidence_pairs_json=json.dumps(
+                items,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+
+    @staticmethod
     def _response_format() -> dict[str, Any]:
         return {
             "type": "json_schema",
@@ -251,6 +408,17 @@ class Hy3Service:
         }
 
     @staticmethod
+    def _deep_audit_response_format() -> dict[str, Any]:
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": DEEP_AUDIT_SCHEMA_NAME,
+                "strict": True,
+                "schema": DeepAuditResult.model_json_schema(),
+            },
+        }
+
+    @staticmethod
     def _load_mock_response() -> str:
         try:
             return MOCK_GENERATION_FIXTURE.read_text(encoding="utf-8")
@@ -258,6 +426,17 @@ class Hy3Service:
             raise Hy3ServiceError(
                 "SCHEMA_INVALID",
                 "The configured Mock response could not be read.",
+                retryable=False,
+            ) from exc
+
+    @staticmethod
+    def _load_mock_deep_audit_response() -> str:
+        try:
+            return MOCK_DEEP_AUDIT_FIXTURE.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise Hy3ServiceError(
+                "SCHEMA_INVALID",
+                "The configured Mock deep-audit response could not be read.",
                 retryable=False,
             ) from exc
 
@@ -278,6 +457,62 @@ class Hy3Service:
             raise Hy3ServiceError(
                 "SCHEMA_INVALID",
                 "The model response did not match GeneratedBundle.",
+                retryable=False,
+                field_error_summary=Hy3Service._field_error_summary(exc),
+            ) from exc
+
+    @staticmethod
+    def _validate_deep_audit_input(
+        claim_evidence_pairs: list[SemanticPair],
+    ) -> set[SemanticPairKey]:
+        expected_pairs: set[SemanticPairKey] = set()
+        for claim, evidence in claim_evidence_pairs:
+            if (
+                evidence.claim_id != claim.claim_id
+                or evidence.block_id is None
+                or not evidence.quote_verified
+            ):
+                raise Hy3ServiceError(
+                    "SCHEMA_INVALID",
+                    "Deep audit requires claim-linked verified evidence.",
+                    retryable=False,
+                    field_error_summary=(
+                        "$ [input_invalid]: claim and verified evidence "
+                        "must be linked"
+                    ),
+                )
+            pair = (claim.claim_id, evidence.block_id)
+            if pair in expected_pairs:
+                raise Hy3ServiceError(
+                    "SCHEMA_INVALID",
+                    "Deep audit input contains a duplicate claim-evidence pair.",
+                    retryable=False,
+                    field_error_summary=(
+                        "$ [input_duplicate]: duplicate claim-evidence pair"
+                    ),
+                )
+            expected_pairs.add(pair)
+        return expected_pairs
+
+    @staticmethod
+    def _validate_deep_audit_result(
+        raw_response: Any,
+    ) -> DeepAuditResult:
+        if not isinstance(raw_response, (str, bytes, bytearray)):
+            raise Hy3ServiceError(
+                "SCHEMA_INVALID",
+                "The model response did not contain JSON text.",
+                retryable=False,
+                field_error_summary=(
+                    "$ [json_type]: response content must be JSON text"
+                ),
+            )
+        try:
+            return DeepAuditResult.model_validate_json(raw_response)
+        except ValidationError as exc:
+            raise Hy3ServiceError(
+                "SCHEMA_INVALID",
+                "The model response did not match DeepAuditResult v2.",
                 retryable=False,
                 field_error_summary=Hy3Service._field_error_summary(exc),
             ) from exc
@@ -357,6 +592,11 @@ class Hy3Service:
         retries: int,
         usage: UsageTuple,
         error_code: str,
+        prompt_version: str = GENERATION_PROMPT_VERSION,
+        schema_version: str = GENERATION_SCHEMA_VERSION,
+        temperature: int = GENERATION_TEMPERATURE,
+        max_completion_tokens: int = GENERATION_MAX_COMPLETION_TOKENS,
+        thinking: str = GENERATION_THINKING,
     ) -> None:
         prompt_tokens, completion_tokens, total_tokens = usage
         latency_ms = max(0, round((time.perf_counter() - started_at) * 1000))
@@ -366,12 +606,12 @@ class Hy3Service:
             "prompt_tokens=%s completion_tokens=%s total_tokens=%s "
             "latency_ms=%s retries=%s error_code=%s",
             self.settings.hy3_model,
-            GENERATION_PROMPT_VERSION,
-            GENERATION_SCHEMA_VERSION,
+            prompt_version,
+            schema_version,
             self.settings.paperlens_model_mode,
-            GENERATION_TEMPERATURE,
-            GENERATION_MAX_COMPLETION_TOKENS,
-            GENERATION_THINKING,
+            temperature,
+            max_completion_tokens,
+            thinking,
             prompt_tokens,
             completion_tokens,
             total_tokens,

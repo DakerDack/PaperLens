@@ -9,12 +9,23 @@ from openai import OpenAIError
 from pydantic import TypeAdapter
 
 from backend.app.hy3_service import Hy3Service, Hy3ServiceError
-from backend.app.models import GeneratedBundle, SectionId, SourceBlock
+from backend.app.models import (
+    AtomicClaim,
+    DeepAuditResult,
+    EvidenceRecord,
+    GeneratedBundle,
+    SectionId,
+    SourceBlock,
+)
 from backend.app.prompts import (
     COMMON_SYSTEM_PROMPT,
+    DEEP_AUDIT_PROMPT_VERSION,
+    DEEP_AUDIT_SCHEMA_NAME,
+    DEEP_AUDIT_SCHEMA_VERSION,
     GENERATION_PROMPT_VERSION,
     GENERATION_SCHEMA_NAME,
     GENERATION_SCHEMA_VERSION,
+    render_deep_audit_prompt,
     render_generation_prompt,
 )
 from backend.app.settings import Settings
@@ -107,6 +118,74 @@ def valid_generation_json() -> str:
     return (FIXTURES / "generation_valid.json").read_text(encoding="utf-8")
 
 
+def generated_bundle() -> GeneratedBundle:
+    return GeneratedBundle.model_validate_json(valid_generation_json())
+
+
+def verified_claim_evidence_pairs() -> list[tuple[AtomicClaim, EvidenceRecord]]:
+    bundle = generated_bundle()
+    claims = {claim.claim_id: claim for claim in bundle.claims}
+    blocks = {block.block_id: block for block in load_source_blocks()}
+    return [
+        (
+            claims["c-001"],
+            EvidenceRecord(
+                claim_id="c-001",
+                block_id="p01-b001",
+                page_index=0,
+                quote="PaperLens fixture - page one",
+                bbox=blocks["p01-b001"].bbox,
+                match_method="model_candidate",
+                quote_verified=True,
+                rule_flags=[],
+            ),
+        ),
+        (
+            claims["c-002"],
+            EvidenceRecord(
+                claim_id="c-002",
+                block_id="p01-b002",
+                page_index=0,
+                quote="Synthetic test text. No private paper content.",
+                bbox=blocks["p01-b002"].bbox,
+                match_method="model_candidate",
+                quote_verified=True,
+                rule_flags=[],
+            ),
+        ),
+        (
+            claims["c-003"],
+            EvidenceRecord(
+                claim_id="c-003",
+                block_id="p02-b001",
+                page_index=1,
+                quote="PaperLens fixture - page two",
+                bbox=blocks["p02-b001"].bbox,
+                match_method="model_candidate",
+                quote_verified=True,
+                rule_flags=[],
+            ),
+        ),
+        (
+            claims["c-004"],
+            EvidenceRecord(
+                claim_id="c-004",
+                block_id="p02-b002",
+                page_index=1,
+                quote="Second synthetic page for zero-based mapping.",
+                bbox=blocks["p02-b002"].bbox,
+                match_method="model_candidate",
+                quote_verified=True,
+                rule_flags=[],
+            ),
+        ),
+    ]
+
+
+def valid_deep_audit_json() -> str:
+    return (FIXTURES / "deep_audit_valid.json").read_text(encoding="utf-8")
+
+
 def completion_response(
     content: str,
     usage: tuple[int | None, int | None, int | None] | None,
@@ -153,6 +232,343 @@ def test_generation_prompt_centralizes_stage_two_contract() -> None:
     assert "不得生成页码、bbox、总分或合格结论" in prompt
     assert 'paper_metadata: {"title":"Synthetic"}' in prompt
     assert 'source_blocks: [{"block_id":"p01-b001","text":"Evidence"}]' in prompt
+
+
+def test_deep_audit_prompt_centralizes_v2_document_contract() -> None:
+    prompt = render_deep_audit_prompt(
+        content_draft_json=(
+            '{"title":"Synthetic","sections":['
+            '{"section_id":"plain_explanation","sentences":['
+            '{"sentence_id":"s-na","text":"NON_AUDITABLE_PRIVATE_TEXT"}]}]}'
+        ),
+        verified_claim_evidence_pairs_json=(
+            '[{"claim":{"claim_id":"c-001"},'
+            '"evidence":{"block_id":"p01-b001"}}]'
+        )
+    )
+
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v2"
+    assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
+    assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v2"
+    assert "逐条判断" in prompt
+    assert "insufficient" in prompt
+    assert "sensitive_information" in prompt
+    assert "author_impersonation" in prompt
+    assert "academic_integrity" in prompt
+    assert "NON_AUDITABLE_PRIVATE_TEXT" in prompt
+    assert "完整生成文档" in prompt
+    assert "不得返回风险等级、分数、权重、硬失败" in prompt
+    assert "页码" in prompt and "bbox" in prompt
+    assert "不得补充给定 evidence 之外的知识或证据" in prompt
+    assert '"claim_id":"c-001"' in prompt
+
+
+def test_mock_deep_audit_returns_valid_deep_audit_result() -> None:
+    result = Hy3Service(settings=mock_settings()).deep_audit(
+        document=generated_bundle().document,
+        claim_evidence_pairs=verified_claim_evidence_pairs()
+    )
+
+    assert isinstance(result, DeepAuditResult)
+    assert [(item.claim_id, item.block_id) for item in result.semantic_judgments] == [
+        ("c-001", "p01-b001"),
+        ("c-002", "p01-b002"),
+        ("c-003", "p02-b001"),
+        ("c-004", "p02-b002"),
+    ]
+    assert all(item.relation == "supports" for item in result.semantic_judgments)
+    assert {item.category.value for item in result.risk_findings} == {
+        "sensitive_information",
+        "author_impersonation",
+        "academic_integrity",
+    }
+
+
+def test_mock_deep_audit_leaves_pair_completeness_to_audit_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = Hy3Service(settings=mock_settings())
+    invalid = json.loads(valid_deep_audit_json())
+    invalid["semantic_judgments"][1]["block_id"] = "p99-b999"
+    monkeypatch.setattr(
+        service,
+        "_load_mock_deep_audit_response",
+        lambda: json.dumps(invalid),
+    )
+
+    result = service.deep_audit(
+        document=generated_bundle().document,
+        claim_evidence_pairs=verified_claim_evidence_pairs(),
+    )
+
+    assert isinstance(result, DeepAuditResult)
+    assert result.semantic_judgments[1].block_id == "p99-b999"
+
+
+def test_mock_deep_audit_uses_same_v2_schema_validation_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = Hy3Service(settings=mock_settings())
+    invalid = json.loads(valid_deep_audit_json())
+    invalid.pop("risk_findings")
+    monkeypatch.setattr(
+        service,
+        "_load_mock_deep_audit_response",
+        lambda: json.dumps(invalid),
+    )
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        service.deep_audit(
+            document=generated_bundle().document,
+            claim_evidence_pairs=verified_claim_evidence_pairs(),
+        )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retryable is False
+
+
+def test_live_deep_audit_uses_one_strict_batch_request() -> None:
+    client = FakeClient([valid_deep_audit_json()])
+    service = Hy3Service(settings=live_settings(), client=client)
+
+    result = service.deep_audit(
+        document=generated_bundle().document,
+        claim_evidence_pairs=verified_claim_evidence_pairs()
+    )
+
+    assert len(result.semantic_judgments) == 4
+    assert len(result.risk_findings) == 3
+    assert len(client.completions.calls) == 1
+    request = client.completions.calls[0]
+    assert request["model"] == "hy3"
+    assert request["stream"] is False
+    assert request["temperature"] == 0
+    assert request["extra_body"] == {"thinking": {"type": "disabled"}}
+    response_format = request["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["name"] == DEEP_AUDIT_SCHEMA_NAME
+    assert response_format["json_schema"]["strict"] is True
+    assert response_format["json_schema"]["schema"]["type"] == "object"
+    assert_closed_objects(response_format["json_schema"]["schema"])
+    user_prompt = request["messages"][1]["content"]
+    assert "PaperLens fixture - page one" in user_prompt
+    assert "PaperLens synthetic fixture explanation" in user_prompt
+    assert "In plain terms, this is a short synthetic PDF for parser tests." in user_prompt
+    assert "overall_score" not in user_prompt
+
+
+def test_live_deep_audit_schema_error_retries_and_logs_safely(caplog) -> None:
+    invalid = "DEEP_AUDIT_PRIVATE_INVALID_RESPONSE"
+    client = FakeClient([invalid, valid_deep_audit_json()])
+    source_secret = verified_claim_evidence_pairs()[0][1].quote
+
+    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+        result = Hy3Service(
+            settings=live_settings(),
+            client=client,
+        ).deep_audit(
+            document=generated_bundle().document,
+            claim_evidence_pairs=verified_claim_evidence_pairs(),
+        )
+
+    assert len(result.semantic_judgments) == 4
+    assert len(client.completions.calls) == 2
+    retry_prompt = client.completions.calls[1]["messages"][1]["content"]
+    assert retry_prompt.count("字段错误摘要：") == 1
+    assert invalid not in retry_prompt
+    assert "prompt_version=audit-v2" in caplog.text
+    assert "schema_version=deep-audit-result-v2" in caplog.text
+    assert "retries=1" in caplog.text
+    assert invalid not in caplog.text
+    assert source_secret not in caplog.text
+    assert generated_bundle().document.title not in caplog.text
+    assert (
+        generated_bundle().document.sections[-1].sentences[0].text
+        not in caplog.text
+    )
+    assert "unit-test-key" not in caplog.text
+
+
+def test_live_deep_audit_provider_failure_stays_failed_without_mock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient([OpenAIError("private provider detail")])
+    service = Hy3Service(settings=live_settings(), client=client)
+    monkeypatch.setattr(
+        service,
+        "_load_mock_deep_audit_response",
+        lambda: pytest.fail("Live failure must not load Mock deep-audit data"),
+        raising=False,
+    )
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        service.deep_audit(
+            document=generated_bundle().document,
+            claim_evidence_pairs=verified_claim_evidence_pairs()
+        )
+
+    assert exc_info.value.error_code == "HY3_UNAVAILABLE"
+    assert exc_info.value.retryable is True
+    assert len(client.completions.calls) == 1
+
+
+def test_deep_audit_rejects_duplicate_input_pair() -> None:
+    pairs = verified_claim_evidence_pairs()
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        Hy3Service(settings=mock_settings()).deep_audit(
+            document=generated_bundle().document,
+            claim_evidence_pairs=[*pairs, pairs[0]]
+        )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retryable is False
+
+
+def test_deep_audit_rejects_unverified_input_evidence() -> None:
+    pairs = verified_claim_evidence_pairs()
+    claim, evidence = pairs[0]
+    unverified = evidence.model_copy(update={"quote_verified": False})
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        Hy3Service(settings=mock_settings()).deep_audit(
+            document=generated_bundle().document,
+            claim_evidence_pairs=[(claim, unverified)]
+        )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retryable is False
+
+
+def test_live_deep_audit_three_schema_failures_accumulate_usage(caplog) -> None:
+    private_values = [
+        "DEEP_PRIVATE_INVALID_ONE",
+        "DEEP_PRIVATE_INVALID_TWO",
+        "DEEP_PRIVATE_INVALID_THREE",
+    ]
+    client = FakeClient(
+        [
+            completion_response(private_values[0], (11, 7, 18)),
+            completion_response(private_values[1], (13, 9, 22)),
+            completion_response(private_values[2], (17, 11, 28)),
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            Hy3Service(settings=live_settings(), client=client).deep_audit(
+                document=generated_bundle().document,
+                claim_evidence_pairs=verified_claim_evidence_pairs()
+            )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.retries == 2
+    assert exc_info.value.usage == (41, 27, 68)
+    assert len(client.completions.calls) == 3
+    assert "prompt_tokens=41" in caplog.text
+    assert "completion_tokens=27" in caplog.text
+    assert "total_tokens=68" in caplog.text
+    assert all(value not in caplog.text for value in private_values)
+
+
+def test_live_deep_audit_provider_failure_preserves_prior_usage(caplog) -> None:
+    private_values = ["DEEP_PRIVATE_FIRST", "DEEP_PRIVATE_SECOND"]
+    client = FakeClient(
+        [
+            completion_response(private_values[0], (13, 5, 18)),
+            completion_response(private_values[1], (17, 7, 24)),
+            OpenAIError("private provider detail after schema retries"),
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            Hy3Service(settings=live_settings(), client=client).deep_audit(
+                document=generated_bundle().document,
+                claim_evidence_pairs=verified_claim_evidence_pairs()
+            )
+
+    assert exc_info.value.error_code == "HY3_UNAVAILABLE"
+    assert exc_info.value.retryable is True
+    assert exc_info.value.retries == 2
+    assert exc_info.value.usage == (30, 12, 42)
+    assert len(client.completions.calls) == 3
+    assert "prompt_tokens=30" in caplog.text
+    assert "completion_tokens=12" in caplog.text
+    assert "total_tokens=42" in caplog.text
+    assert "error_code=HY3_UNAVAILABLE" in caplog.text
+    assert all(value not in caplog.text for value in private_values)
+
+
+@pytest.mark.parametrize("variant", ["missing", "extra", "illegal_enum"])
+def test_live_deep_audit_v2_schema_errors_retry_twice(
+    variant: str,
+) -> None:
+    invalid = json.loads(valid_deep_audit_json())
+    if variant == "missing":
+        invalid.pop("risk_findings")
+    elif variant == "extra":
+        invalid["unexpected"] = "PRIVATE_SCHEMA_VALUE"
+    else:
+        invalid["risk_findings"][0]["status"] = "invalid_status"
+    raw = json.dumps(invalid)
+    client = FakeClient([raw, raw, raw])
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        Hy3Service(settings=live_settings(), client=client).deep_audit(
+            document=generated_bundle().document,
+            claim_evidence_pairs=verified_claim_evidence_pairs(),
+        )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retries == 2
+    assert len(client.completions.calls) == 3
+
+
+def test_live_deep_audit_with_empty_pairs_still_checks_complete_document() -> None:
+    payload = json.loads(valid_deep_audit_json())
+    payload["semantic_judgments"] = []
+    client = FakeClient([json.dumps(payload)])
+    document = generated_bundle().document
+
+    result = Hy3Service(settings=live_settings(), client=client).deep_audit(
+        document=document,
+        claim_evidence_pairs=[],
+    )
+
+    assert result.semantic_judgments == []
+    assert len(result.risk_findings) == 3
+    assert len(client.completions.calls) == 1
+    prompt = client.completions.calls[0]["messages"][1]["content"]
+    assert document.title in prompt
+    assert document.sections[-1].sentences[0].text in prompt
+    assert "items: []" in prompt
+
+
+def test_live_deep_audit_missing_key_does_not_call_provider_or_mock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient([valid_deep_audit_json()])
+    service = Hy3Service(
+        settings=live_settings(hy3_api_key=""),
+        client=client,
+    )
+    monkeypatch.setattr(
+        service,
+        "_load_mock_deep_audit_response",
+        lambda: pytest.fail("Live config failure must not load Mock data"),
+    )
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        service.deep_audit(
+            document=generated_bundle().document,
+            claim_evidence_pairs=verified_claim_evidence_pairs(),
+        )
+
+    assert exc_info.value.error_code == "HY3_CONFIG_MISSING"
+    assert exc_info.value.retryable is False
+    assert client.completions.calls == []
 
 
 def test_mock_generation_returns_valid_generated_bundle() -> None:

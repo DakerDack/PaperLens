@@ -1,21 +1,63 @@
-[
-  {
-    "claim_id": "c-001",
-    "block_id": "p01-b001",
-    "relation": "supports",
-    "scope_status": "preserved",
-    "terminology_status": "correct",
-    "severity": "none",
-    "reason": "证据直接说明了研究问题。"
-  },
-  {
-    "claim_id": "c-002",
-    "block_id": "p02-b001",
-    "relation": "supports",
-    "scope_status": "preserved",
-    "terminology_status": "correct",
-    "severity": "none",
-    "reason": "样本数量与原文一致。"
-  }
-]
-
+{
+  "semantic_judgments": [
+    {
+      "claim_id": "c-001",
+      "block_id": "p01-b001",
+      "relation": "supports",
+      "scope_status": "preserved",
+      "terminology_status": "correct",
+      "severity": "none",
+      "reason": "证据直接说明了研究问题。"
+    },
+    {
+      "claim_id": "c-002",
+      "block_id": "p01-b002",
+      "relation": "supports",
+      "scope_status": "preserved",
+      "terminology_status": "correct",
+      "severity": "none",
+      "reason": "证据直接支持关于第一页合成文本的主张。"
+    },
+    {
+      "claim_id": "c-003",
+      "block_id": "p02-b001",
+      "relation": "supports",
+      "scope_status": "preserved",
+      "terminology_status": "correct",
+      "severity": "none",
+      "reason": "证据直接标识第二页。"
+    },
+    {
+      "claim_id": "c-004",
+      "block_id": "p02-b002",
+      "relation": "supports",
+      "scope_status": "preserved",
+      "terminology_status": "correct",
+      "severity": "none",
+      "reason": "证据支持关于零基页码映射的主张。"
+    }
+  ],
+  "risk_findings": [
+    {
+      "category": "sensitive_information",
+      "status": "not_detected",
+      "locations": [],
+      "reason": "未发现敏感信息。",
+      "remediation": "无需修改。"
+    },
+    {
+      "category": "author_impersonation",
+      "status": "not_detected",
+      "locations": [],
+      "reason": "未发现作者身份冒充。",
+      "remediation": "无需修改。"
+    },
+    {
+      "category": "academic_integrity",
+      "status": "not_detected",
+      "locations": [],
+      "reason": "未发现鼓励违反学术诚信的内容。",
+      "remediation": "无需修改。"
+    }
+  ]
+}

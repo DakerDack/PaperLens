@@ -1,0 +1,1546 @@
+import json
+from pathlib import Path
+
+import pytest
+from pydantic import TypeAdapter
+
+from backend.app.audit_service import (
+    DIMENSION_WEIGHTS,
+    AuditService,
+    AuditServiceError,
+    normalize_evidence_text,
+    required_section_flags,
+    should_split_sentence,
+)
+from backend.app.models import (
+    AtomicClaim,
+    AuditStatus,
+    ComplianceContext,
+    DeepAuditResult,
+    Decision,
+    DisclosureStatus,
+    DimensionId,
+    EvidenceRecord,
+    GeneratedContentLabelApplicability,
+    GeneratedContentLabelStatus,
+    GeneratedBundle,
+    RiskFinding,
+    SectionId,
+    SemanticJudgment,
+    Severity,
+    SourceBlock,
+    TerminologyStatus,
+)
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def source_block(
+    block_id: str,
+    text: str,
+    *,
+    page_index: int = 0,
+    reading_order: int = 0,
+) -> SourceBlock:
+    return SourceBlock(
+        block_id=block_id,
+        page_index=page_index,
+        type="text",
+        text=text,
+        bbox=(0.1, 0.2, 0.8, 0.3),
+        reading_order=reading_order,
+        parser="mineru",
+        parser_version="3.4.5",
+    )
+
+
+def atomic_claim(
+    text: str,
+    *,
+    candidate_block_ids: list[str],
+    candidate_quote: str | None,
+    numeric_entities: list[str] | None = None,
+    claim_id: str = "c-001",
+    importance: str = "critical",
+) -> AtomicClaim:
+    return AtomicClaim(
+        claim_id=claim_id,
+        sentence_id="s-001",
+        text=text,
+        claim_type="result",
+        importance=importance,
+        qualifiers=[],
+        numeric_entities=numeric_entities or [],
+        auditability="auditable",
+        candidate_block_ids=candidate_block_ids,
+        candidate_quote=candidate_quote,
+    )
+
+
+def only_record(records: list[EvidenceRecord]) -> EvidenceRecord:
+    assert len(records) == 1
+    return records[0]
+
+
+def generated_bundle() -> GeneratedBundle:
+    return GeneratedBundle.model_validate_json(
+        (FIXTURES / "generation_valid.json").read_text(encoding="utf-8")
+    )
+
+
+def source_blocks_fixture() -> list[SourceBlock]:
+    payload = json.loads(
+        (FIXTURES / "source_blocks.json").read_text(encoding="utf-8")
+    )
+    return TypeAdapter(list[SourceBlock]).validate_python(payload)
+
+
+def compliance_context(**updates: object) -> ComplianceContext:
+    payload: dict[str, object] = {
+        "rights_or_license_confirmed": True,
+        "source_disclosure_status": "present",
+        "ai_assistance_disclosure_status": "present",
+        "generated_content_label_applicability": "not_applicable",
+        "generated_content_label_status": "not_applicable",
+    }
+    payload.update(updates)
+    return ComplianceContext.model_validate(payload)
+
+
+def clear_risk_findings() -> list[RiskFinding]:
+    return [
+        RiskFinding(
+            category=category,
+            status="not_detected",
+            locations=[],
+            reason="No risk was detected.",
+            remediation="No change is required.",
+        )
+        for category in (
+            "sensitive_information",
+            "author_impersonation",
+            "academic_integrity",
+        )
+    ]
+
+
+def risk_findings_with(
+    category: str,
+    status: str,
+    *,
+    locations: list[dict[str, object]] | None = None,
+    reason: str = "The structured risk signal was detected.",
+    remediation: str = "Revise the identified generated content.",
+) -> list[RiskFinding]:
+    findings = clear_risk_findings()
+    replacement = RiskFinding.model_validate(
+        {
+            "category": category,
+            "status": status,
+            "locations": locations or [],
+            "reason": reason,
+            "remediation": remediation,
+        }
+    )
+    return [
+        replacement if finding.category.value == category else finding
+        for finding in findings
+    ]
+
+
+def deep_result(
+    judgments: list[SemanticJudgment],
+    *,
+    risk_findings: list[RiskFinding] | None = None,
+) -> DeepAuditResult:
+    return DeepAuditResult(
+        semantic_judgments=judgments,
+        risk_findings=(
+            clear_risk_findings() if risk_findings is None else risk_findings
+        ),
+    )
+
+
+class RecordingDeepAudit:
+    def __init__(
+        self,
+        *,
+        omit_last: bool = False,
+        risk_findings: list[RiskFinding] | None = None,
+    ) -> None:
+        self.omit_last = omit_last
+        self.risk_findings = risk_findings
+        self.calls: list[list[tuple[AtomicClaim, EvidenceRecord]]] = []
+        self.documents = []
+
+    def deep_audit(
+        self,
+        *,
+        document,
+        claim_evidence_pairs: list[tuple[AtomicClaim, EvidenceRecord]],
+    ) -> DeepAuditResult:
+        self.documents.append(document)
+        self.calls.append(claim_evidence_pairs)
+        pairs = claim_evidence_pairs[:-1] if self.omit_last else claim_evidence_pairs
+        return deep_result(
+            [
+                SemanticJudgment(
+                    claim_id=claim.claim_id,
+                    block_id=evidence.block_id,
+                    relation="supports",
+                    scope_status="preserved",
+                    terminology_status="correct",
+                    severity="none",
+                    reason="The verified evidence supports this claim.",
+                )
+                for claim, evidence in pairs
+                if evidence.block_id is not None
+            ],
+            risk_findings=self.risk_findings,
+        )
+
+
+def test_evidence_correct_model_block_and_quote_copy_source_location() -> None:
+    block = source_block(
+        "p04-b012",
+        "The study enrolled 69 students.",
+        page_index=3,
+    )
+    claim = atomic_claim(
+        "The study enrolled 69 students.",
+        candidate_block_ids=["p04-b012"],
+        candidate_quote="The study enrolled 69 students.",
+        numeric_entities=["69"],
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.claim_id == "c-001"
+    assert record.block_id == "p04-b012"
+    assert record.page_index == 3
+    assert record.bbox == block.bbox
+    assert record.quote == "The study enrolled 69 students."
+    assert record.quote_verified is True
+    assert record.match_method == "model_candidate"
+    assert record.rule_flags == []
+
+
+def test_normalization_accepts_unicode_whitespace_newline_and_hyphenation() -> None:
+    block = source_block(
+        "p01-b001",
+        "The inter-\nvention enrolled ６９ students.\nNo adverse events.",
+    )
+    quote = "The intervention enrolled 69   students. No adverse events."
+    claim = atomic_claim(
+        quote,
+        candidate_block_ids=["p01-b001"],
+        candidate_quote=quote,
+        numeric_entities=["69"],
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert normalize_evidence_text(block.text) == normalize_evidence_text(quote)
+    assert record.quote_verified is True
+    assert record.match_method == "model_candidate"
+    assert record.rule_flags == []
+
+
+def test_evidence_fake_block_uses_bm25_top_three_with_exact_constraints() -> None:
+    blocks = [
+        source_block(
+            "p01-b001",
+            "The treatment did not reduce pain after the 5 mg dose.",
+            reading_order=0,
+        ),
+        source_block(
+            "p01-b002",
+            "At 5 mg, the treatment did not reduce the measured symptom.",
+            reading_order=1,
+        ),
+        source_block(
+            "p01-b003",
+            "The control did not change after a 5 mg dose.",
+            reading_order=2,
+        ),
+        source_block(
+            "p01-b004",
+            "Participants did not improve with the 5 mg dose.",
+            reading_order=3,
+        ),
+        source_block(
+            "p01-b005",
+            "The treatment reduced pain after a 5 mg dose.",
+            reading_order=4,
+        ),
+        source_block(
+            "p01-b006",
+            "The treatment did not reduce pain after the 5 kg dose.",
+            reading_order=5,
+        ),
+    ]
+    claim = atomic_claim(
+        "The treatment did not reduce pain after the 5 mg dose.",
+        candidate_block_ids=["p99-b999"],
+        candidate_quote="fabricated candidate",
+        numeric_entities=["5"],
+    )
+
+    records = AuditService().verify_claim_evidence(claim, blocks)
+
+    assert len(records) == 3
+    assert records[0].block_id == "p01-b001"
+    assert all(record.match_method == "bm25_fallback" for record in records)
+    assert all(record.quote_verified is True for record in records)
+    assert all("CANDIDATE_BLOCK_NOT_FOUND:p99-b999" in record.rule_flags for record in records)
+    assert "p01-b005" not in {record.block_id for record in records}
+    assert "p01-b006" not in {record.block_id for record in records}
+
+
+def test_evidence_fake_quote_is_located_even_when_bm25_recovers_block() -> None:
+    block = source_block(
+        "p01-b001",
+        "The study enrolled 69 students from one university.",
+    )
+    claim = atomic_claim(
+        "The study enrolled 69 students from one university.",
+        candidate_block_ids=["p01-b001"],
+        candidate_quote="The study enrolled 96 students from two universities.",
+        numeric_entities=["69"],
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.match_method == "bm25_fallback"
+    assert record.block_id == "p01-b001"
+    assert "CANDIDATE_QUOTE_NOT_FOUND:p01-b001" in record.rule_flags
+
+
+def test_evidence_detects_changed_number_with_claim_location() -> None:
+    block = source_block("p01-b001", "The study enrolled 69 students.")
+    claim = atomic_claim(
+        "The study enrolled 70 students.",
+        candidate_block_ids=["p01-b001"],
+        candidate_quote="The study enrolled 69 students.",
+        numeric_entities=["70"],
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.match_method == "model_candidate"
+    assert "NUMBER_MISMATCH:70" in record.rule_flags
+
+
+def test_evidence_detects_changed_unit_with_claim_location() -> None:
+    block = source_block("p01-b001", "Participants received a 5 mg dose.")
+    claim = atomic_claim(
+        "Participants received a 5 kg dose.",
+        candidate_block_ids=["p01-b001"],
+        candidate_quote="Participants received a 5 mg dose.",
+        numeric_entities=["5"],
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert "UNIT_MISMATCH:kg" in record.rule_flags
+
+
+def test_evidence_does_not_truncate_milliseconds_to_metres() -> None:
+    block = source_block("p01-b001", "Latency was 5 ms.")
+    claim = atomic_claim(
+        "Latency was 5 m.",
+        candidate_block_ids=["p01-b001"],
+        candidate_quote="Latency was 5 ms.",
+        numeric_entities=["5"],
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert "UNIT_MISMATCH:m" in record.rule_flags
+
+
+def test_evidence_detects_negation_reversal() -> None:
+    block = source_block("p01-b001", "The treatment did not improve accuracy.")
+    claim = atomic_claim(
+        "The treatment did improve accuracy.",
+        candidate_block_ids=["p01-b001"],
+        candidate_quote="The treatment did not improve accuracy.",
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert "NEGATION_MISMATCH" in record.rule_flags
+
+
+def test_evidence_detects_comparison_direction_change() -> None:
+    block = source_block("p01-b001", "Accuracy decreased relative to baseline.")
+    claim = atomic_claim(
+        "Accuracy increased relative to baseline.",
+        candidate_block_ids=["p01-b001"],
+        candidate_quote="Accuracy decreased relative to baseline.",
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert "COMPARISON_DIRECTION_MISMATCH" in record.rule_flags
+
+
+def test_evidence_without_valid_candidate_or_recall_is_insufficient() -> None:
+    block = source_block("p01-b001", "The study used interviews only.")
+    claim = atomic_claim(
+        "The trial administered 10 mg and did not improve outcomes.",
+        candidate_block_ids=["p99-b999"],
+        candidate_quote="fabricated",
+        numeric_entities=["10"],
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.match_method == "none"
+    assert record.block_id is None
+    assert record.page_index is None
+    assert record.quote is None
+    assert record.quote_verified is False
+    assert "CANDIDATE_BLOCK_NOT_FOUND:p99-b999" in record.rule_flags
+    assert "INSUFFICIENT_EVIDENCE" in record.rule_flags
+
+
+def test_split_trigger_only_selects_sentences_with_independent_facts() -> None:
+    assert should_split_sentence(
+        "Treatment reduced pain by 10%, and accuracy increased by 5%."
+    )
+    assert should_split_sentence(
+        "Accuracy increased relative to baseline, but latency decreased."
+    )
+    assert should_split_sentence(
+        "Accuracy increased, because the model learned a causal rule."
+    )
+
+    assert not should_split_sentence("Accuracy increased by 10%.")
+    assert not should_split_sentence("The dose was 5 mg for 10 days.")
+    assert not should_split_sentence("The study used interviews and surveys.")
+
+
+def test_required_section_check_reports_the_missing_region() -> None:
+    flags = required_section_flags(
+        [
+            SectionId.RESEARCH_QUESTION,
+            SectionId.METHODS,
+            SectionId.RESULTS,
+            SectionId.PLAIN_EXPLANATION,
+        ]
+    )
+
+    assert flags == ["MISSING_REQUIRED_SECTION:limitations"]
+
+
+def test_quick_complete_keeps_score_and_decision_pending() -> None:
+    records, report = AuditService().quick_check(
+        generated_bundle(),
+        source_blocks_fixture(),
+    )
+
+    assert {record.claim_id for record in records} == {
+        "c-001",
+        "c-002",
+        "c-003",
+        "c-004",
+        "c-005",
+    }
+    assert report.audit_status == AuditStatus.QUICK_COMPLETE
+    assert report.dimensions == []
+    assert report.core_gate_passed is None
+    assert report.overall_score is None
+    assert report.decision == Decision.PENDING_DEEP_AUDIT
+    assert report.risk_assessment is None
+
+
+def test_quick_report_keeps_hard_failures_empty_while_records_keep_rule_flags() -> None:
+    bundle = generated_bundle()
+    altered_claim = bundle.claims[0].model_copy(
+        update={"candidate_quote": "A fabricated quotation."}
+    )
+    altered_bundle = bundle.model_copy(
+        update={"claims": [altered_claim, *bundle.claims[1:]]}
+    )
+
+    records, report = AuditService().quick_check(
+        altered_bundle,
+        source_blocks_fixture(),
+    )
+
+    first_claim_records = [record for record in records if record.claim_id == "c-001"]
+    assert first_claim_records
+    assert any(
+        "CANDIDATE_QUOTE_NOT_FOUND:p01-b001" in record.rule_flags
+        for record in first_claim_records
+    )
+    assert report.audit_status == AuditStatus.QUICK_COMPLETE
+    assert report.dimensions == []
+    assert report.risk_assessment is None
+    assert report.hard_failures == []
+    assert report.core_gate_passed is None
+    assert report.overall_score is None
+    assert report.decision == Decision.PENDING_DEEP_AUDIT
+
+
+def test_deep_audit_batches_once_and_code_builds_all_eight_dimensions() -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    semantic_service = RecordingDeepAudit()
+    result, report = AuditService(
+        hy3_service=semantic_service
+    ).run_deep_audit(bundle, records, compliance_context())
+
+    assert len(semantic_service.calls) == 1
+    assert len(result.semantic_judgments) == len(semantic_service.calls[0])
+    assert all(evidence.quote_verified for _, evidence in semantic_service.calls[0])
+    assert semantic_service.documents == [bundle.document]
+    assert report.audit_status == AuditStatus.DEEP_COMPLETE
+    assert {item.dimension_id for item in report.dimensions} == set(DimensionId)
+    assert len(report.dimensions) == 8
+    assert all(item.raw_metrics["level_points"] == 4 for item in report.dimensions)
+    assert report.hard_failures == []
+    assert report.core_gate_passed is True
+    assert report.overall_score == 100.0
+    assert report.decision == Decision.QUALIFIED
+    assert report.risk_assessment is not None
+    assert report.risk_assessment.level_points == 4
+
+
+def test_deep_audit_rejects_incomplete_semantic_batch_without_score() -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    service = AuditService(hy3_service=RecordingDeepAudit(omit_last=True))
+
+    try:
+        service.run_deep_audit(bundle, records, compliance_context())
+    except AuditServiceError as exc:
+        assert exc.error_code == "AUDIT_INCOMPLETE"
+        assert exc.retryable is True
+    else:
+        raise AssertionError("Incomplete semantic output must not be scored")
+
+
+def test_dimension_weights_sum_strictly_to_one() -> None:
+    assert set(DIMENSION_WEIGHTS) == set(DimensionId)
+    assert sum(DIMENSION_WEIGHTS.values()) == 1.0
+
+
+def test_hard_failure_cannot_be_offset_by_other_high_scores() -> None:
+    bundle = generated_bundle()
+    altered_claim = bundle.claims[0].model_copy(
+        update={"candidate_quote": "A fabricated quotation."}
+    )
+    altered_bundle = bundle.model_copy(
+        update={"claims": [altered_claim, *bundle.claims[1:]]}
+    )
+    records, _ = AuditService().quick_check(
+        altered_bundle,
+        source_blocks_fixture(),
+    )
+    pairs = AuditService().semantic_pairs(altered_bundle, records)
+    result = RecordingDeepAudit().deep_audit(
+        document=altered_bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+
+    report = AuditService().score(
+        altered_bundle,
+        records,
+        result,
+        compliance_context(),
+    )
+
+    assert "FORGED_CITATION:c-001:CANDIDATE_QUOTE_NOT_FOUND:p01-b001" in (
+        report.hard_failures
+    )
+    assert report.overall_score is not None
+    assert report.overall_score >= 75
+    assert report.core_gate_passed is False
+    assert report.decision == Decision.UNQUALIFIED
+
+
+def test_critical_number_error_is_a_hard_failure() -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    altered_records = [
+        (
+            record.model_copy(
+                update={
+                    "rule_flags": [*record.rule_flags, "NUMBER_MISMATCH:999"]
+                }
+            )
+            if record.claim_id == "c-001"
+            else record
+        )
+        for record in records
+    ]
+    pairs = AuditService().semantic_pairs(bundle, altered_records)
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+
+    report = AuditService().score(
+        bundle,
+        altered_records,
+        result,
+        compliance_context(),
+    )
+
+    assert "CRITICAL_NUMBER_ERROR:c-001" in report.hard_failures
+    assert report.decision == Decision.UNQUALIFIED
+
+
+def test_core_dimension_gate_can_require_revision_despite_high_total() -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    pairs = AuditService().semantic_pairs(bundle, records)
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+    result.semantic_judgments[0] = result.semantic_judgments[0].model_copy(
+        update={
+            "terminology_status": TerminologyStatus.MISUSED,
+            "severity": Severity.MAJOR,
+        }
+    )
+
+    report = AuditService().score(
+        bundle,
+        records,
+        result,
+        compliance_context(),
+    )
+
+    terminology = next(
+        item
+        for item in report.dimensions
+        if item.dimension_id == DimensionId.TERMINOLOGY
+    )
+    assert terminology.raw_metrics["level_points"] == 1
+    assert report.overall_score is not None
+    assert report.overall_score >= 75
+    assert report.hard_failures == []
+    assert report.core_gate_passed is False
+    assert report.decision == Decision.NEEDS_REVISION
+    risk = next(
+        item
+        for item in report.dimensions
+        if item.dimension_id == DimensionId.RISK_COMPLIANCE
+    )
+    assert risk.raw_metrics["level_points"] == 4
+
+
+def test_public_mock_flow_uses_real_hy3_service_and_fixed_fixture() -> None:
+    service = AuditService()
+    assert service.hy3_service.settings.paperlens_model_mode == "mock"
+    bundle = generated_bundle()
+    records, quick_report = service.quick_check(
+        bundle,
+        source_blocks_fixture(),
+    )
+
+    result, report = service.run_deep_audit(
+        bundle,
+        records,
+        compliance_context(),
+    )
+
+    assert quick_report.audit_status == AuditStatus.QUICK_COMPLETE
+    assert quick_report.dimensions == []
+    assert quick_report.overall_score is None
+    assert quick_report.core_gate_passed is None
+    assert quick_report.decision == Decision.PENDING_DEEP_AUDIT
+    assert [(item.claim_id, item.block_id) for item in result.semantic_judgments] == [
+        ("c-001", "p01-b001"),
+        ("c-002", "p01-b002"),
+        ("c-003", "p02-b001"),
+        ("c-004", "p02-b002"),
+    ]
+    assert report.audit_status == AuditStatus.DEEP_COMPLETE
+    assert len(report.dimensions) == 8
+    assert report.overall_score is not None
+    assert report.decision != Decision.PENDING_DEEP_AUDIT
+    assert report.risk_assessment is not None
+    assert len(report.risk_assessment.risk_findings) == 3
+
+
+def test_bound_quote_controls_number_rules_inside_multi_sentence_block() -> None:
+    block = source_block(
+        "p01-b001",
+        "The study enrolled 69 students. "
+        "A separate sensitivity analysis considered 70 records.",
+    )
+    claim = atomic_claim(
+        "The study enrolled 70 students.",
+        candidate_block_ids=["p01-b001"],
+        candidate_quote="The study enrolled 69 students.",
+        numeric_entities=["70"],
+    )
+    bundle = generated_bundle().model_copy(update={"claims": [claim]})
+
+    records, quick_report = AuditService().quick_check(bundle, [block])
+
+    record = only_record(records)
+    assert record.quote == "The study enrolled 69 students."
+    assert "NUMBER_MISMATCH:70" in record.rule_flags
+    assert quick_report.hard_failures == []
+
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=AuditService().semantic_pairs(bundle, records),
+    )
+    deep_report = AuditService().score(
+        bundle,
+        records,
+        result,
+        compliance_context(),
+    )
+
+    assert "CRITICAL_NUMBER_ERROR:c-001" in deep_report.hard_failures
+    assert deep_report.decision == Decision.UNQUALIFIED
+
+
+def test_bm25_uses_matching_sentence_when_block_has_unrelated_negation() -> None:
+    matching_sentence = "The treatment did not reduce pain after the 5 mg dose."
+    block = source_block(
+        "p01-b001",
+        matching_sentence + " An unrelated survey reported no missing forms.",
+    )
+    claim = atomic_claim(
+        matching_sentence,
+        candidate_block_ids=["p99-b999"],
+        candidate_quote="fabricated candidate",
+        numeric_entities=["5"],
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.block_id == "p01-b001"
+    assert record.match_method == "bm25_fallback"
+    assert record.quote == matching_sentence
+    assert record.quote_verified is True
+    assert "NEGATION_MISMATCH" not in record.rule_flags
+
+
+def test_bm25_preserves_decimal_inside_evidence_fragment() -> None:
+    source_text = "The dose was 3.14 mg and reduced pain."
+    block = source_block("p01-b001", source_text)
+    claim = atomic_claim(
+        source_text,
+        candidate_block_ids=["p99-b999"],
+        candidate_quote="fabricated candidate",
+        numeric_entities=["3.14"],
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.block_id == "p01-b001"
+    assert record.match_method == "bm25_fallback"
+    assert record.quote == source_text
+    assert "3.14" in record.quote
+
+
+def test_bm25_normalizes_hyphenated_line_break_before_fragment_split() -> None:
+    block = source_block(
+        "p01-b001",
+        "The inter-\nvention enrolled 69 students.",
+    )
+    claim = atomic_claim(
+        "The intervention enrolled 69 students.",
+        candidate_block_ids=["p99-b999"],
+        candidate_quote="fabricated candidate",
+        numeric_entities=["69"],
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+    normalized_quote = normalize_evidence_text(record.quote)
+
+    assert record.block_id == "p01-b001"
+    assert record.match_method == "bm25_fallback"
+    assert "intervention enrolled 69 students" in normalized_quote
+    assert not normalized_quote.startswith("vention")
+
+
+def test_bm25_preserves_scientific_abbreviation_and_subject_context() -> None:
+    source_text = "The intervention used, e.g. 5 mg, and reduced pain."
+    block = source_block("p01-b001", source_text)
+    claim = atomic_claim(
+        source_text,
+        candidate_block_ids=["p99-b999"],
+        candidate_quote="fabricated candidate",
+        numeric_entities=["5"],
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.block_id == "p01-b001"
+    assert record.match_method == "bm25_fallback"
+    assert record.quote == source_text
+    assert "e.g." in record.quote
+    assert record.quote.startswith("The intervention")
+
+
+def test_bm25_preserves_abbreviation_before_number_and_prior_context() -> None:
+    source_text = "The result is shown in Fig. 2 and increased by 5%."
+    block = source_block("p01-b001", source_text)
+    claim = atomic_claim(
+        source_text,
+        candidate_block_ids=["p99-b999"],
+        candidate_quote="fabricated candidate",
+        numeric_entities=["2", "5%"],
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.block_id == "p01-b001"
+    assert record.match_method == "bm25_fallback"
+    assert record.quote == source_text
+    assert not record.quote.startswith("2 and increased")
+
+
+def test_bm25_splits_short_common_word_before_unrelated_negation() -> None:
+    expected_quote = "The measured risk was low."
+    block = source_block(
+        "p01-b001",
+        expected_quote + " No adverse events occurred.",
+    )
+    claim = atomic_claim(
+        expected_quote,
+        candidate_block_ids=["p99-b999"],
+        candidate_quote="fabricated candidate",
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.block_id == "p01-b001"
+    assert record.match_method == "bm25_fallback"
+    assert record.quote == expected_quote
+    assert "NEGATION_MISMATCH" not in record.rule_flags
+
+
+def test_bm25_splits_unit_sentence_before_unrelated_negation() -> None:
+    expected_quote = "The administered dose was 5 mg."
+    block = source_block(
+        "p01-b001",
+        expected_quote + " No adverse events occurred.",
+    )
+    claim = atomic_claim(
+        expected_quote,
+        candidate_block_ids=["p99-b999"],
+        candidate_quote="fabricated candidate",
+        numeric_entities=["5"],
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.block_id == "p01-b001"
+    assert record.match_method == "bm25_fallback"
+    assert record.quote == expected_quote
+    assert "5 mg" in record.quote
+    assert "NEGATION_MISMATCH" not in record.rule_flags
+
+
+def test_bm25_preserves_short_title_abbreviation_context() -> None:
+    source_text = "Dr. Smith administered 5 mg."
+    block = source_block("p01-b001", source_text)
+    claim = atomic_claim(
+        source_text,
+        candidate_block_ids=["p99-b999"],
+        candidate_quote="fabricated candidate",
+        numeric_entities=["5"],
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.block_id == "p01-b001"
+    assert record.match_method == "bm25_fallback"
+    assert record.quote == source_text
+    assert not record.quote.startswith("Smith")
+
+
+def test_citation_accuracy_counts_each_verified_reference_pair() -> None:
+    bundle = generated_bundle()
+    claim = bundle.claims[0].model_copy(
+        update={"candidate_block_ids": ["p01-b001", "p01-b002"]}
+    )
+    single_claim_bundle = bundle.model_copy(update={"claims": [claim]})
+    records = [
+        EvidenceRecord(
+            claim_id="c-001",
+            block_id="p01-b001",
+            page_index=0,
+            quote="First verified quotation.",
+            bbox=None,
+            match_method="model_candidate",
+            quote_verified=True,
+            rule_flags=[],
+        ),
+        EvidenceRecord(
+            claim_id="c-001",
+            block_id="p01-b002",
+            page_index=0,
+            quote="Second verified quotation.",
+            bbox=None,
+            match_method="model_candidate",
+            quote_verified=True,
+            rule_flags=[],
+        ),
+    ]
+    judgments = [
+        SemanticJudgment(
+            claim_id="c-001",
+            block_id="p01-b001",
+            relation="supports",
+            scope_status="preserved",
+            terminology_status="correct",
+            severity="none",
+            reason="The first quotation supports the claim.",
+        ),
+        SemanticJudgment(
+            claim_id="c-001",
+            block_id="p01-b002",
+            relation="insufficient",
+            scope_status="unclear",
+            terminology_status="correct",
+            severity="none",
+            reason="The second quotation is real but does not support the claim.",
+        ),
+    ]
+
+    report = AuditService().score(
+        single_claim_bundle,
+        records,
+        deep_result(judgments),
+        compliance_context(),
+    )
+
+    citation = next(
+        item
+        for item in report.dimensions
+        if item.dimension_id == DimensionId.CITATION_CORRECTNESS
+    )
+    assert citation.raw_metrics["accurate_citations"] == 1
+    assert citation.raw_metrics["citations"] == 2
+    assert citation.raw_metrics["accuracy_rate"] == 50.0
+    assert citation.raw_metrics["level_points"] == 1
+
+
+@pytest.mark.parametrize("mode", ["duplicate", "extra"])
+def test_score_rejects_duplicate_or_extra_semantic_pairs(mode: str) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    pairs = AuditService().semantic_pairs(bundle, records)
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+    if mode == "duplicate":
+        invalid_judgments = [
+            *result.semantic_judgments,
+            result.semantic_judgments[0],
+        ]
+    else:
+        invalid_judgments = [
+            *result.semantic_judgments,
+            SemanticJudgment(
+                claim_id="c-extra",
+                block_id="p99-b999",
+                relation="supports",
+                scope_status="preserved",
+                terminology_status="correct",
+                severity="none",
+                reason="Unexpected semantic pair.",
+            ),
+        ]
+
+    with pytest.raises(AuditServiceError) as exc_info:
+        AuditService().score(
+            bundle,
+            records,
+            deep_result(invalid_judgments),
+            compliance_context(),
+        )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is True
+
+
+@pytest.mark.parametrize("mode", ["missing", "duplicate", "extra"])
+def test_risk_categories_must_be_complete_exactly_once(mode: str) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    pairs = AuditService().semantic_pairs(bundle, records)
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+    if mode == "missing":
+        findings = result.risk_findings[:-1]
+    elif mode == "duplicate":
+        findings = [*result.risk_findings, result.risk_findings[0]]
+    else:
+        findings = [
+            *result.risk_findings,
+            result.risk_findings[0],
+            result.risk_findings[1],
+        ]
+
+    with pytest.raises(AuditServiceError) as exc_info:
+        AuditService().score(
+            bundle,
+            records,
+            result.model_copy(update={"risk_findings": findings}),
+            compliance_context(),
+        )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is True
+
+
+def test_sentence_title_document_and_multiple_risk_locations_are_preserved() -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    pairs = AuditService().semantic_pairs(bundle, records)
+    findings = risk_findings_with(
+        "author_impersonation",
+        "detected",
+        locations=[
+            {
+                "location_type": "sentence",
+                "sentence_id": "s-001",
+                "evidence_excerpt": "identifies the first page",
+            },
+            {
+                "location_type": "title",
+                "sentence_id": None,
+                "evidence_excerpt": "PaperLens synthetic fixture",
+            },
+            {
+                "location_type": "document",
+                "sentence_id": None,
+                "evidence_excerpt": None,
+            },
+        ],
+    )
+    result = RecordingDeepAudit(risk_findings=findings).deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+
+    report = AuditService().score(
+        bundle,
+        records,
+        result,
+        compliance_context(),
+    )
+
+    assert report.risk_assessment is not None
+    saved = next(
+        finding
+        for finding in report.risk_assessment.risk_findings
+        if finding.category.value == "author_impersonation"
+    )
+    assert [item.location_type.value for item in saved.locations] == [
+        "sentence",
+        "title",
+        "document",
+    ]
+    assert "AUTHOR_IMPERSONATION" in report.hard_failures
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        {
+            "location_type": "sentence",
+            "sentence_id": "s-missing",
+            "evidence_excerpt": None,
+        },
+        {
+            "location_type": "sentence",
+            "sentence_id": "s-001",
+            "evidence_excerpt": "excerpt not in the generated sentence",
+        },
+        {
+            "location_type": "title",
+            "sentence_id": None,
+            "evidence_excerpt": "excerpt not in the generated title",
+        },
+    ],
+)
+def test_invalid_risk_location_or_excerpt_is_audit_incomplete(
+    location: dict[str, object],
+) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    result = RecordingDeepAudit(
+        risk_findings=risk_findings_with(
+            "academic_integrity",
+            "detected",
+            locations=[location],
+        )
+    ).deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=AuditService().semantic_pairs(bundle, records),
+    )
+
+    with pytest.raises(AuditServiceError) as exc_info:
+        AuditService().score(
+            bundle,
+            records,
+            result,
+            compliance_context(),
+        )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is True
+
+
+@pytest.mark.parametrize(
+    ("category", "status", "locations"),
+    [
+        ("author_impersonation", "detected", []),
+        (
+            "author_impersonation",
+            "not_detected",
+            [
+                {
+                    "location_type": "document",
+                    "sentence_id": None,
+                    "evidence_excerpt": None,
+                }
+            ],
+        ),
+        (
+            "author_impersonation",
+            "detected",
+            [
+                {
+                    "location_type": "sentence",
+                    "sentence_id": None,
+                    "evidence_excerpt": None,
+                }
+            ],
+        ),
+        (
+            "author_impersonation",
+            "detected",
+            [
+                {
+                    "location_type": "title",
+                    "sentence_id": "s-001",
+                    "evidence_excerpt": None,
+                }
+            ],
+        ),
+        (
+            "author_impersonation",
+            "detected",
+            [
+                {
+                    "location_type": "document",
+                    "sentence_id": None,
+                    "evidence_excerpt": "not allowed",
+                }
+            ],
+        ),
+        (
+            "sensitive_information",
+            "detected",
+            [
+                {
+                    "location_type": "sentence",
+                    "sentence_id": "s-001",
+                    "evidence_excerpt": "identifies the first page",
+                }
+            ],
+        ),
+    ],
+    ids=[
+        "detected-without-location",
+        "not-detected-with-location",
+        "sentence-without-id",
+        "title-with-id",
+        "document-with-excerpt",
+        "sensitive-with-excerpt",
+    ],
+)
+def test_logically_incomplete_risk_finding_is_audit_incomplete(
+    category: str,
+    status: str,
+    locations: list[dict[str, object]],
+) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    findings = risk_findings_with(
+        category,
+        status,
+        locations=locations,
+    )
+    result = RecordingDeepAudit(risk_findings=findings).deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=AuditService().semantic_pairs(bundle, records),
+    )
+
+    with pytest.raises(AuditServiceError) as exc_info:
+        AuditService().score(
+            bundle,
+            records,
+            result,
+            compliance_context(),
+        )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is True
+
+
+def test_risk_excerpt_uses_unicode_whitespace_and_hyphenation_normalization() -> None:
+    bundle = generated_bundle()
+    sections = list(bundle.document.sections)
+    first_section = sections[0]
+    normalized_sentence = first_section.sentences[0].model_copy(
+        update={"text": "The inter-\nvention used A\u030Angstro\u0308m units."}
+    )
+    sections[0] = first_section.model_copy(update={"sentences": [normalized_sentence]})
+    normalized_bundle = bundle.model_copy(
+        update={"document": bundle.document.model_copy(update={"sections": sections})}
+    )
+    records, _ = AuditService().quick_check(
+        normalized_bundle,
+        source_blocks_fixture(),
+    )
+    result = RecordingDeepAudit(
+        risk_findings=risk_findings_with(
+            "academic_integrity",
+            "unclear",
+            locations=[
+                {
+                    "location_type": "sentence",
+                    "sentence_id": "s-001",
+                    "evidence_excerpt": "intervention used Ångström units",
+                }
+            ],
+        )
+    ).deep_audit(
+        document=normalized_bundle.document,
+        claim_evidence_pairs=AuditService().semantic_pairs(
+            normalized_bundle,
+            records,
+        ),
+    )
+
+    report = AuditService().score(
+        normalized_bundle,
+        records,
+        result,
+        compliance_context(),
+    )
+
+    assert report.risk_assessment is not None
+    assert report.risk_assessment.level_points == 2
+
+
+@pytest.mark.parametrize(
+    ("context_updates", "risk_status", "expected_points"),
+    [
+        ({}, None, 4),
+        ({"source_disclosure_status": "missing"}, None, 3),
+        (
+            {
+                "source_disclosure_status": "missing",
+                "ai_assistance_disclosure_status": "missing",
+            },
+            None,
+            2,
+        ),
+        ({}, "unclear", 2),
+        ({"rights_or_license_confirmed": False}, None, 1),
+    ],
+)
+def test_risk_compliance_mapping_four_through_one(
+    context_updates: dict[str, object],
+    risk_status: str | None,
+    expected_points: int,
+) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    findings = (
+        risk_findings_with("academic_integrity", risk_status)
+        if risk_status is not None
+        else clear_risk_findings()
+    )
+    result = RecordingDeepAudit(risk_findings=findings).deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=AuditService().semantic_pairs(bundle, records),
+    )
+
+    report = AuditService().score(
+        bundle,
+        records,
+        result,
+        compliance_context(**context_updates),
+    )
+
+    assert report.risk_assessment is not None
+    assert report.risk_assessment.level_points == expected_points
+    risk_dimension = next(
+        item
+        for item in report.dimensions
+        if item.dimension_id == DimensionId.RISK_COMPLIANCE
+    )
+    assert risk_dimension.raw_metrics["level_points"] == expected_points
+
+
+def test_missing_required_generated_label_is_zero_without_hard_failure() -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=AuditService().semantic_pairs(bundle, records),
+    )
+
+    report = AuditService().score(
+        bundle,
+        records,
+        result,
+        compliance_context(
+            generated_content_label_applicability="applicable",
+            generated_content_label_status="missing",
+        ),
+    )
+
+    assert report.risk_assessment is not None
+    assert report.risk_assessment.level_points == 0
+    assert report.hard_failures == []
+    assert report.core_gate_passed is False
+    assert report.decision == Decision.NEEDS_REVISION
+
+
+@pytest.mark.parametrize(
+    ("category", "hard_failure"),
+    [
+        ("sensitive_information", "SENSITIVE_INFORMATION"),
+        ("author_impersonation", "AUTHOR_IMPERSONATION"),
+        ("academic_integrity", "ACADEMIC_INTEGRITY"),
+    ],
+)
+def test_detected_risk_categories_generate_fixed_hard_failures(
+    category: str,
+    hard_failure: str,
+) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    result = RecordingDeepAudit(
+        risk_findings=risk_findings_with(
+            category,
+            "detected",
+            locations=[
+                {
+                    "location_type": "document",
+                    "sentence_id": None,
+                    "evidence_excerpt": None,
+                }
+            ],
+        )
+    ).deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=AuditService().semantic_pairs(bundle, records),
+    )
+
+    report = AuditService().score(
+        bundle,
+        records,
+        result,
+        compliance_context(),
+    )
+
+    assert report.risk_assessment is not None
+    assert report.risk_assessment.level_points == 0
+    assert hard_failure in report.hard_failures
+    assert report.decision == Decision.UNQUALIFIED
+
+
+def test_non_auditable_content_still_enters_document_risk_check() -> None:
+    bundle = generated_bundle()
+    non_auditable_claims = [
+        claim.model_copy(
+            update={
+                "auditability": "non_auditable",
+                "candidate_block_ids": [],
+                "candidate_quote": None,
+            }
+        )
+        for claim in bundle.claims
+    ]
+    non_auditable_bundle = bundle.model_copy(
+        update={"claims": non_auditable_claims}
+    )
+    records, _ = AuditService().quick_check(
+        non_auditable_bundle,
+        source_blocks_fixture(),
+    )
+    recording = RecordingDeepAudit()
+
+    result, report = AuditService(hy3_service=recording).run_deep_audit(
+        non_auditable_bundle,
+        records,
+        compliance_context(),
+    )
+
+    assert recording.calls == [[]]
+    assert recording.documents == [non_auditable_bundle.document]
+    assert any(
+        sentence.sentence_id == "s-005"
+        for section in recording.documents[0].sections
+        for sentence in section.sentences
+    )
+    assert result.semantic_judgments == []
+    assert report.risk_assessment is not None
+
+
+def test_sensitive_information_reason_cannot_repeat_full_sensitive_value() -> None:
+    bundle = generated_bundle()
+    sensitive_value = "private.person@example.test"
+    sections = list(bundle.document.sections)
+    last_section = sections[-1]
+    sensitive_sentence = last_section.sentences[0].model_copy(
+        update={"text": f"Contact {sensitive_value} for the private record."}
+    )
+    sections[-1] = last_section.model_copy(update={"sentences": [sensitive_sentence]})
+    sensitive_bundle = bundle.model_copy(
+        update={"document": bundle.document.model_copy(update={"sections": sections})}
+    )
+    records, _ = AuditService().quick_check(
+        sensitive_bundle,
+        source_blocks_fixture(),
+    )
+    bad_findings = risk_findings_with(
+        "sensitive_information",
+        "detected",
+        locations=[
+            {
+                "location_type": "sentence",
+                "sentence_id": "s-005",
+                "evidence_excerpt": None,
+            }
+        ],
+        reason=f"The document exposes {sensitive_value}.",
+        remediation="Remove the sensitive contact value.",
+    )
+    result = RecordingDeepAudit(risk_findings=bad_findings).deep_audit(
+        document=sensitive_bundle.document,
+        claim_evidence_pairs=AuditService().semantic_pairs(
+            sensitive_bundle,
+            records,
+        ),
+    )
+
+    with pytest.raises(AuditServiceError) as exc_info:
+        AuditService().score(
+            sensitive_bundle,
+            records,
+            result,
+            compliance_context(),
+        )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert sensitive_value not in exc_info.value.message
+
+
+@pytest.mark.parametrize(
+    ("status", "locations"),
+    [
+        (
+            "detected",
+            [
+                {
+                    "location_type": "document",
+                    "sentence_id": None,
+                    "evidence_excerpt": None,
+                }
+            ],
+        ),
+        ("unclear", []),
+    ],
+    ids=["document-location", "unclear-without-location"],
+)
+def test_document_level_sensitive_reason_cannot_echo_full_value(
+    status: str,
+    locations: list[dict[str, object]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bundle = generated_bundle()
+    sensitive_value = "whole.document@example.test"
+    sections = list(bundle.document.sections)
+    last_section = sections[-1]
+    sensitive_sentence = last_section.sentences[0].model_copy(
+        update={"text": f"Contact {sensitive_value} for the private record."}
+    )
+    sections[-1] = last_section.model_copy(update={"sentences": [sensitive_sentence]})
+    sensitive_bundle = bundle.model_copy(
+        update={"document": bundle.document.model_copy(update={"sections": sections})}
+    )
+    records, _ = AuditService().quick_check(
+        sensitive_bundle,
+        source_blocks_fixture(),
+    )
+    findings = risk_findings_with(
+        "sensitive_information",
+        status,
+        locations=locations,
+        reason=f"The full document exposes {sensitive_value}.",
+    )
+    result = RecordingDeepAudit(risk_findings=findings).deep_audit(
+        document=sensitive_bundle.document,
+        claim_evidence_pairs=AuditService().semantic_pairs(
+            sensitive_bundle,
+            records,
+        ),
+    )
+
+    with pytest.raises(AuditServiceError) as exc_info:
+        AuditService().score(
+            sensitive_bundle,
+            records,
+            result,
+            compliance_context(),
+        )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert sensitive_value not in exc_info.value.message
+    assert sensitive_value not in caplog.text
+
+
+def test_invalid_compliance_context_is_audit_incomplete() -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=AuditService().semantic_pairs(bundle, records),
+    )
+    invalid_context = ComplianceContext.model_construct(
+        rights_or_license_confirmed=True,
+        source_disclosure_status=DisclosureStatus.PRESENT,
+        ai_assistance_disclosure_status=DisclosureStatus.PRESENT,
+        generated_content_label_applicability=(
+            GeneratedContentLabelApplicability.APPLICABLE
+        ),
+        generated_content_label_status=(
+            GeneratedContentLabelStatus.NOT_APPLICABLE
+        ),
+    )
+
+    with pytest.raises(AuditServiceError) as exc_info:
+        AuditService().score(
+            bundle,
+            records,
+            result,
+            invalid_context,
+        )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"

@@ -85,6 +85,40 @@ class Severity(str, Enum):
     CRITICAL = "critical"
 
 
+class DisclosureStatus(str, Enum):
+    PRESENT = "present"
+    MISSING = "missing"
+
+
+class GeneratedContentLabelApplicability(str, Enum):
+    APPLICABLE = "applicable"
+    NOT_APPLICABLE = "not_applicable"
+
+
+class GeneratedContentLabelStatus(str, Enum):
+    PRESENT = "present"
+    MISSING = "missing"
+    NOT_APPLICABLE = "not_applicable"
+
+
+class RiskCategory(str, Enum):
+    SENSITIVE_INFORMATION = "sensitive_information"
+    AUTHOR_IMPERSONATION = "author_impersonation"
+    ACADEMIC_INTEGRITY = "academic_integrity"
+
+
+class RiskStatus(str, Enum):
+    DETECTED = "detected"
+    NOT_DETECTED = "not_detected"
+    UNCLEAR = "unclear"
+
+
+class RiskLocationType(str, Enum):
+    SENTENCE = "sentence"
+    TITLE = "title"
+    DOCUMENT = "document"
+
+
 class DimensionId(str, Enum):
     FACTUAL_CONSISTENCY = "factual_consistency"
     CITATION_CORRECTNESS = "citation_correctness"
@@ -254,6 +288,73 @@ class SemanticJudgment(StrictModel):
     reason: str = Field(min_length=1)
 
 
+class ComplianceContext(StrictModel):
+    rights_or_license_confirmed: bool
+    source_disclosure_status: DisclosureStatus
+    ai_assistance_disclosure_status: DisclosureStatus
+    generated_content_label_applicability: GeneratedContentLabelApplicability
+    generated_content_label_status: GeneratedContentLabelStatus
+
+    @model_validator(mode="after")
+    def validate_generated_content_label(self) -> ComplianceContext:
+        if (
+            self.generated_content_label_applicability
+            == GeneratedContentLabelApplicability.NOT_APPLICABLE
+        ):
+            if (
+                self.generated_content_label_status
+                != GeneratedContentLabelStatus.NOT_APPLICABLE
+            ):
+                raise ValueError(
+                    "not-applicable generated content labels require "
+                    "not_applicable status"
+                )
+        elif (
+            self.generated_content_label_status
+            == GeneratedContentLabelStatus.NOT_APPLICABLE
+        ):
+            raise ValueError(
+                "applicable generated content labels require present or missing status"
+            )
+        return self
+
+
+class RiskLocation(StrictModel):
+    location_type: RiskLocationType
+    sentence_id: Identifier | None
+    evidence_excerpt: str | None = Field(min_length=1, max_length=160)
+
+
+class RiskFinding(StrictModel):
+    category: RiskCategory
+    status: RiskStatus
+    locations: list[RiskLocation]
+    reason: str = Field(min_length=1, max_length=500)
+    remediation: str = Field(min_length=1, max_length=300)
+
+
+class DeepAuditResult(StrictModel):
+    semantic_judgments: list[SemanticJudgment]
+    risk_findings: list[RiskFinding]
+
+
+class RiskAssessment(StrictModel):
+    compliance_context: ComplianceContext
+    risk_findings: list[RiskFinding]
+    level_points: int = Field(ge=0, le=4)
+
+    @model_validator(mode="after")
+    def validate_risk_categories(self) -> RiskAssessment:
+        categories = [finding.category for finding in self.risk_findings]
+        if len(categories) != len(RiskCategory) or set(categories) != set(
+            RiskCategory
+        ):
+            raise ValueError(
+                "risk findings must contain each required category exactly once"
+            )
+        return self
+
+
 MetricValue = int | float
 
 
@@ -267,6 +368,7 @@ class DimensionResult(StrictModel):
 class AuditReport(StrictModel):
     audit_status: AuditStatus
     dimensions: list[DimensionResult]
+    risk_assessment: RiskAssessment | None
     hard_failures: list[str]
     core_gate_passed: bool | None
     overall_score: float | None = Field(default=None, ge=0, le=100)
@@ -277,6 +379,10 @@ class AuditReport(StrictModel):
         if self.audit_status == AuditStatus.QUICK_COMPLETE:
             if self.dimensions:
                 raise ValueError("quick audit cannot contain final dimension scores")
+            if self.risk_assessment is not None:
+                raise ValueError("quick audit risk assessment must be null")
+            if self.hard_failures:
+                raise ValueError("quick audit hard failures must be empty")
             if self.core_gate_passed is not None or self.overall_score is not None:
                 raise ValueError("quick audit cannot contain final gates or score")
             if self.decision != Decision.PENDING_DEEP_AUDIT:
@@ -290,6 +396,20 @@ class AuditReport(StrictModel):
             raise ValueError("deep audit must contain each dimension exactly once")
         if self.core_gate_passed is None or self.overall_score is None:
             raise ValueError("deep audit requires gates and overall score")
+        if self.risk_assessment is None:
+            raise ValueError("deep audit requires a risk assessment")
+        risk_dimension = next(
+            item
+            for item in self.dimensions
+            if item.dimension_id == DimensionId.RISK_COMPLIANCE
+        )
+        if (
+            risk_dimension.raw_metrics.get("level_points")
+            != self.risk_assessment.level_points
+        ):
+            raise ValueError(
+                "risk assessment level_points must match risk_compliance dimension"
+            )
         if self.decision == Decision.PENDING_DEEP_AUDIT:
             raise ValueError("deep audit cannot remain pending")
         return self
