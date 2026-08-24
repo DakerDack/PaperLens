@@ -112,7 +112,7 @@ finally {
 ## 阶段 3：证据核验、快速检查和评分
 
 ```text
-继续开发 D:\Hy3 的 PaperLens 项目。本会话只完成 DEV_PLAN 阶段 3“证据核验、快速检查和评分”，通过全部验收后停止，不进入阶段 4。
+继续开发 D:\Hy3 的 PaperLens 项目。本会话只完成 DEV_PLAN 阶段 3“证据核验、快速检查和评分”，通过全部验收后停止，不进入阶段 4。阶段 3 已在提交 `be5adf3` 通过独立验收；本段保留为契约与回归事实，后续阶段不得顺手返工。
 
 项目定位：PaperLens 的关键差异不是普通论文总结，而是把解读拆成可核验主张，以 PDF 解析结果为证据源，通过确定性规则和 Hy3 语义裁判完成八维审计。代码而不是 Hy3 负责证据有效性、页码、分数、权重、硬失败和双门槛结论。工程保持扁平，不增加向量数据库、多 Agent 或复杂检索架构。请使用中文，并先解释用户可观察行为再讲实现文件。
 
@@ -129,9 +129,9 @@ finally {
 - `ComplianceContext` 由代码提供，包含处理权限或许可确认、来源说明、AI 辅助披露、生成内容标识适用性与存在状态；Hy3 不得判断这些字段。
 - Hy3 读取完整 `ContentDraft`，对 `sensitive_information/author_impersonation/academic_integrity` 各返回一条 `RiskFinding`；状态只允许 `detected/not_detected/unclear`。
 - `RiskLocation` 固定为 `{location_type, sentence_id, evidence_excerpt}`：`location_type` 只允许 `sentence/title/document`，摘录为 `null` 或最长 160 字符；sentence 必须引用真实生成句，title/document 的 sentence_id 必须为 `null`，document 的摘录必须为 `null`，非空摘录必须在对应标题或句子中规范化匹配。
-- `RiskFinding` 固定为 `{category, status, locations, reason, remediation}`。`detected` 至少一个合法位置，`not_detected` 的位置为空，`unclear` 可为空；同类风险可保存多个位置。敏感信息位置的摘录必须为 `null`，理由和修复建议不得复述完整敏感值。所有位置只来自完整 `ContentDraft`，不得使用页码、bbox 或 SourceBlock 引文。
+- `RiskFinding` 固定为 `{category, status, locations, reason, remediation}`。`detected` 至少一个合法位置，`not_detected` 的位置为空，`unclear` 可为空；同类风险可保存多个位置。敏感信息位置的摘录必须为 `null`；结构核验后，无条件把供应商的敏感类别 reason/remediation 替换为按 status 选择的代码固定文本，禁止用格式启发式决定是否脱敏。所有位置只来自完整 `ContentDraft`，不得使用页码、bbox 或 SourceBlock 引文。
 - Hy3 不得返回最终风险等级、pass/fail、分数、权重、硬失败、decision、页码或 bbox。代码核验语义配对、三类风险完整性、所有位置和摘录，合并 `ComplianceContext` 后生成 `RiskAssessment {compliance_context, risk_findings, level_points}`，再计算 0 至 4 级、硬失败、5% 权重、核心门槛和最终结论。
-- `AuditReport.risk_assessment` 固定为 `RiskAssessment|null`：`quick_complete` 必须为 `null`，`deep_complete` 必须非空，且 `level_points` 必须与风险合规维度一致。阶段 4 API 返回并由 `audits.report_json` 保存完整 `AuditReport`，位置、理由和修复建议不得丢失。
+- `AuditReport.risk_assessment` 固定为 `RiskAssessment|null`：`quick_complete` 必须无维度、无风险评估、无硬失败且保持 pending；`deep_complete` 必须非空，且 `level_points` 必须与风险合规维度一致。RiskAssessment/AuditReport 在反序列化时复算风险等级、维度展示、风险硬失败、总分、核心门槛和 decision。阶段 4 API 返回并由 `audits.report_json` 保存完整 `AuditReport`，位置、代码脱敏后的敏感类别说明及其他类别理由/修复建议不得丢失。
 - 非 JSON、对象缺字段、额外字段或非法枚举为 `SCHEMA_INVALID`；结构合法但 ComplianceContext、配对、风险类别、位置、摘录、检查结果或 RiskAssessment 不完整为 `AUDIT_INCOMPLETE`，且不得生成分数；Live 供应商失败为 `HY3_UNAVAILABLE`，禁止回退 Mock。
 - `non_auditable` 内容不进入事实支持率分母，但仍随完整文档接受风险检查。
 - 风险映射固定为：全通过=4；一项来源/AI 提示缺失=3；两项提示缺失或任一 `unclear`=2；处理权限或许可未确认=1；必要标识缺失或任一三类风险 `detected`=0。必要标识单独缺失不进入 hard_failures，没有其他硬失败时 decision 必须为 `needs_revision`；三类 `detected` 才分别生成 `SENSITIVE_INFORMATION`、`AUTHOR_IMPERSONATION`、`ACADEMIC_INTEGRITY`。通用 SemanticJudgment.severity 不参与风险合规。
@@ -139,13 +139,13 @@ finally {
 必须完成：
 - 核验候选 source_block_id 是否存在；模型候选只是一条线索，不是证据事实。
 - 对引文执行 Unicode、空白、换行和断词规范化匹配，保留可追溯的匹配方法。
-- 候选无效时使用 rank-bm25 加数字、单位、否定词精确约束召回 Top-3。
+- 候选无效时使用 rank-bm25 加数字、单位、否定词精确约束召回 Top-3。切片前先规范化断词换行，支持小数、e.g.、Fig. 2、Dr. Smith、短词和单位句边界；使用原子片段与有界相邻窗口，同一 block 最多一个候选。
 - 实现页码、引文、数字、单位、否定词、比较方向和五区必需内容检查。
 - 实现条件拆分触发器，只拆真正包含多个可独立核验事实的句子，不递归调用所有句子。
 - 批量调用 Hy3Service.deep_audit 获取 DeepAuditResult v2；由代码检查完整性、合并 ComplianceContext、生成 RiskAssessment，并计算八维分数、权重、总分、硬失败和双门槛。
 - quick_complete 时总分和合格状态必须为 null/pending_deep_audit；只有八维结果齐全才计算完整结论。
 
-必须覆盖：正确 block/引文、假 block、假引用、数字改变、单位改变、否定反转、换行/连字符规范化、无证据 insufficient、快速与完整状态、权重严格为 1、硬失败不可被高分抵消；还要覆盖纯术语 severity 不扣风险分、non_auditable 风险检查、三类风险完整性、RiskLocation 三种位置约束、同类多位置、摘录规范化核验、敏感信息脱敏、4/3/2/1/0 映射、标识缺失无硬失败且为 needs_revision、三类 detected 硬失败、quick/deep RiskAssessment 状态、等级一致及 AuditReport JSON 往返。测试不能只断言总分，还要断言问题定位、原始指标、错误码和状态。
+必须覆盖：正确 block/引文、假 block、假引用、数字改变、单位改变、否定反转、换行/连字符规范化、无证据 insufficient、快速与完整状态、权重严格为 1、硬失败不可被高分抵消；还要覆盖纯术语 severity 不扣风险分、non_auditable 风险检查、三类风险完整性、RiskLocation 三种位置约束、同类多位置、摘录规范化核验、权限门禁发生在 Hy3 调用前、任意供应商敏感自由文本无条件替换且普通学术文本不误报、4/3/2/1/0 映射、标识缺失无硬失败且为 needs_revision、三类 detected 硬失败、quick/deep RiskAssessment 状态、等级一致及 AuditReport JSON 往返。测试不能只断言总分，还要断言问题定位、原始指标、错误码、调用次数、返回对象和状态。
 
 最终验收使用以下完整 PowerShell 指令：
 $ErrorActionPreference = "Stop"
@@ -169,36 +169,46 @@ if ($LASTEXITCODE -ne 0) { throw "Stage 3 backend regression failed: $LASTEXITCO
 项目定位：PaperLens 必须用最小后端完成上传、解析、联合生成、快速检查、完整审计和状态读取闭环。数据层只使用 sqlite3 与 JSON 快照，不引入 ORM、Redis、队列、后台任务或微服务。API 保持同步且路径严格遵守 DEV_PLAN 4.2。请用中文说明用户流程，并清楚区分已实现、Mock 端到端和真实 Hy3 能力。
 
 开始时必须：
-1. 将工作目录设为 D:\Hy3，阅读 AGENTS.md、DEV_PLAN 第 2、3、4、5、7、8.4、9、10、12 节。
-2. 阅读 document_service.py、hy3_service.py、audit_service.py、models.py 和现有测试。
-3. 运行阶段 3 后端回归：`.venv313\Scripts\python.exe -m pytest backend/tests -q -p no:cacheprovider`。失败则停止并定位，不降低旧测试。
-4. 先把阶段拆为多个原子任务；每次编辑最多 4 个文件，不能因为阶段允许 5 类文件就一次全部改完。每次编辑前输出唯一目标、允许文件、禁止范围、契约/错误码和验证命令。
+1. 将工作目录设为 D:\Hy3，阅读 AGENTS.md、DEV_PLAN 第 2、3、4、5.5、5.6、5.8、7、8.4、9、10、12 节。
+2. 确认 Git 工作区干净、历史包含阶段 3 验收提交 `be5adf3`，阅读 document_service.py、hy3_service.py、audit_service.py、models.py 和现有测试。阶段 3 的 DeepAuditResult v2、风险脱敏、权限门禁和评分验证器均是受保护基线。
+3. 运行阶段 3 后端回归：`.venv313\Scripts\python.exe -m pytest backend/tests -q -p no:cacheprovider`。可信起点为 `208 passed, 1 skipped`；数字可能随阶段 4 新测试增加，但任何旧测试失败都必须停止定位，禁止降低或删除旧测试。
+4. 先按 DEV_PLAN 8.4 的固定顺序列出六个原子任务。每次编辑最多 4 个文件；编辑前输出唯一目标、允许文件、禁止范围、固定输入输出/错误码和验证命令。先补公开入口或存储边界红测，再写最小实现。
 
-阶段允许范围：project_store.py、api.py、main.py、test_project_store.py、test_api.py。不得修改前端，不得新增 API 路径、数据库表或 ORM。只有 project_store.py 可执行 SQL；api.py 只做请求校验、服务调用和错误映射。
+阶段整体允许范围：models.py、project_store.py、api.py、main.py、test_models.py、test_project_store.py、test_api.py；每个原子任务仍遵守最多 4 文件。models.py/test_models.py 只允许第一个契约任务新增 DEV_PLAN 5.8 模型，不得改变现有 Stage 1-3 字段、枚举、评分权重、门槛或验证器。不得修改前端、prompts.py、hy3_service.py、audit_service.py、document_service.py、settings.py、夹具、依赖或锁文件。不得新增 API 路径、数据库表、ORM、后台任务或业务目录。只有 project_store.py 可执行 SQL；api.py 只做请求校验、服务编排和错误映射；main.py 只负责依赖装配与 FastAPI 生命周期。
+
+固定阶段拆分：
+1. models.py + test_models.py：DEV_PLAN 5.8 存储/API 契约。
+2. project_store.py + test_project_store.py：五表、事务、JSON 双向校验和恢复。
+3. api.py + main.py + test_api.py：上传、项目读取、PDF 读取和可注入测试依赖。
+4. api.py + test_api.py：生成、自动快速检查、版本/证据/快速报告原子保存。
+5. api.py + test_api.py：完整审计、权限重建、报告持久化和错误映射。
+6. 以 test_api.py 为主：Mock 核心闭环、失败恢复和最终 PowerShell 冒烟；只有真实红测证明生产缺陷时才修改对应已授权生产文件。
 
 必须完成：
-- 使用 sqlite3 建立 projects、versions、audits、patches、runs 五张固定表，字段遵守 DEV_PLAN 4.3。
-- 数据库只保存项目状态和经 Pydantic 校验的 JSON 快照，不保存 pickle，不做通用实体系统。
-- 实现 DEV_PLAN 4.2 的固定 API，不创建别名或重复路径。
-- 上传前检查 rights_confirmed、PDF 类型、大小和安全存储路径。
-- 项目状态遵守 created -> parsed -> generated -> quick_checked -> deep_audited/patch_pending；失败保留 error_code 和可重试阶段。
-- 每阶段成功后提交事务；失败写 run 记录，但不破坏上一稳定版本。
+- 使用 sqlite3 建立 projects、versions、audits、patches、runs 五张固定表；只增加已获授权的 projects.rights_confirmed 和 audits.evidence_json，不增加第六张表或其他列。
+- 数据库只保存经 DEV_PLAN 5.8 Pydantic 模型验证的 JSON 快照，不保存 pickle，不做通用实体系统；读取时再次验证，损坏或不一致不得静默忽略。
+- 阶段 4 只实现 POST /api/projects、GET /api/projects/{id}、GET /api/projects/{id}/pdf、POST /api/projects/{id}/generate、POST /api/projects/{id}/audit。修订、补丁接受、恢复和导出留到阶段 6；不得创建占位路由、501 或固定空响应。
+- 上传固定为 multipart file + rights_confirmed。权限未确认必须在读取/保存 PDF 前返回 RIGHTS_NOT_CONFIRMED，不创建项目、PDF 或 run。文件大小有界读取，客户端文件名不参与存储路径。
+- 生成不接收客户端 SourceBlock；只读 ParseSnapshot。Hy3Service.generate 成功后先提交初始版本并推进到 generated；随后 AuditService.quick_check 以独立事务保存 EvidenceSnapshot 和 quick AuditReport 并推进到 quick_checked。快速检查失败必须保留已成功生成的稳定版本。
+- 审计请求只包含四个披露/标识字段；rights 从 projects.rights_confirmed 重建。只使用当前版本已保存的文档、主张和 EvidenceRecord，保存并返回同一份完整、已脱敏 AuditReport。
+- 项目状态遵守 created -> parsed -> generated -> quick_checked -> deep_audited；patch_pending 留到阶段 6。失败保留 error_code，并从最新失败 runs.metadata_json 返回安全消息和 retryable_stage。
+- 每阶段成功后提交事务；失败写脱敏 run 记录，但不破坏上一稳定版本、证据或审计。失败不能在数据库或 API 中伪装为 Mock 成功。
 - Mock 必须显式启用；Live 失败不能返回 Mock 成功。
 - 用命令行或 TestClient 完成上传、生成、快速检查、完整审计和读取当前项目的核心闭环。
 
-必须覆盖：未确认权限、非 PDF、超限文件、完整 Mock API 流程、重复读取幂等、失败后旧版本可读、不存在项目/版本/补丁的稳定错误码、数据库 JSON 写入前校验和事务恢复。
+必须覆盖：未确认权限不读写、非 PDF、超限文件、有界读取、安全路径、五表精确集合、两列授权 Schema、全部 JSON 写前/读后校验、事务提交与回滚、完整 Mock API 流程、重复读取幂等、失败后旧版本/证据/审计可读、不存在项目/PDF 的稳定错误码、阶段错误、供应商失败、SCHEMA_INVALID、AUDIT_INCOMPLETE、API 与数据库不含 Key/Prompt/原始响应/原文和供应商敏感自由文本。测试必须经过 ProjectStore 或 FastAPI 公开入口，并断言状态、HTTP、错误码、数据库副作用和旧快照。
 
 最终验收使用以下完整 PowerShell 指令：
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath "D:\Hy3"
 $Python = (Resolve-Path ".\.venv313\Scripts\python.exe").Path
-& $Python -m pytest "backend/tests/test_project_store.py" "backend/tests/test_api.py" -q -p no:cacheprovider
-if ($LASTEXITCODE -ne 0) { throw "Stage 4 API/store tests failed: $LASTEXITCODE" }
+& $Python -m pytest "backend/tests/test_models.py" "backend/tests/test_project_store.py" "backend/tests/test_api.py" -q -p no:cacheprovider
+if ($LASTEXITCODE -ne 0) { throw "Stage 4 contract/API/store tests failed: $LASTEXITCODE" }
 & $Python -m pytest "backend/tests" -q -p no:cacheprovider
 if ($LASTEXITCODE -ne 0) { throw "Stage 4 backend regression failed: $LASTEXITCODE" }
-# 阶段报告还必须根据最终 api.py 的真实请求字段提供完整 PowerShell API 冒烟脚本：启动后端、等待 /api/health、上传 simple_2page.pdf、生成、快速检查、深度审计、读取项目，并在 finally 中关闭它启动的进程。所有 ID 必须从响应自动提取。
+# 阶段报告还必须按 DEV_PLAN 5.8 的真实字段提供完整 PowerShell API 冒烟脚本：使用显式 Mock 环境与独立临时 PAPERLENS_DATA_DIR，启动后端、等待 /api/health、上传 simple_2page.pdf、生成、深度审计、读取项目和 PDF，并在 finally 中只关闭它启动的进程、删除本次临时数据。所有 ID 必须从响应自动提取；不得打印完整响应中的论文文本、Prompt、风险理由或任何 Key。
 
-阶段完成条件：后端全测通过；Mock 模式可从命令行完成核心闭环；数据库只有五张计划内表；API 路径与错误码固定；失败不破坏稳定版本；没有前端或计划外架构改动。
+阶段完成条件：后端全测通过；Mock 模式可从命令行完成五个核心路由闭环；数据库只有五张计划内表及两列明确授权扩展；JSON 往返、权限与证据快照、API 模型和 HTTP 错误映射符合 DEV_PLAN 4.2/4.3/5.8；失败不破坏稳定版本；没有修订占位路由、前端或计划外架构改动。
 
 结束时只提交阶段报告：API 闭环演示结果、数据库表、修改文件、测试数量与结果、失败恢复证据、未解决问题、是否通过门槛。报告必须附上完整且无占位符的测试与 API 冒烟 PowerShell 脚本。停在阶段边界，等待阶段 5 新会话。
 ```
@@ -213,7 +223,7 @@ if ($LASTEXITCODE -ne 0) { throw "Stage 4 backend regression failed: $LASTEXITCO
 开始时必须：
 1. 将工作目录设为 D:\Hy3，阅读 AGENTS.md、DEV_PLAN 第 1、2、3、4、5、7、8.5、9、10、12 节，以及现有前后端 API 契约。
 2. 运行阶段 4 回归：`.venv313\Scripts\python.exe -m pytest backend/tests -q -p no:cacheprovider`，并运行 `cd frontend && npm run typecheck && npm run build`。受限环境出现 spawn EPERM 时先诊断，不能把环境限制误报为代码错误；最终仍需在正常环境取得真实构建结果。
-3. 检查 package.json。DEV_PLAN 已计划但当前可能缺少 pdfjs-dist、lucide-react、Vitest、Testing Library 和 Playwright。本提示明确授权只添加这些 DEV_PLAN 2.3 列出的前端依赖，并修改 package.json/package-lock.json；安装前核对官方当前兼容版本和许可证，真实安装后锁定。不得添加 UI 框架、状态管理库或第二套请求库。不要用会隐式下载未知版本的 npx 来掩盖缺失依赖。
+3. 检查 package.json。已知阶段 3 基线中 `test` 脚本引用 `vitest --run`，但 devDependencies/package-lock 尚无 Vitest 且没有测试文件；这是明确延后到阶段 5 的 P2。第一项前端任务必须安装并锁定实际兼容的 pdfjs-dist、lucide-react、Vitest、Testing Library 和 Playwright，并先建立至少一个真实失败测试；禁止使用 `--passWithNoTests`、删除 test 脚本或依赖全局 CLI 伪装通过。只允许这些 DEV_PLAN 2.3 列出的依赖，安装前核对官方当前兼容版本和许可证，真实安装后锁定。不得添加 UI 框架、状态管理库或第二套请求库，不要用会隐式下载未知版本的 npx 掩盖缺失依赖。
 4. 先列阶段任务和组件职责；每个原子任务最多修改 4 个文件，编辑前输出唯一目标、允许文件、禁止范围、固定 API/类型和验证命令。先写测试再实现。
 
 阶段允许范围：frontend/src、前端测试，以及上述已明确批准的 package.json/package-lock.json 依赖变更。不得改变后端 API、Schema、数据库或错误码。
@@ -282,9 +292,10 @@ finally {
 - 拒绝补丁不改变当前版本；接受补丁创建不可变新版本，保留父版本，并自动运行快速检查。
 - 全文修改后重新生成主张，旧深度审计标为过期。
 - 回退通过复制历史快照创建新的当前版本，不移动、不覆盖、不删除历史记录。
+- 实现阶段 4 明确延后的 Markdown 导出路由；导出只读取当前稳定版本，包含源论文说明、AI 辅助说明、生成时间和模型信息，不创建第二种内容格式。
 - UI 可讨论修改意图、查看前后差异、接受/拒绝、查看版本历史并回退；所有写操作有等待、失败和重试状态。
 
-必须覆盖：合法句子补丁预览/拒绝/接受、越界补丁、过期 hash、不存在句子、拒绝后版本不变、接受后新旧版本并存、句子修改不影响其他句子、全文修改重建主张和审计过期、回退后内容/主张/审计快照一致、无确认不覆盖。
+必须覆盖：合法句子补丁预览/拒绝/接受、越界补丁、过期 hash、不存在句子、拒绝后版本不变、接受后新旧版本并存、句子修改不影响其他句子、全文修改重建主张和审计过期、回退后内容/主张/审计快照一致、Markdown 导出内容与当前版本一致、无确认不覆盖。
 
 最终验收使用以下完整 PowerShell 指令：
 $ErrorActionPreference = "Stop"

@@ -222,11 +222,11 @@ created -> parsed -> generated -> quick_checked -> deep_audited
 
 | 方法与路径 | 行为 | 成功结果 | 主要失败码 |
 |---|---|---|---|
-| `POST /api/projects` | 上传并解析 PDF | 项目、解析质量、`SourceBlock` 统计 | `PDF_INVALID`、`PARSE_FAILED`、`RIGHTS_NOT_CONFIRMED` |
+| `POST /api/projects` | 上传并解析 PDF | 项目、解析质量、`SourceBlock` 统计 | `PDF_INVALID`、`PARSE_FAILED`、`PARSE_QUALITY_LOW`、`RIGHTS_NOT_CONFIRMED` |
 | `GET /api/projects/{id}` | 读取完整当前状态 | 当前文档、审计、版本列表 | `PROJECT_NOT_FOUND` |
 | `GET /api/projects/{id}/pdf` | 读取本地 PDF | PDF 文件流 | `PDF_NOT_FOUND` |
-| `POST /api/projects/{id}/generate` | 联合生成并自动快速检查 | 文档、主张、规则结果 | `HY3_UNAVAILABLE`、`SCHEMA_INVALID` |
-| `POST /api/projects/{id}/audit` | 批量运行完整语义审计和评分 | 完整 `AuditReport` | `EVIDENCE_NOT_READY`、`SCHEMA_INVALID`、`AUDIT_INCOMPLETE`、`HY3_UNAVAILABLE` |
+| `POST /api/projects/{id}/generate` | 联合生成并自动快速检查 | 文档、主张、规则结果 | `PROJECT_NOT_READY`、`HY3_CONFIG_MISSING`、`HY3_UNAVAILABLE`、`SCHEMA_INVALID` |
+| `POST /api/projects/{id}/audit` | 批量运行完整语义审计和评分 | 完整 `AuditReport` | `PROJECT_NOT_READY`、`EVIDENCE_NOT_READY`、`HY3_CONFIG_MISSING`、`SCHEMA_INVALID`、`AUDIT_INCOMPLETE`、`HY3_UNAVAILABLE` |
 | `POST /api/projects/{id}/revisions` | 生成补丁预览，不改当前版本 | `EditPatch` | `TARGET_STALE`、`PATCH_INVALID` |
 | `POST /api/projects/{id}/revisions/{patch_id}/accept` | 接受补丁并生成新版本 | 新版本和快速检查结果 | `TARGET_STALE`、`PATCH_INVALID` |
 | `POST /api/projects/{id}/versions/{version_id}/restore` | 复制历史版本为新当前版本 | 新版本 | `VERSION_NOT_FOUND` |
@@ -234,19 +234,33 @@ created -> parsed -> generated -> quick_checked -> deep_audited
 
 不允许在开发过程中创建功能重复的路径。若确需改变 API，必须同时修改本节、`types.ts`、后端契约测试和前端 API 测试。
 
+API 路径在本节一次冻结，但实现按阶段交付，禁止为了让路径提前存在而创建占位路由：
+
+- 阶段 4 只实现核心闭环所需的 `POST /api/projects`、`GET /api/projects/{id}`、`GET /api/projects/{id}/pdf`、`POST /api/projects/{id}/generate` 和 `POST /api/projects/{id}/audit`。
+- 阶段 6 实现 `POST /api/projects/{id}/revisions`、补丁接受、版本恢复和 Markdown 导出；这些路径在阶段 4 不得以固定错误、空对象或未实现响应占位。
+- 阶段 5 前端只能调用阶段 4 已真实实现的核心路径；修订、恢复和导出 UI 随阶段 6 一并启用。
+
 ### 4.3 SQLite 最小表结构
 
 数据库固定为五张表，不建立通用实体系统：
 
 | 表 | 必需字段 |
 |---|---|
-| `projects` | `id`、`stage`、`pdf_path`、`pdf_sha256`、`parse_json`、`current_version_id`、`error_code`、`created_at`、`updated_at` |
+| `projects` | `id`、`stage`、`pdf_path`、`pdf_sha256`、`rights_confirmed`、`parse_json`、`current_version_id`、`error_code`、`created_at`、`updated_at` |
 | `versions` | `id`、`project_id`、`version_no`、`parent_version_id`、`content_json`、`claims_json`、`reason`、`created_at` |
-| `audits` | `id`、`project_id`、`version_id`、`status`、`report_json`、`created_at` |
+| `audits` | `id`、`project_id`、`version_id`、`status`、`evidence_json`、`report_json`、`created_at` |
 | `patches` | `id`、`project_id`、`base_version_id`、`status`、`patch_json`、`created_at` |
 | `runs` | `id`、`project_id`、`version_id`、`operation`、`mode`、`status`、`metadata_json`、`usage_json`、`error_code`、`started_at`、`ended_at` |
 
 所有 JSON 列在写入前必须经过 Pydantic 校验。`status/stage` 使用固定枚举；不允许在 SQL 中保存 Python pickle。删除项目时再清理其 PDF 和解析临时文件，普通重试不得删除上一个稳定版本。
+
+新增字段的固定语义如下：
+
+- `projects.rights_confirmed` 使用 SQLite `INTEGER NOT NULL CHECK (rights_confirmed IN (0, 1))`。只有上传请求显式确认权限后才能创建项目并写入 `1`；后续生成和深审从该列重建 `ComplianceContext.rights_or_license_confirmed`，不得相信客户端重复声明。
+- `audits.evidence_json` 保存经 Pydantic 校验的 `EvidenceRecord[]` 快照。快速检查与同一版本的完整审计必须使用同一组已验证证据；不得从 Hy3 响应恢复页码、bbox 或引文，也不得在读取 API 时静默重新计算并覆盖已保存证据。
+- `projects.parse_json` 保存严格的解析快照，包含 `SourceBlock[]` 与解析质量；`versions.content_json` 保存 `ContentDraft`，`versions.claims_json` 保存 `AtomicClaim[]`，`audits.report_json` 仍只保存同一份完整 `AuditReport`。
+- 可读错误消息、是否可重试和可重试阶段保存在最新失败 `runs.metadata_json`；不再向 `projects` 增加重复错误字段。项目即使处于 `failed`，最后一个稳定版本和审计快照仍可读取。
+- SQLite 文件固定为 `PAPERLENS_DATA_DIR/paperlens.db`；PDF 固定保存为 `PAPERLENS_DATA_DIR/projects/<project_id>/source.pdf`。客户端文件名不得参与存储路径，路径必须经解析后仍位于项目目录内。
 
 ## 5. 数据契约模板
 
@@ -439,7 +453,7 @@ Hy3 只对完整生成文档执行三类语义风险检查，并为每类恰好�
 - `status=detected` 时 `locations` 至少包含一个合法位置。
 - `status=not_detected` 时 `locations` 必须为空数组。
 - `status=unclear` 是合法结果，`locations` 可以为空；非空时每个位置仍必须满足 `RiskLocation` 的全部核验规则。
-- `category=sensitive_information` 时，每个 `RiskLocation.evidence_excerpt` 必须为 `null`；`reason` 和 `remediation` 不得复述完整敏感值，只能说明风险类型与安全修改方式。
+- `category=sensitive_information` 时，每个 `RiskLocation.evidence_excerpt` 必须为 `null`。Hy3 返回的 `reason` 和 `remediation` 只作为未信任的临时输入：`AuditService` 完成结构、状态和位置核验后，必须按 `detected/not_detected/unclear` 无条件替换为代码固定的脱敏说明，再构造任何公开返回或持久化对象。不得通过邮箱、电话、姓名、地址、ISBN、DOI、试验编号或其他格式启发式决定是否替换。
 
 Hy3 不得返回最终风险等级、风险维度分数、权重、硬失败、`core_gate_passed`、`decision`、页码、bbox，也不得判断许可、披露或标识的适用性。
 
@@ -501,6 +515,8 @@ Hy3 不得返回最终风险等级、风险维度分数、权重、硬失败、`
 - 非 JSON、对象缺字段、额外字段或非法枚举属于结构错误，经过受限重试后返回 `SCHEMA_INVALID`。
 - JSON 结构合法但 `ComplianceContext`、语义配对、风险类别覆盖、位置、摘录、检查结果或代码生成的 `RiskAssessment` 缺失、不完整、重复、额外或无法验证时，`AuditService` 返回 `AUDIT_INCOMPLETE`，不得生成完整八维分数、核心门槛或最终结论。
 - Live 供应商调用失败返回 `HY3_UNAVAILABLE`，禁止回退 Mock。
+- `AuditService.run_deep_audit` 必须先验证 `ComplianceContext`。`rights_or_license_confirmed=false` 时，在发送完整文档前返回不可重试的 `RIGHTS_NOT_CONFIRMED`，Hy3 调用次数为 0；离线 `score` 仍可按冻结映射计算 1 级，用于确定性测试。
+- `AuditService.run_deep_audit` 返回的 `DeepAuditResult` 必须与 `AuditReport.risk_assessment.risk_findings` 使用同一组已校验、已脱敏风险结果；不得把 Hy3 原始 `sensitive_information.reason/remediation` 暴露给调用方、日志或数据库。
 
 #### 5.5.5 RiskAssessment
 
@@ -520,8 +536,8 @@ Hy3 不得返回最终风险等级、风险维度分数、权重、硬失败、`
       "category": "sensitive_information",
       "status": "not_detected",
       "locations": [],
-      "reason": "未发现敏感信息。",
-      "remediation": "无需修改。"
+      "reason": "No sensitive-content risk was detected.",
+      "remediation": "No sensitive-content remediation is required."
     },
     {
       "category": "author_impersonation",
@@ -542,7 +558,7 @@ Hy3 不得返回最终风险等级、风险维度分数、权重、硬失败、`
 }
 ```
 
-三个字段全部必填；`risk_findings` 必须保存校验通过的三个类别及其全部位置、理由和修复建议，`level_points` 必须是代码按下表计算的 0 至 4 整数。任何缺失或不一致均为 `AUDIT_INCOMPLETE`。
+三个字段全部必填；`risk_findings` 必须保存校验通过的三个类别及其全部位置、理由和修复建议，其中 `sensitive_information` 只能保存代码固定脱敏文本。`level_points` 必须是代码按下表计算的 0 至 4 整数。`RiskAssessment` 在构造和反序列化时都必须复算风险等级、三个类别完整性和敏感类别固定文本；任何缺失或不一致均为 `AUDIT_INCOMPLETE`。
 
 风险与合规的代码映射按严重信号优先，通用 `SemanticJudgment.severity` 不参与该维度：
 
@@ -583,8 +599,8 @@ Hy3 不得返回最终风险等级、风险维度分数、权重、硬失败、`
         "category": "sensitive_information",
         "status": "not_detected",
         "locations": [],
-        "reason": "未发现敏感信息。",
-        "remediation": "无需修改。"
+        "reason": "No sensitive-content risk was detected.",
+        "remediation": "No sensitive-content remediation is required."
       },
       {
         "category": "author_impersonation",
@@ -624,7 +640,9 @@ Hy3 不得返回最终风险等级、风险维度分数、权重、硬失败、`
 }
 ```
 
-`AuditReport.risk_assessment` 的类型固定为 `RiskAssessment|null`。`quick_complete` 必须为 `null`；`deep_complete` 必须包含非空 `RiskAssessment`，且其 `level_points` 必须与 `risk_compliance` 维度 `raw_metrics.level_points` 一致。阶段 4 的 API 返回完整 `AuditReport`，`audits.report_json` 保存同一完整对象，因此风险位置、理由和修复建议必须随报告持久化，不能在 API 或存储边界丢失。
+`AuditReport.risk_assessment` 的类型固定为 `RiskAssessment|null`。`quick_complete` 必须使用 `dimensions=[]`、`risk_assessment=null`、`hard_failures=[]`、`core_gate_passed=null`、`overall_score=null` 和 `pending_deep_audit`；证据问题只保存在 `EvidenceRecord.rule_flags`。`deep_complete` 必须包含非空 `RiskAssessment`，且其 `level_points` 必须与 `risk_compliance` 维度 `raw_metrics.level_points` 一致。阶段 4 的 API 返回完整 `AuditReport`，`audits.report_json` 保存同一完整对象，因此风险位置、代码脱敏后的敏感类别说明、其他类别理由和修复建议必须随报告持久化，不能在 API 或存储边界丢失。
+
+`AuditReport` 在构造和 JSON 反序列化时必须重新核对八个维度各自的 `level_points/score/level`、风险等级与风险维度、三类 `detected` 与固定风险硬失败、加权总分、核心门槛和最终 `decision`。任何硬失败固定产生 `unqualified`；必要标识缺失本身不产生硬失败，但风险等级为 0、核心门槛失败且在无其他硬失败时只能是 `needs_revision`。外部输入不得通过同时伪造多个相互一致的展示字段绕过代码计算。
 
 完整八维分数、核心门槛和总分只能由 `audit_service.py` 根据规则与语义结果计算，Hy3 不得直接返回。
 
@@ -652,6 +670,102 @@ Hy3 不得返回最终风险等级、风险维度分数、权重、硬失败、`
 - 接受时重新计算 `before_hash`；不一致立即返回 `TARGET_STALE`。
 - 句子补丁不能包含目标句子之外的文本。
 - 不提供“自动接受”选项。
+
+### 5.8 阶段 4 存储快照与核心 API 契约
+
+阶段 4 的第一个原子任务必须在 `models.py` 中补齐严格 Pydantic 契约，并在 `test_models.py` 中先写失败测试。不得在 `api.py` 或 `project_store.py` 临时定义请求、响应或 JSON 列字典协议。该任务只允许新增本节模型，不得修改阶段 1 至 3 已冻结模型的字段、枚举或验证规则。
+
+JSON 列使用以下包装模型：
+
+- `ParseQualitySnapshot {page_count, block_count, empty_page_rate, abnormal_character_rate, page_number_completeness_rate, bbox_availability_rate}`；计数非负，比例限定在 0 至 1。
+- `ParseSnapshot {blocks: SourceBlock[], quality: ParseQualitySnapshot}`，写入 `projects.parse_json`。
+- `ClaimsSnapshot {claims: AtomicClaim[]}`，写入 `versions.claims_json`；`versions.content_json` 单独保存 `ContentDraft`。
+- `EvidenceSnapshot {evidence_records: EvidenceRecord[]}`，写入 `audits.evidence_json`。
+- `UsageSnapshot {prompt_tokens, completion_tokens, total_tokens}`，三个字段均为非负整数或 `null`，写入 `runs.usage_json`。
+- `RunMetadata {message, retryable, retryable_stage, model, prompt_version, schema_version}`；除 `retryable` 外均允许 `null`，只保存脱敏错误说明和短元数据，写入 `runs.metadata_json`。
+- `runs.operation` 只允许 `parse/generate/quick_check/deep_audit`，`runs.mode` 只允许 `local/mock/live`，`runs.status` 只允许 `succeeded/failed`。这些枚举同样定义在 `models.py`。
+
+阶段 4 核心 API 使用以下响应模型；时间字段使用带时区 UTC `datetime`，所有对象 `extra="forbid"`：
+
+```text
+ProjectCreateResponse
+  project_id: Identifier
+  stage: parsed
+  parse_quality: ParseQualitySnapshot
+  source_block_count: int >= 0
+  created_at: datetime
+
+VersionSummary
+  version_id: Identifier
+  version_no: int >= 1
+  parent_version_id: Identifier|null
+  reason: string
+  created_at: datetime
+
+ProjectView
+  project_id: Identifier
+  stage: ProjectStage
+  model_mode: mock|live
+  parse_quality: ParseQualitySnapshot|null
+  source_block_count: int >= 0
+  current_version_id: Identifier|null
+  current_version_no: int|null
+  document: ContentDraft|null
+  claims: AtomicClaim[]
+  evidence_records: EvidenceRecord[]
+  audit_report: AuditReport|null
+  versions: VersionSummary[]
+  error_code: string|null
+  retryable_stage: ProjectStage|null
+  created_at: datetime
+  updated_at: datetime
+
+GenerationResponse
+  project_id: Identifier
+  version_id: Identifier
+  stage: quick_checked
+  model_mode: mock|live
+  document: ContentDraft
+  claims: AtomicClaim[]
+  evidence_records: EvidenceRecord[]
+  quick_report: AuditReport
+
+DeepAuditRequest
+  source_disclosure_status: present|missing
+  ai_assistance_disclosure_status: present|missing
+  generated_content_label_applicability: applicable|not_applicable
+  generated_content_label_status: present|missing|not_applicable
+
+DeepAuditResponse
+  project_id: Identifier
+  version_id: Identifier
+  stage: deep_audited
+  audit_report: AuditReport
+```
+
+请求和状态约束固定如下：
+
+- `POST /api/projects` 使用 multipart，字段固定为 `file` 和 `rights_confirmed`。`rights_confirmed` 不是 `true` 时必须在读取或保存 PDF 前返回 `RIGHTS_NOT_CONFIRMED`；不得创建项目、PDF 或 run 记录。文件名必须以 `.pdf` 结尾且内容以 PDF 魔数开头；读取时按 `MAX_PDF_MB + 1 byte` 有界检查，超限后立即停止并删除本请求的临时文件。
+- `POST /api/projects/{id}/generate` 不接收请求体。服务只读取已保存并重新通过 `ParseSnapshot` 校验的 `SourceBlock[]`。`Hy3Service.generate` 成功后先用一个事务保存初始版本并将稳定阶段推进到 `generated`；随后运行 `AuditService.quick_check`，再用第二个事务保存证据快照、快速报告并推进到 `quick_checked`。快速检查失败不得删除已成功生成的版本。
+- `POST /api/projects/{id}/audit` 只接收 `DeepAuditRequest`。API 从 `projects.rights_confirmed` 构造 `ComplianceContext.rights_or_license_confirmed`，不得接受客户端覆盖；其余四个披露和标识字段来自请求。完整审计只读取当前版本已保存的 `ContentDraft`、`AtomicClaim[]` 和 `EvidenceRecord[]`。
+- `GET /api/projects/{id}` 返回 `ProjectView`，只从已通过 Pydantic 重新验证的数据库快照构造；不得暴露 `pdf_path`、SQL 行、Hy3 原始响应或供应商敏感自由文本。
+- `GET /api/projects/{id}/pdf` 只返回当前项目固定 `source.pdf`，并设置 `application/pdf`；数据库路径缺失、越界或文件不存在统一返回 `PDF_NOT_FOUND`。
+- Mock/Live 模式只来自后端 `Settings`，客户端不能切换。`model_mode` 必须进入生成响应和项目视图，使前端能够显示 `MOCK`。
+
+现有错误码的 HTTP 映射固定如下，不新增同义错误码：
+
+| HTTP | 错误码 |
+|---:|---|
+| 400 | `PDF_INVALID` |
+| 403 | `RIGHTS_NOT_CONFIRMED` |
+| 404 | `PROJECT_NOT_FOUND`、`PDF_NOT_FOUND`、`VERSION_NOT_FOUND` |
+| 409 | `PROJECT_NOT_READY`、`EVIDENCE_NOT_READY`、`TARGET_STALE` |
+| 413 | `PDF_INVALID`，并在安全 `details.reason` 中标记 `file_too_large` |
+| 422 | `PARSE_QUALITY_LOW`、`PATCH_INVALID` |
+| 502 | `SCHEMA_INVALID`、`AUDIT_INCOMPLETE` |
+| 503 | `PARSE_FAILED`、`HY3_CONFIG_MISSING`、`HY3_UNAVAILABLE` |
+
+上传字段缺失或类型错误仍使用对应的 `PDF_INVALID`/`RIGHTS_NOT_CONFIRMED`；`DeepAuditRequest` 结构或组合无效使用 `AUDIT_INCOMPLETE`。所有业务失败都返回现有 `ErrorResponse`，不得把 FastAPI 默认验证体、Python 异常、SQL、绝对路径、Prompt、原始论文或 API Key 返回给客户端。
 
 ## 6. Hy3 Prompt 模板
 
@@ -865,13 +979,15 @@ python -m pytest backend/tests/test_models.py backend/tests/test_hy3_service.py 
 
 ### 阶段 3：证据核验、快速检查和评分
 
+**验收状态**：阶段 3 已在提交 `be5adf3` 通过独立验收；验收基线为阶段 3 聚焦 `181 passed`、后端 `208 passed, 1 skipped`，跳过项仅为需显式开启的真实 MinerU 集成。后续阶段不得在无新失败测试和单独授权时修改阶段 3 的检索、深审、风险或评分行为。
+
 **允许修改**：常规任务为 `audit_service.py`、`test_audit_service.py`，必要时补充 `models.py`。深审 v2 属于一次原子协议迁移；只有用户明确授权时，才允许在同一任务同步修改 `models.py`、`prompts.py`、`hy3_service.py`、`audit_service.py`、`deep_audit_valid.json`、`test_models.py`、`test_hy3_service.py` 和 `test_audit_service.py`。该例外只用于将 v1 原子替换为 v2，不得新增并行协议、API、数据库或前端改动。
 
 任务：
 
 1. 核验候选 block 是否存在。
 2. 对引文执行 Unicode、空白、换行和断词规范化后匹配。
-3. 候选无效时使用 BM25 + 数字/单位/否定词精确匹配召回 Top-3。
+3. 候选无效时使用 BM25 + 数字/单位/否定词精确匹配召回 Top-3。证据切片先完成 Unicode、空白和断词换行规范化，再生成原子片段与相邻两片段窗口；不得在小数点或 `e.g.`、`Fig. 2`、`Dr. Smith` 等缩写内部截断。同一 block 只保留一个候选，优先覆盖更多主张约束、覆盖相同时选择更短片段，不同 block 再按 BM25 排序。
 4. 实现页码、引文、数字、单位、否定词、比较方向和必需区检查。
 5. 实现条件拆分触发器，但不对所有句子递归调用。
 6. 批量调用 `Hy3Service.deep_audit` 获取唯一的 `DeepAuditResult` v2；输入包含完整 `ContentDraft` 和已验证语义配对，代码合并 `ComplianceContext`、生成 `RiskAssessment` 后计算八维分数和双门槛。
@@ -897,6 +1013,8 @@ python -m pytest backend/tests/test_models.py backend/tests/test_hy3_service.py 
 - 纯事实、范围或术语问题不会重复扣风险合规分。
 - 三类风险检查缺失、重复、额外，`RiskLocation` 类型/句子/摘录无效，或 `RiskAssessment` 缺失、不完整、等级不一致时返回 `AUDIT_INCOMPLETE`，不生成完整结论。
 - `detected/not_detected/unclear` 的位置数量约束、多位置保存、敏感信息摘录为空及脱敏理由/修复建议均有测试。
+- 邮箱、电话、姓名、地址、ISBN、DOI、试验编号和未知格式的供应商敏感自由文本均不得进入 `DeepAuditResult` 或 `AuditReport`；实现依靠无条件代码替换，不依靠格式识别。普通学术术语、数字范围和混合字母数字文本不得因此触发 `AUDIT_INCOMPLETE`。
+- 权限未确认必须在 Hy3 调用前返回 `RIGHTS_NOT_CONFIRMED`，并断言调用次数为 0。
 - 一项提示缺失、两项提示缺失/中风险、高风险和严重风险分别稳定映射为 3、2、1、0 级；三类 `detected` 触发对应代码硬失败。
 - 标识适用但缺失稳定映射为 0 级但不生成硬失败；没有其他硬失败时结论为 `needs_revision`。
 - `quick_complete` 的 `risk_assessment=null`；`deep_complete` 保存完整 `RiskAssessment`，且其 `level_points` 与风险合规维度一致并能随 `AuditReport` JSON 往返保留。
@@ -905,20 +1023,30 @@ python -m pytest backend/tests/test_models.py backend/tests/test_hy3_service.py 
 
 ### 阶段 4：存储和 API 闭环
 
-**允许修改**：`project_store.py`、`api.py`、`main.py`、`test_project_store.py`、`test_api.py`。
+**允许修改**：阶段整体允许 `models.py`、`project_store.py`、`api.py`、`main.py`、`test_models.py`、`test_project_store.py`、`test_api.py`，但每个原子任务仍最多修改 4 个文件。`models.py` 和 `test_models.py` 只允许用于第 5.8 节新增的存储/API 契约，不得改动阶段 1 至 3 已冻结模型、枚举、评分常量或验证器。
 
 任务：
 
-1. 用 `sqlite3` 建立 `projects/versions/audits/patches/runs` 五张表。
-2. 数据库只保存项目状态和 JSON 快照，不进行复杂关系建模。
-3. 实现第 4.2 节固定 API。
-4. 上传类型、大小和权限确认在进入解析前检查。
-5. 每个阶段成功后提交事务；失败保存 `run` 记录但不破坏上一稳定状态。
+1. 先在 `models.py` 与 `test_models.py` 完成第 5.8 节存储快照、运行元数据和核心 API 请求/响应契约。
+2. 用 `sqlite3` 建立 `projects/versions/audits/patches/runs` 五张表，包含已授权的 `projects.rights_confirmed` 和 `audits.evidence_json`，不增加第六张表或 ORM。
+3. 数据库只保存项目状态和经 Pydantic 校验的 JSON 快照，不进行复杂关系建模。
+4. 只实现第 4.2 节明确分配给阶段 4 的五个核心 API；修订、接受、恢复和导出留到阶段 6，不创建占位路由。
+5. 上传类型、大小和权限确认在进入解析及写入正式 PDF 前检查；后续深审权限只读取项目记录。
+6. 每个阶段成功后提交事务；失败保存脱敏 run 记录但不破坏上一稳定版本、审计或证据快照。
+
+原子任务顺序固定为：
+
+1. `models.py + test_models.py`：只完成第 5.8 节契约红测与最小模型。
+2. `project_store.py + test_project_store.py`：建表、事务、Pydantic JSON 往返和失败恢复。
+3. `api.py + main.py + test_api.py`：上传、项目读取和 PDF 读取，支持可注入的测试依赖。
+4. `api.py + test_api.py`：生成、自动快速检查和原子保存。
+5. `api.py + test_api.py`：完整审计、权限重建、完整 `AuditReport` 保存和稳定错误映射。
+6. `test_api.py` 为主：Mock 命令行核心闭环与失败恢复；只有真实缺陷才回到对应获准生产文件。
 
 测试：
 
 ```powershell
-python -m pytest backend/tests/test_project_store.py backend/tests/test_api.py -q
+python -m pytest backend/tests/test_models.py backend/tests/test_project_store.py backend/tests/test_api.py -q
 python -m pytest backend/tests -q
 ```
 
@@ -929,13 +1057,18 @@ python -m pytest backend/tests -q
 - 完成上传、生成、快速检查和完整审计的 API 流程。
 - 重复读取返回相同当前版本。
 - API 失败后旧版本仍可读取。
-- 不存在的项目、版本和补丁返回稳定错误码。
+- 不存在的项目和 PDF 返回稳定错误码；版本、补丁和修订路径留到阶段 6 测试。
+- 权限未确认不创建项目、PDF 或 run；生成和审计不接受客户端 SourceBlock、已验证证据、页码、bbox、分数或 rights 覆盖。
+- `parse_json/content_json/claims_json/evidence_json/report_json/metadata_json/usage_json` 写入前和读取后都经过固定 Pydantic 模型验证。
+- 完整审计保存并返回阶段 3 已脱敏的风险结果；数据库和 API 中不存在 Hy3 原始敏感自由文本。
 
 通过门槛：后端全部测试通过；使用 Mock 能通过命令行完成核心闭环。
 
 ### 阶段 5：三栏工作台和证据跳转
 
-**允许修改**：`frontend/src/` 和前端测试，不修改后端契约。
+**允许修改**：`frontend/src/`、前端测试以及实际建立 Vitest/Testing Library/Playwright 测试基础设施所需的 `frontend/package.json` 和 `frontend/package-lock.json`，不修改后端契约。
+
+阶段 5 启动时已知 P2：阶段 3 结束时 `frontend/package.json` 虽定义 `vitest --run`，但尚未声明 Vitest 依赖且没有前端测试文件。该缺口在阶段 5 以独立依赖/测试任务修复；不得通过 `--passWithNoTests` 或删除测试脚本伪装通过，也不得在阶段 4 提前处理。
 
 任务：
 
@@ -967,6 +1100,8 @@ npx playwright test
 通过门槛：前三个预设流程任务通过 Playwright；前端构建通过。
 
 ### 阶段 6：修订、版本和回退
+
+阶段 6 除实现修订、补丁接受和版本恢复外，同时实现第 4.2 节已冻结但在阶段 4 明确延后的 Markdown 导出。阶段 4 和阶段 5 不得为这些路径创建占位实现。
 
 **允许修改**：`hy3_service.py`、`project_store.py`、`api.py`、`SidePanel.tsx`、相关测试。
 
