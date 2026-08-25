@@ -223,8 +223,9 @@ if ($LASTEXITCODE -ne 0) { throw "Stage 4 backend regression failed: $LASTEXITCO
 开始时必须：
 1. 将工作目录设为 D:\Hy3，阅读 AGENTS.md、DEV_PLAN 第 1、2、3、4、5、7、8.5、9、10、12 节，以及现有前后端 API 契约。
 2. 运行阶段 4 回归：`.venv313\Scripts\python.exe -m pytest backend/tests -q -p no:cacheprovider`，并运行 `cd frontend && npm run typecheck && npm run build`。受限环境出现 spawn EPERM 时先诊断，不能把环境限制误报为代码错误；最终仍需在正常环境取得真实构建结果。
-3. 检查 package.json。已知阶段 3 基线中 `test` 脚本引用 `vitest --run`，但 devDependencies/package-lock 尚无 Vitest 且没有测试文件；这是明确延后到阶段 5 的 P2。第一项前端任务必须安装并锁定实际兼容的 pdfjs-dist、lucide-react、Vitest、Testing Library 和 Playwright，并先建立至少一个真实失败测试；禁止使用 `--passWithNoTests`、删除 test 脚本或依赖全局 CLI 伪装通过。只允许这些 DEV_PLAN 2.3 列出的依赖，安装前核对官方当前兼容版本和许可证，真实安装后锁定。不得添加 UI 框架、状态管理库或第二套请求库，不要用会隐式下载未知版本的 npx 掩盖缺失依赖。
-4. 先列阶段任务和组件职责；每个原子任务最多修改 4 个文件，编辑前输出唯一目标、允许文件、禁止范围、固定 API/类型和验证命令。先写测试再实现。
+3. 阶段 4 的正式门槛已通过，但 `DEV_PLAN` 中的 `LIVE-BLOCKER-01` 仍未关闭：真实 MinerU 和真实 Hy3 生成成功，`claims/evidence=0/0`，risk-only 深审经过三次真实响应后仍为 `502/AUDIT_INCOMPLETE`，边界为 `HY3_RISK_CATEGORY_COVERAGE_INVALID`，且无 Mock fallback。本阶段不得修改后端或顺手修复该问题；必须把空 claims/evidence、完整审计失败、保留快速检查结果和可重试状态作为正式 UI 场景。阶段 5 可以完成，但 `LIVE-BLOCKER-01` 未关闭时不得进入阶段 6。
+4. 检查 package.json。已知阶段 3 基线中 `test` 脚本引用 `vitest --run`，但 devDependencies/package-lock 尚无 Vitest 且没有测试文件；这是明确延后到阶段 5 的 P2。第一项前端任务必须安装并锁定实际兼容的 pdfjs-dist、lucide-react、Vitest、Testing Library 和 Playwright，并先建立至少一个真实失败测试；禁止使用 `--passWithNoTests`、删除 test 脚本或依赖全局 CLI 伪装通过。只允许这些 DEV_PLAN 2.3 列出的依赖，安装前核对官方当前兼容版本和许可证，真实安装后锁定。不得添加 UI 框架、状态管理库或第二套请求库，不要用会隐式下载未知版本的 npx 掩盖缺失依赖。
+5. 先列阶段任务和组件职责；每个原子任务最多修改 4 个文件，编辑前输出唯一目标、允许文件、禁止范围、固定 API/类型和验证命令。先写测试再实现。
 
 阶段允许范围：frontend/src、前端测试，以及上述已明确批准的 package.json/package-lock.json 依赖变更。不得改变后端 API、Schema、数据库或错误码。
 
@@ -235,6 +236,7 @@ if ($LASTEXITCODE -ne 0) { throw "Stage 4 backend regression failed: $LASTEXITCO
 - SidePanel.tsx 根据状态展示证据、快速检查、深度审计入口、修改入口占位状态和版本历史读取状态。
 - api.ts 集中封装全部请求、取消和统一错误映射；组件中不得拼 API URL。
 - 明确显示未上传、解析中、生成中、快速检查完成、深度审计中、完整审计完成、证据不足和失败可重试状态。
+- `claims=[]`、`evidence_records=[]` 时明确显示证据不足，不创建证据跳转；`AUDIT_INCOMPLETE` 时保留快速检查结果并显示完整审计失败和重试入口。
 - 深度审计未完成时不显示总分或合格状态。
 - 文本查找失败时仍停留正确页并显示证据摘录；不能白屏。
 - 页眉始终显示 Mock 或 Live。
@@ -264,7 +266,7 @@ finally {
     Pop-Location
 }
 
-阶段完成条件：前三个预设任务 Playwright 全绿；生产构建通过；两个规定视口无重叠；证据跳转和降级路径可见；后端契约未改变；依赖仅限批准清单且 audit 无高危漏洞。
+阶段完成条件：前三个预设任务 Playwright 全绿；生产构建通过；两个规定视口无重叠；证据跳转、空证据状态和 `AUDIT_INCOMPLETE` 降级路径可见；后端契约未改变；依赖仅限批准清单且 audit 无高危漏洞。阶段报告必须继续列出 `LIVE-BLOCKER-01`；该阻塞不否定阶段 5 的前端验收，但在关闭前 `STAGE_6_ENTRY=HOLD`。
 
 完成后启动本地后端和前端，给我可点击 URL，并提交阶段报告：用户流程、修改文件、依赖变更、测试结果、截图核验、已知限制、是否通过门槛。报告必须附上完整且无占位符的 PowerShell 验收脚本，并负责安全启动、等待和关闭测试服务。停在阶段边界，等待阶段 6 新会话。
 ```
@@ -278,9 +280,10 @@ finally {
 
 开始时必须：
 1. 将工作目录设为 D:\Hy3，阅读 AGENTS.md、DEV_PLAN 第 1、2、4、5、6、7、8.6、9、10、12 节，以及阶段 5 的前后端实现和测试。
-2. 运行后端全测和前端测试/构建，确认阶段 5 基线真实通过。若 Playwright 需要服务，按项目 README 启动并在结束时清理进程。
-3. 先给出多个原子任务及依赖顺序；每次编辑最多 4 个文件，编辑前输出唯一目标、允许文件、禁止范围、固定 EditPatch/API/错误码和验证命令。
-4. 不新增依赖。先写拒绝、过期和越界测试，再实现成功路径。
+2. 首先核对 `DEV_PLAN` 中 `LIVE-BLOCKER-01` 的关闭证据。必须同时存在真实 risk-only `200/deep_complete/8 dimensions` 和至少一条非零 claims、已验证 evidence、semantic judgments 的真实完整闭环，且均无 Mock fallback。证据不足时立即停止，报告 `STAGE_6_ENTRY=HOLD`，要求另开“阶段 4 Live 收口”会话；不得在本阶段顺手修改深审 Prompt、Schema、重试或生成契约。
+3. 运行后端全测和前端测试/构建，确认阶段 5 基线真实通过。若 Playwright 需要服务，按项目 README 启动并在结束时清理进程。
+4. 先给出多个原子任务及依赖顺序；每次编辑最多 4 个文件，编辑前输出唯一目标、允许文件、禁止范围、固定 EditPatch/API/错误码和验证命令。
+5. 不新增依赖。先写拒绝、过期和越界测试，再实现成功路径。
 
 阶段允许范围：hy3_service.py、project_store.py、api.py、SidePanel.tsx 和直接相关测试。按原子任务拆分，不能一次修改所有文件。除契约有已证实矛盾外不得修改 models.py、types.ts 或固定 API。
 

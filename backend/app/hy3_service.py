@@ -15,6 +15,7 @@ from backend.app.models import (
     DeepAuditResult,
     EvidenceRecord,
     GeneratedBundle,
+    RiskCategory,
     SourceBlock,
 )
 from backend.app.prompts import (
@@ -136,10 +137,13 @@ class Hy3Service:
         usage: UsageTuple = (None, None, None)
         retries = 0
         try:
-            self._validate_deep_audit_input(claim_evidence_pairs)
+            expected_pairs = self._validate_deep_audit_input(
+                claim_evidence_pairs
+            )
             if self.settings.paperlens_model_mode == "mock":
                 result = self._validate_deep_audit_result(
-                    self._load_mock_deep_audit_response()
+                    self._load_mock_deep_audit_response(),
+                    expected_pairs,
                 )
             else:
                 self._require_live_config()
@@ -147,7 +151,10 @@ class Hy3Service:
                     document,
                     claim_evidence_pairs,
                 )
-                result, retries, usage = self._deep_audit_live(prompt)
+                result, retries, usage = self._deep_audit_live(
+                    prompt,
+                    expected_pairs,
+                )
         except Hy3ServiceError as exc:
             self._log_run(
                 started_at=started_at,
@@ -274,6 +281,7 @@ class Hy3Service:
     def _deep_audit_live(
         self,
         original_prompt: str,
+        expected_pairs: set[SemanticPairKey],
     ) -> tuple[DeepAuditResult, int, UsageTuple]:
         field_error_summary: str | None = None
         cumulative_usage: UsageTuple | None = None
@@ -320,7 +328,10 @@ class Hy3Service:
             raw_response = self._extract_response_content(response)
             try:
                 return (
-                    self._validate_deep_audit_result(raw_response),
+                    self._validate_deep_audit_result(
+                        raw_response,
+                        expected_pairs,
+                    ),
                     attempt,
                     cumulative_usage,
                 )
@@ -497,6 +508,7 @@ class Hy3Service:
     @staticmethod
     def _validate_deep_audit_result(
         raw_response: Any,
+        expected_pairs: set[SemanticPairKey],
     ) -> DeepAuditResult:
         if not isinstance(raw_response, (str, bytes, bytearray)):
             raise Hy3ServiceError(
@@ -508,7 +520,7 @@ class Hy3Service:
                 ),
             )
         try:
-            return DeepAuditResult.model_validate_json(raw_response)
+            result = DeepAuditResult.model_validate_json(raw_response)
         except ValidationError as exc:
             raise Hy3ServiceError(
                 "SCHEMA_INVALID",
@@ -516,6 +528,50 @@ class Hy3Service:
                 retryable=False,
                 field_error_summary=Hy3Service._field_error_summary(exc),
             ) from exc
+
+        actual_pairs = [
+            (judgment.claim_id, judgment.block_id)
+            for judgment in result.semantic_judgments
+        ]
+        unique_actual_pairs = set(actual_pairs)
+        if (
+            len(actual_pairs) != len(unique_actual_pairs)
+            or unique_actual_pairs != expected_pairs
+        ):
+            raise Hy3ServiceError(
+                "AUDIT_INCOMPLETE",
+                "The deep-audit semantic judgments did not match the requested pairs.",
+                retryable=True,
+                field_error_summary=(
+                    "semantic_judgments [semantic_pair_mismatch]: "
+                    f"expected_count={len(expected_pairs)} "
+                    f"actual_count={len(actual_pairs)} "
+                    f"unique_count={len(unique_actual_pairs)}"
+                ),
+            )
+
+        risk_categories = [
+            finding.category for finding in result.risk_findings
+        ]
+        unique_risk_categories = set(risk_categories)
+        expected_risk_categories = set(RiskCategory)
+        if (
+            len(risk_categories) != len(expected_risk_categories)
+            or len(unique_risk_categories) != len(expected_risk_categories)
+            or unique_risk_categories != expected_risk_categories
+        ):
+            raise Hy3ServiceError(
+                "AUDIT_INCOMPLETE",
+                "The deep-audit risk findings did not cover the required categories.",
+                retryable=True,
+                field_error_summary=(
+                    "risk_findings [risk_category_coverage_invalid]: "
+                    f"expected_count={len(expected_risk_categories)} "
+                    f"actual_count={len(risk_categories)} "
+                    f"unique_count={len(unique_risk_categories)}"
+                ),
+            )
+        return result
 
     @staticmethod
     def _field_error_summary(error: ValidationError) -> str:

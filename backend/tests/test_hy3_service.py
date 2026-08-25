@@ -186,6 +186,23 @@ def valid_deep_audit_json() -> str:
     return (FIXTURES / "deep_audit_valid.json").read_text(encoding="utf-8")
 
 
+def deep_audit_with_risk_category_coverage(variant: str) -> str:
+    payload = json.loads(valid_deep_audit_json())
+    findings = payload["risk_findings"]
+    for index, finding in enumerate(findings):
+        finding["reason"] = f"PRIVATE_RISK_REASON_{index}"
+        finding["remediation"] = f"PRIVATE_RISK_REMEDIATION_{index}"
+    if variant == "missing":
+        payload["risk_findings"] = findings[:2]
+    elif variant == "duplicate":
+        payload["risk_findings"] = [findings[0], findings[1], findings[1]]
+    elif variant == "extra":
+        payload["risk_findings"] = [*findings, findings[0]]
+    else:
+        raise AssertionError(f"unknown risk coverage variant: {variant}")
+    return json.dumps(payload)
+
+
 def completion_response(
     content: str,
     usage: tuple[int | None, int | None, int | None] | None,
@@ -284,7 +301,7 @@ def test_mock_deep_audit_returns_valid_deep_audit_result() -> None:
     }
 
 
-def test_mock_deep_audit_leaves_pair_completeness_to_audit_service(
+def test_mock_deep_audit_rejects_semantic_pair_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = Hy3Service(settings=mock_settings())
@@ -296,13 +313,15 @@ def test_mock_deep_audit_leaves_pair_completeness_to_audit_service(
         lambda: json.dumps(invalid),
     )
 
-    result = service.deep_audit(
-        document=generated_bundle().document,
-        claim_evidence_pairs=verified_claim_evidence_pairs(),
-    )
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        service.deep_audit(
+            document=generated_bundle().document,
+            claim_evidence_pairs=verified_claim_evidence_pairs(),
+        )
 
-    assert isinstance(result, DeepAuditResult)
-    assert result.semantic_judgments[1].block_id == "p99-b999"
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is True
+    assert "p99-b999" not in (exc_info.value.field_error_summary or "")
 
 
 def test_mock_deep_audit_uses_same_v2_schema_validation_chain(
@@ -387,6 +406,161 @@ def test_live_deep_audit_schema_error_retries_and_logs_safely(caplog) -> None:
         not in caplog.text
     )
     assert "unit-test-key" not in caplog.text
+
+
+def test_live_deep_audit_retries_schema_valid_semantic_pair_mismatch() -> None:
+    invalid = json.loads(valid_deep_audit_json())
+    invalid["semantic_judgments"][0]["block_id"] = "p99-b999"
+    raw_response = json.dumps(invalid)
+    client = FakeClient([raw_response, raw_response, raw_response])
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        Hy3Service(settings=live_settings(), client=client).deep_audit(
+            document=generated_bundle().document,
+            claim_evidence_pairs=verified_claim_evidence_pairs(),
+        )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is True
+    assert exc_info.value.retries == 2
+    assert exc_info.value.usage == (303, 159, 462)
+    assert len(client.completions.calls) == 3
+    assert "p99-b999" not in (exc_info.value.field_error_summary or "")
+    for request in client.completions.calls[1:]:
+        retry_prompt = request["messages"][1]["content"]
+        assert retry_prompt.count("字段错误摘要：") == 1
+        assert "semantic_pair_mismatch" in retry_prompt
+        assert "p99-b999" not in retry_prompt
+
+
+@pytest.mark.parametrize(
+    ("variant", "actual_count", "unique_count"),
+    [
+        ("missing", 2, 2),
+        ("duplicate", 3, 2),
+        ("extra", 4, 3),
+    ],
+)
+def test_live_deep_audit_retries_invalid_risk_category_coverage(
+    variant: str,
+    actual_count: int,
+    unique_count: int,
+    caplog,
+) -> None:
+    raw_response = deep_audit_with_risk_category_coverage(variant)
+    client = FakeClient([raw_response, raw_response, raw_response])
+    safe_summary = (
+        "risk_findings [risk_category_coverage_invalid]: "
+        f"expected_count=3 actual_count={actual_count} "
+        f"unique_count={unique_count}"
+    )
+
+    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            Hy3Service(settings=live_settings(), client=client).deep_audit(
+                document=generated_bundle().document,
+                claim_evidence_pairs=verified_claim_evidence_pairs(),
+            )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is True
+    assert exc_info.value.retries == 2
+    assert exc_info.value.usage == (303, 159, 462)
+    assert exc_info.value.field_error_summary == safe_summary
+    assert len(client.completions.calls) == 3
+    for request in client.completions.calls[1:]:
+        retry_prompt = request["messages"][1]["content"]
+        assert retry_prompt.count("字段错误摘要：") == 1
+        assert safe_summary in retry_prompt
+    for private_value in (
+        "PRIVATE_RISK_REASON_0",
+        "PRIVATE_RISK_REASON_1",
+        "PRIVATE_RISK_REASON_2",
+        "PRIVATE_RISK_REMEDIATION_0",
+        "PRIVATE_RISK_REMEDIATION_1",
+        "PRIVATE_RISK_REMEDIATION_2",
+    ):
+        assert private_value not in (exc_info.value.field_error_summary or "")
+        assert private_value not in caplog.text
+
+
+def test_live_risk_only_deep_audit_retries_invalid_categories_then_succeeds(
+    caplog,
+) -> None:
+    invalid = json.loads(deep_audit_with_risk_category_coverage("missing"))
+    invalid["semantic_judgments"] = []
+    valid = json.loads(valid_deep_audit_json())
+    valid["semantic_judgments"] = []
+    client = FakeClient(
+        [
+            completion_response(json.dumps(invalid), (11, 7, 18)),
+            completion_response(json.dumps(valid), (13, 9, 22)),
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+        result = Hy3Service(settings=live_settings(), client=client).deep_audit(
+            document=generated_bundle().document,
+            claim_evidence_pairs=[],
+        )
+
+    assert result.semantic_judgments == []
+    categories = [finding.category.value for finding in result.risk_findings]
+    assert len(categories) == 3
+    assert len(set(categories)) == 3
+    assert set(categories) == {
+        "sensitive_information",
+        "author_impersonation",
+        "academic_integrity",
+    }
+    assert len(client.completions.calls) == 2
+    retry_prompt = client.completions.calls[1]["messages"][1]["content"]
+    assert retry_prompt.count("字段错误摘要：") == 1
+    assert (
+        "risk_findings [risk_category_coverage_invalid]: "
+        "expected_count=3 actual_count=2 unique_count=2"
+        in retry_prompt
+    )
+    assert "PRIVATE_RISK_REASON" not in retry_prompt
+    assert "PRIVATE_RISK_REMEDIATION" not in retry_prompt
+    assert "prompt_tokens=24" in caplog.text
+    assert "completion_tokens=16" in caplog.text
+    assert "total_tokens=40" in caplog.text
+    assert "retries=1" in caplog.text
+    assert "PRIVATE_RISK_REASON" not in caplog.text
+    assert "PRIVATE_RISK_REMEDIATION" not in caplog.text
+
+
+def test_live_deep_audit_empty_pairs_requires_empty_semantic_judgments(
+    caplog,
+) -> None:
+    extra = json.loads(valid_deep_audit_json())
+    extra["semantic_judgments"] = [extra["semantic_judgments"][0]]
+    risk_only = json.loads(valid_deep_audit_json())
+    risk_only["semantic_judgments"] = []
+    client = FakeClient(
+        [
+            completion_response(json.dumps(extra), (11, 7, 18)),
+            completion_response(json.dumps(risk_only), (13, 9, 22)),
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+        result = Hy3Service(settings=live_settings(), client=client).deep_audit(
+            document=generated_bundle().document,
+            claim_evidence_pairs=[],
+        )
+
+    assert result.semantic_judgments == []
+    assert len(result.risk_findings) == 3
+    assert len(client.completions.calls) == 2
+    assert "semantic_pair_mismatch" in (
+        client.completions.calls[1]["messages"][1]["content"]
+    )
+    assert "prompt_tokens=24" in caplog.text
+    assert "completion_tokens=16" in caplog.text
+    assert "total_tokens=40" in caplog.text
+    assert "retries=1" in caplog.text
 
 
 def test_live_deep_audit_provider_failure_stays_failed_without_mock(

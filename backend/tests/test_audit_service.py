@@ -509,6 +509,26 @@ def test_deep_audit_batches_once_and_code_builds_all_eight_dimensions() -> None:
     assert report.risk_assessment.level_points == 4
 
 
+def test_risk_only_deep_audit_completes_with_empty_pairs() -> None:
+    bundle = generated_bundle().model_copy(update={"claims": []})
+    semantic_service = RecordingDeepAudit()
+
+    result, report = AuditService(
+        hy3_service=semantic_service
+    ).run_deep_audit(bundle, [], compliance_context())
+
+    assert semantic_service.calls == [[]]
+    assert result.semantic_judgments == []
+    assert len(result.risk_findings) == 3
+    assert report.audit_status == AuditStatus.DEEP_COMPLETE
+    assert len(report.dimensions) == 8
+    assert {item.dimension_id for item in report.dimensions} == set(DimensionId)
+    assert all(
+        item.raw_metrics.get("total_claims", 0) == 0
+        for item in report.dimensions
+    )
+
+
 def test_run_deep_audit_rejects_unconfirmed_rights_before_hy3_call() -> None:
     bundle = generated_bundle()
     records, _ = AuditService().quick_check(bundle, source_blocks_fixture())

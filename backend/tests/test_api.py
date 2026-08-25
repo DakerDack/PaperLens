@@ -1,6 +1,7 @@
 import json
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Iterator
 
 import pytest
@@ -19,6 +20,7 @@ from backend.app.main import create_app
 from backend.app.hy3_service import Hy3Service, Hy3ServiceError
 from backend.app.models import (
     ComplianceContext,
+    DeepAuditResult,
     ErrorResponse,
     EvidenceRecord,
     GeneratedBundle,
@@ -364,6 +366,63 @@ class RecordingGenerateService:
         return generated_bundle()
 
 
+class ZeroClaimGenerateService(RecordingGenerateService):
+    def generate(
+        self,
+        *,
+        paper_metadata: dict[str, object],
+        source_blocks: list[SourceBlock],
+    ) -> GeneratedBundle:
+        self.calls.append((paper_metadata, source_blocks))
+        return generated_bundle().model_copy(update={"claims": []})
+
+
+class RiskOnlyDeepAuditProvider:
+    def __init__(self) -> None:
+        self.calls: list[list[tuple[object, EvidenceRecord]]] = []
+
+    def deep_audit(
+        self,
+        *,
+        document: object,
+        claim_evidence_pairs: list[tuple[object, EvidenceRecord]],
+    ) -> DeepAuditResult:
+        del document
+        self.calls.append(claim_evidence_pairs)
+        payload = json.loads(
+            (FIXTURES / "deep_audit_valid.json").read_text(encoding="utf-8")
+        )
+        payload["semantic_judgments"] = []
+        return DeepAuditResult.model_validate(payload)
+
+
+class SequencedLiveCompletions:
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> SimpleNamespace:
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=self.responses.pop(0))
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=11,
+                completion_tokens=7,
+                total_tokens=18,
+            ),
+        )
+
+
+class SequencedLiveClient:
+    def __init__(self, responses: list[str]) -> None:
+        self.completions = SequencedLiveCompletions(responses)
+        self.chat = SimpleNamespace(completions=self.completions)
+
+
 class FailingGenerateService:
     def __init__(self, error: Hy3ServiceError) -> None:
         self.error = error
@@ -436,6 +495,143 @@ def test_generate_uses_only_saved_parse_snapshot_and_persists_quick_check(
             "audits": 1,
             "patches": 0,
             "runs": 3,
+        }
+
+
+def test_zero_claim_generation_can_complete_risk_only_api_audit(
+    tmp_path: Path,
+) -> None:
+    generation = ZeroClaimGenerateService()
+    risk_provider = RiskOnlyDeepAuditProvider()
+    audit_service = AuditService(hy3_service=risk_provider)
+    with api_client(
+        tmp_path,
+        hy3_service=generation,
+        audit_service=audit_service,
+    ) as (client, store, _):
+        upload_parsed_project(client)
+
+        generated = client.post("/api/projects/project-001/generate")
+        assert generated.status_code == 200
+        assert generated.json()["stage"] == "quick_checked"
+        assert generated.json()["claims"] == []
+        assert generated.json()["evidence_records"] == []
+        version_id = generated.json()["version_id"]
+
+        audited = client.post(
+            "/api/projects/project-001/audit",
+            json=VALID_AUDIT_REQUEST,
+        )
+
+        assert audited.status_code == 200
+        payload = audited.json()
+        assert payload["stage"] == "deep_audited"
+        assert payload["version_id"] == version_id
+        assert payload["audit_report"]["audit_status"] == "deep_complete"
+        assert len(payload["audit_report"]["dimensions"]) == 8
+        assert risk_provider.calls == [[]]
+        project = client.get("/api/projects/project-001")
+        assert project.status_code == 200
+        assert project.json()["stage"] == "deep_audited"
+        assert project.json()["error_code"] is None
+        assert project.json()["claims"] == []
+        assert project.json()["evidence_records"] == []
+        assert store.row_counts() == {
+            "projects": 1,
+            "versions": 1,
+            "audits": 2,
+            "patches": 0,
+            "runs": 4,
+        }
+
+
+def test_zero_claim_live_provider_retries_invalid_risk_categories_and_completes_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation_payload = json.loads(
+        (FIXTURES / "generation_valid.json").read_text(encoding="utf-8")
+    )
+    generation_payload["claims"] = []
+    invalid_audit = json.loads(
+        (FIXTURES / "deep_audit_valid.json").read_text(encoding="utf-8")
+    )
+    invalid_audit["semantic_judgments"] = []
+    invalid_audit["risk_findings"] = invalid_audit["risk_findings"][:2]
+    valid_audit = json.loads(
+        (FIXTURES / "deep_audit_valid.json").read_text(encoding="utf-8")
+    )
+    valid_audit["semantic_judgments"] = []
+    live_client = SequencedLiveClient(
+        [
+            json.dumps(generation_payload),
+            json.dumps(invalid_audit),
+            json.dumps(valid_audit),
+        ]
+    )
+    live_settings = Settings(
+        _env_file=None,
+        paperlens_env="test",
+        paperlens_data_dir=tmp_path / "live-service-data",
+        paperlens_model_mode="live",
+        hy3_api_key="unit-test-key",
+        hy3_max_retries=2,
+    )
+    hy3_service = Hy3Service(settings=live_settings, client=live_client)
+    monkeypatch.setattr(
+        hy3_service,
+        "_load_mock_response",
+        lambda: pytest.fail("Live generation must not load Mock data"),
+    )
+    monkeypatch.setattr(
+        hy3_service,
+        "_load_mock_deep_audit_response",
+        lambda: pytest.fail("Live deep audit must not load Mock data"),
+    )
+
+    with api_client(
+        tmp_path,
+        model_mode="live",
+        hy3_service=hy3_service,
+        audit_service=AuditService(hy3_service=hy3_service),
+        hy3_api_key="unit-test-key",
+    ) as (client, store, _):
+        upload_parsed_project(client)
+        generated = client.post("/api/projects/project-001/generate")
+
+        assert generated.status_code == 200
+        assert generated.json()["stage"] == "quick_checked"
+        assert generated.json()["model_mode"] == "live"
+        assert generated.json()["claims"] == []
+        assert generated.json()["evidence_records"] == []
+
+        audited = client.post(
+            "/api/projects/project-001/audit",
+            json=VALID_AUDIT_REQUEST,
+        )
+
+        assert audited.status_code == 200
+        body = audited.json()
+        assert body["stage"] == "deep_audited"
+        assert body["audit_report"]["audit_status"] == "deep_complete"
+        assert len(body["audit_report"]["dimensions"]) == 8
+        assert len(live_client.completions.calls) == 3
+        retry_prompt = live_client.completions.calls[2]["messages"][1]["content"]
+        assert "risk_category_coverage_invalid" in retry_prompt
+
+        project = client.get("/api/projects/project-001")
+        assert project.status_code == 200
+        assert project.json()["stage"] == "deep_audited"
+        assert project.json()["model_mode"] == "live"
+        assert project.json()["error_code"] is None
+        assert project.json()["claims"] == []
+        assert project.json()["evidence_records"] == []
+        assert store.row_counts() == {
+            "projects": 1,
+            "versions": 1,
+            "audits": 2,
+            "patches": 0,
+            "runs": 4,
         }
 
 

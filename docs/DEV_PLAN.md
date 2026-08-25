@@ -1064,6 +1064,17 @@ python -m pytest backend/tests -q
 
 通过门槛：后端全部测试通过；使用 Mock 能通过命令行完成核心闭环。
 
+**阶段 4 收口状态（2026-08-25）**：`STAGE_4_FORMAL_GATE=PASS`。当前收口基线为后端 `267 passed, 1 skipped`，跳过项仅为需显式启用的真实 MinerU 集成测试；Mock 五路由命令行闭环、五表存储、Pydantic JSON 往返、失败恢复和稳定错误映射均已通过。阶段 4 的正式门槛不要求真实 Live 公共 API 全链路成功，因此允许在保持下述已知阻塞可见的前提下进入阶段 5。该结论不等于 `PRODUCTION_READY`，也不得把 Mock 结果描述为真实 Hy3 结果。
+
+**LIVE-BLOCKER-01：真实 risk-only 深审未闭环。** 已使用 `simple_2page.pdf` 完成一次受控真实公共 API 复验：真实 MinerU 上传解析返回 `201/parsed`（2 页、4 个 `SourceBlock`）；真实 Hy3 生成返回 `200/quick_checked/live`，但产生 `0 claims/0 evidence`；随后 risk-only 深审在三次真实 Hy3 响应（`retries=2`）后仍返回 `502/AUDIT_INCOMPLETE`，安全失败边界为 `HY3_RISK_CATEGORY_COVERAGE_INVALID`。项目保持 `failed/live`，PDF 读取仍为有效 `200`，确认没有 Mock fallback。现有代码已能让结构合法但风险类别缺失、重复或多余的响应进入有界重试，但真实供应商在空 `items` 场景仍未返回三个固定风险类别各一条；不得通过代码补齐、过滤或伪造风险结果来消除此失败。
+
+阶段 5 可以使用冻结的阶段 4 API、Mock 夹具和稳定失败响应继续开发，但必须把以下状态作为正式界面与测试输入：
+
+- `claims=[]`、`evidence_records=[]` 的证据不足状态；不得显示不存在的证据跳转。
+- `502/AUDIT_INCOMPLETE`、项目 `failed` 和 `retryable_stage=deep_audited` 的可见失败与重试提示。
+- Mock/Live 标识始终可见；Live 失败不得在前端替换为 Mock 成功。
+- 非空 claims/evidence 的证据跳转使用确定性夹具完成，不得用空结果证明证据跳转已验证。
+
 ### 阶段 5：三栏工作台和证据跳转
 
 **允许修改**：`frontend/src/`、前端测试以及实际建立 Vitest/Testing Library/Playwright 测试基础设施所需的 `frontend/package.json` 和 `frontend/package-lock.json`，不修改后端契约。
@@ -1095,6 +1106,8 @@ npx playwright test
 - 文本查找失败时仍停留正确页并明确显示摘录，不出现空白界面。
 - 深度审计未完成时不显示总分和合格状态。
 - API 错误可见且允许重试。
+- `claims=[]` 和 `evidence_records=[]` 时明确显示证据不足，不渲染伪造证据或无效跳转。
+- `AUDIT_INCOMPLETE` 时保留最后稳定的快速检查结果，显示完整审计失败和可重试状态，不显示总分或合格结论。
 - 桌面 1440x900 和移动 390x844 下文字不重叠；移动端允许切换三个面板。
 
 通过门槛：前三个预设流程任务通过 Playwright；前端构建通过。
@@ -1102,6 +1115,15 @@ npx playwright test
 ### 阶段 6：修订、版本和回退
 
 阶段 6 除实现修订、补丁接受和版本恢复外，同时实现第 4.2 节已冻结但在阶段 4 明确延后的 Markdown 导出。阶段 4 和阶段 5 不得为这些路径创建占位实现。
+
+**进入阶段 6 的额外硬门槛**：必须先在独立的“阶段 4 Live 收口”原子任务中关闭 `LIVE-BLOCKER-01`，不得在阶段 6 修订任务中顺手修复。关闭证据必须同时包含：
+
+1. `claims=0` 的真实 risk-only 公共 API 闭环达到 `200/deep_audited/deep_complete`，由代码生成并持久化完整 8 个维度，全程无 Mock fallback。
+2. 至少一篇获授权真实文本型 PDF 产生非零 `AtomicClaim[]`、非零已验证 `EvidenceRecord[]` 和一一对应的 `SemanticJudgment[]`，并完成真实 `200/deep_complete` 审计。
+3. 两条 Live 记录均只保存脱敏结构摘要和运行元数据；不保存 Key、Prompt、论文长文本、供应商原始响应或未脱敏敏感风险文本。
+4. 受影响聚焦测试、后端全量、阶段 5 前端测试/构建/Playwright 和 `git diff --check` 全部通过。
+
+任一条件未满足时，`STAGE_6_ENTRY=HOLD`。不得通过删除空 claims 场景、降低三类风险完整性、将候选证据当作已验证证据或使用 Mock 演示来绕过该门槛。
 
 **允许修改**：`hy3_service.py`、`project_store.py`、`api.py`、`SidePanel.tsx`、相关测试。
 
