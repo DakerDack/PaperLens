@@ -11,6 +11,8 @@ pytest-cache-files-*/
 frontend/node_modules/
 frontend/dist/
 frontend/coverage/
+frontend/.vitest-attachments/
+frontend/test-results/
 
 data/
 *.db

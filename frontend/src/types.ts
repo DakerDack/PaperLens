@@ -44,6 +44,16 @@ export type ProjectStage =
   | "deep_audited"
   | "patch_pending"
   | "failed";
+export type ModelMode = "mock" | "live";
+export type DisclosureStatus = "present" | "missing";
+export type GeneratedContentLabelApplicability = "applicable" | "not_applicable";
+export type GeneratedContentLabelStatus = "present" | "missing" | "not_applicable";
+export type RiskCategory =
+  | "sensitive_information"
+  | "author_impersonation"
+  | "academic_integrity";
+export type RiskStatus = "detected" | "not_detected" | "unclear";
+export type RiskLocationType = "sentence" | "title" | "document";
 
 export interface SourceBlock {
   block_id: string;
@@ -111,6 +121,34 @@ export interface SemanticJudgment {
   reason: string;
 }
 
+export interface ComplianceContext {
+  rights_or_license_confirmed: boolean;
+  source_disclosure_status: DisclosureStatus;
+  ai_assistance_disclosure_status: DisclosureStatus;
+  generated_content_label_applicability: GeneratedContentLabelApplicability;
+  generated_content_label_status: GeneratedContentLabelStatus;
+}
+
+export interface RiskLocation {
+  location_type: RiskLocationType;
+  sentence_id: string | null;
+  evidence_excerpt: string | null;
+}
+
+export interface RiskFinding {
+  category: RiskCategory;
+  status: RiskStatus;
+  locations: RiskLocation[];
+  reason: string;
+  remediation: string;
+}
+
+export interface RiskAssessment {
+  compliance_context: ComplianceContext;
+  risk_findings: RiskFinding[];
+  level_points: number;
+}
+
 export interface DimensionResult {
   dimension_id: DimensionId;
   raw_metrics: Record<string, number>;
@@ -121,6 +159,7 @@ export interface DimensionResult {
 export interface AuditReport {
   audit_status: AuditStatus;
   dimensions: DimensionResult[];
+  risk_assessment: RiskAssessment | null;
   hard_failures: string[];
   core_gate_passed: boolean | null;
   overall_score: number | null;
@@ -151,4 +190,73 @@ export interface HealthResponse {
   status: "ok";
   service: "paperlens-api";
   version: string;
+}
+
+export interface ParseQualitySnapshot {
+  page_count: number;
+  block_count: number;
+  empty_page_rate: number;
+  abnormal_character_rate: number;
+  page_number_completeness_rate: number;
+  bbox_availability_rate: number;
+}
+
+export interface ProjectCreateResponse {
+  project_id: string;
+  stage: "parsed";
+  parse_quality: ParseQualitySnapshot;
+  source_block_count: number;
+  created_at: string;
+}
+
+export interface VersionSummary {
+  version_id: string;
+  version_no: number;
+  parent_version_id: string | null;
+  reason: string;
+  created_at: string;
+}
+
+export interface ProjectView {
+  project_id: string;
+  stage: ProjectStage;
+  model_mode: ModelMode;
+  parse_quality: ParseQualitySnapshot | null;
+  source_block_count: number;
+  current_version_id: string | null;
+  current_version_no: number | null;
+  document: ContentDraft | null;
+  claims: AtomicClaim[];
+  evidence_records: EvidenceRecord[];
+  audit_report: AuditReport | null;
+  versions: VersionSummary[];
+  error_code: string | null;
+  retryable_stage: ProjectStage | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GenerationResponse {
+  project_id: string;
+  version_id: string;
+  stage: "quick_checked";
+  model_mode: ModelMode;
+  document: ContentDraft;
+  claims: AtomicClaim[];
+  evidence_records: EvidenceRecord[];
+  quick_report: AuditReport;
+}
+
+export interface DeepAuditRequest {
+  source_disclosure_status: DisclosureStatus;
+  ai_assistance_disclosure_status: DisclosureStatus;
+  generated_content_label_applicability: GeneratedContentLabelApplicability;
+  generated_content_label_status: GeneratedContentLabelStatus;
+}
+
+export interface DeepAuditResponse {
+  project_id: string;
+  version_id: string;
+  stage: "deep_audited";
+  audit_report: AuditReport;
 }
