@@ -772,7 +772,7 @@ DeepAuditResponse
 
 ## 6. Hy3 Prompt 模板
 
-所有 Prompt 保存在 `backend/app/prompts.py`，使用版本常量，例如 `GENERATION_PROMPT_VERSION = "gen-v2"`。不得把 Prompt 分散在路由、测试和前端。加入 `claim_policy` 后只升级 Prompt 版本；`GeneratedBundle` 输出结构未改变，因此生成 Schema 版本仍为 `generated-bundle-v1`。
+所有 Prompt 保存在 `backend/app/prompts.py`，使用版本常量，例如 `GENERATION_PROMPT_VERSION = "gen-v3"`。不得把 Prompt 分散在路由、测试和前端。Generation 跨重试安全契约错误改为按 attempt 顺序累计并要求同时修复后升级 Prompt 版本；`GeneratedBundle` 输出结构未改变，因此生成 Schema 版本仍为 `generated-bundle-v1`。
 
 ### 6.1 共同系统约束
 
@@ -962,7 +962,7 @@ python -m pytest backend/tests/test_document_service.py -q
 2. 实现 OpenAI 兼容客户端，Key 从环境变量读取。
 3. 执行真实接口探针，不接前端。
 4. 使用严格 JSON Schema；Pydantic 每层设置 `extra="forbid"`。
-5. Schema 失败最多重试 2 次，重试只附加字段错误摘要。
+5. Generation 的 JSON、Pydantic 或 claim policy 失败最多重试 2 次；每次重试按 attempt 顺序附加此前全部安全契约错误摘要，并要求同时修复且不得重新违反先前约束。每项摘要最多 800 字符，不含 Pydantic input、供应商原始响应、Prompt、论文或 claims 文本。
 6. 记录模型 ID、Prompt 版本、参数、token、延迟、重试和错误码，不记录完整论文。
 
 测试：

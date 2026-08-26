@@ -30,6 +30,7 @@ from backend.app.prompts import (
     GENERATION_SCHEMA_VERSION,
     render_deep_audit_prompt,
     render_generation_prompt,
+    render_generation_retry_prompt,
 )
 from backend.app.settings import Settings, settings as app_settings
 
@@ -81,6 +82,15 @@ _SAFE_FINISH_REASONS = frozenset({
     "content_filter",
     "tool_calls",
 })
+_SAFE_VALIDATION_ERROR_MESSAGES = {
+    "json_invalid": "JSON text is invalid.",
+    "missing": "Required field is missing.",
+    "extra_forbidden": "Extra field is not permitted.",
+    "enum": "Value is not an allowed enum member.",
+    "literal_error": "Value is not an allowed literal.",
+    "value_error": "Value failed validation.",
+}
+_DEFAULT_SAFE_VALIDATION_ERROR_MESSAGE = "Value failed validation."
 
 
 class Hy3ServiceError(RuntimeError):
@@ -253,12 +263,14 @@ class Hy3Service:
         original_prompt: str,
         claim_policy: ClaimPolicy,
     ) -> tuple[GeneratedBundle, int, UsageTuple]:
-        field_error_summary: str | None = None
+        field_error_summaries: list[tuple[int, str]] = []
         cumulative_usage: UsageTuple | None = None
         for attempt in range(self.settings.hy3_max_retries + 1):
             prompt = original_prompt
-            if field_error_summary is not None:
-                prompt += f"\n\n字段错误摘要：{field_error_summary}"
+            if field_error_summaries:
+                prompt += "\n\n" + render_generation_retry_prompt(
+                    validation_summaries=field_error_summaries,
+                )
 
             try:
                 response = self._get_client().chat.completions.create(
@@ -320,9 +332,10 @@ class Hy3Service:
                 exc.usage = cumulative_usage
                 if attempt >= self.settings.hy3_max_retries:
                     raise
-                field_error_summary = (
+                safe_summary = (
                     exc.field_error_summary or "$ [schema_invalid]"
-                )
+                )[:800]
+                field_error_summaries.append((attempt, safe_summary))
                 continue
 
             self._log_generation_attempt(
@@ -676,6 +689,29 @@ class Hy3Service:
         return result
 
     @staticmethod
+    def _safe_validation_location(
+        location: Any,
+        error_type: str,
+    ) -> str:
+        if not isinstance(location, (tuple, list)):
+            return "<location>"
+        if not location:
+            return "$"
+
+        safe_segments: list[str] = []
+        last_index = len(location) - 1
+        for index, segment in enumerate(location):
+            if error_type == "extra_forbidden" and index == last_index:
+                safe_segments.append("<extra_field>")
+            elif isinstance(segment, str) and segment:
+                safe_segments.append(segment)
+            elif type(segment) is int and segment >= 0:
+                safe_segments.append(str(segment))
+            else:
+                safe_segments.append("<location_segment>")
+        return ".".join(safe_segments)
+
+    @staticmethod
     def _field_error_summary(error: ValidationError) -> str:
         summaries: list[str] = []
         for item in error.errors(
@@ -683,9 +719,15 @@ class Hy3Service:
             include_context=False,
             include_input=False,
         )[:8]:
-            location = ".".join(str(part) for part in item.get("loc", ())) or "$"
             error_type = str(item.get("type", "validation_error"))
-            message = " ".join(str(item.get("msg", "invalid value")).split())
+            location = Hy3Service._safe_validation_location(
+                item.get("loc", ()),
+                error_type,
+            )
+            message = _SAFE_VALIDATION_ERROR_MESSAGES.get(
+                error_type,
+                _DEFAULT_SAFE_VALIDATION_ERROR_MESSAGE,
+            )
             summaries.append(f"{location} [{error_type}]: {message}")
         summary = "; ".join(summaries) or "$ [schema_invalid]"
         return summary[:800]

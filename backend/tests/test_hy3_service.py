@@ -250,6 +250,12 @@ def generation_attempt_logs(caplog: Any) -> list[str]:
     ]
 
 
+def generation_retry_summary(prompt: str) -> str:
+    marker = "\n\n字段错误摘要："
+    assert marker in prompt
+    return prompt.split(marker, 1)[1]
+
+
 def assert_closed_objects(node: object) -> None:
     if isinstance(node, dict):
         if node.get("type") == "object":
@@ -268,7 +274,7 @@ def test_generation_prompt_centralizes_stage_two_contract() -> None:
         source_blocks_json='[{"block_id":"p01-b001","text":"Evidence"}]',
     )
 
-    assert GENERATION_PROMPT_VERSION == "gen-v2"
+    assert GENERATION_PROMPT_VERSION == "gen-v3"
     assert GENERATION_SCHEMA_VERSION == "generated-bundle-v1"
     assert GENERATION_SCHEMA_NAME == "paperlens_generated_bundle_v1"
     assert "只能依据输入中的 SourceBlock" in COMMON_SYSTEM_PROMPT
@@ -917,6 +923,354 @@ def test_live_generation_claim_policy_recovers_without_mutating_supplier_output(
     assert len(client.completions.calls) == 2
 
 
+def test_live_generation_required_accumulates_cross_attempt_contract_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: Any,
+) -> None:
+    schema_invalid = json.loads(valid_generation_json())
+    schema_invalid["unexpected"] = {
+        "raw": "RAW_RESPONSE_SENTINEL",
+        "input": "PYDANTIC_INPUT_SENTINEL",
+    }
+    policy_invalid = generation_json_with_claims(present=False)
+    valid_raw = valid_generation_json()
+    source_blocks = load_source_blocks()[:2]
+    source_blocks[0] = source_blocks[0].model_copy(
+        update={"text": "SOURCE_BLOCK_SENTINEL"}
+    )
+    client = FakeClient(
+        [json.dumps(schema_invalid), policy_invalid, valid_raw]
+    )
+    service = Hy3Service(
+        settings=live_settings(hy3_api_key="API_KEY_SENTINEL"),
+        client=client,
+    )
+    accepted_bundles: list[GeneratedBundle] = []
+    original_validate = service._validate_generated_bundle
+
+    def track_valid_bundle(
+        raw_response: Any,
+        claim_policy: str,
+    ) -> GeneratedBundle:
+        bundle = original_validate(raw_response, claim_policy)
+        accepted_bundles.append(bundle)
+        return bundle
+
+    monkeypatch.setattr(service, "_validate_generated_bundle", track_valid_bundle)
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        result = service.generate(
+            claim_policy="required",
+            paper_metadata={"title": "PROMPT_SENTINEL"},
+            source_blocks=source_blocks,
+        )
+
+    assert result is accepted_bundles[-1]
+    assert result == GeneratedBundle.model_validate_json(valid_raw)
+    assert len(client.completions.calls) == 3
+    prompts = [call["messages"][1]["content"] for call in client.completions.calls]
+    assert "字段错误摘要：" not in prompts[0]
+    attempt_one_summary = generation_retry_summary(prompts[1])
+    attempt_two_summary = generation_retry_summary(prompts[2])
+    assert "<extra_field> [extra_forbidden]" in attempt_one_summary
+    assert "claim_policy_mismatch" not in attempt_one_summary
+    assert "<extra_field> [extra_forbidden]" in attempt_two_summary
+    assert (
+        "claims [claim_policy_mismatch]: claim_policy=required "
+        "expected_count=at_least_1 actual_count=0"
+        in attempt_two_summary
+    )
+    assert "attempt=0" in attempt_one_summary
+    assert "attempt=0" in attempt_two_summary
+    assert "attempt=1" in attempt_two_summary
+    assert attempt_two_summary.index("attempt=0") < attempt_two_summary.index(
+        "attempt=1"
+    )
+    assert "必须同时修复" in attempt_two_summary
+    assert "重新违反先前约束" in attempt_two_summary
+    assert "retries=2" in caplog.text
+    for sentinel in (
+        "PROMPT_SENTINEL",
+        "RAW_RESPONSE_SENTINEL",
+        "SOURCE_BLOCK_SENTINEL",
+        "CLAIM_TEXT_SENTINEL",
+        "API_KEY_SENTINEL",
+        "PYDANTIC_INPUT_SENTINEL",
+    ):
+        assert sentinel not in attempt_one_summary
+        assert sentinel not in attempt_two_summary
+        assert sentinel not in caplog.text
+
+
+def test_live_generation_must_be_empty_accumulates_cross_attempt_contract_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: Any,
+) -> None:
+    schema_invalid = json.loads(valid_generation_json())
+    schema_invalid["unexpected"] = "RAW_RESPONSE_SENTINEL"
+    policy_invalid = json.loads(valid_generation_json())
+    policy_invalid["claims"][0]["text"] = "CLAIM_TEXT_SENTINEL"
+    valid_raw = generation_json_with_claims(present=False)
+    client = FakeClient(
+        [
+            json.dumps(schema_invalid),
+            json.dumps(policy_invalid),
+            valid_raw,
+        ]
+    )
+    service = Hy3Service(
+        settings=live_settings(hy3_api_key="API_KEY_SENTINEL"),
+        client=client,
+    )
+    accepted_bundles: list[GeneratedBundle] = []
+    original_validate = service._validate_generated_bundle
+
+    def track_valid_bundle(
+        raw_response: Any,
+        claim_policy: str,
+    ) -> GeneratedBundle:
+        bundle = original_validate(raw_response, claim_policy)
+        accepted_bundles.append(bundle)
+        return bundle
+
+    monkeypatch.setattr(service, "_validate_generated_bundle", track_valid_bundle)
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        result = service.generate(
+            claim_policy="must_be_empty",
+            paper_metadata={"title": "PROMPT_SENTINEL"},
+            source_blocks=load_source_blocks()[:2],
+        )
+
+    assert result is accepted_bundles[-1]
+    assert result == GeneratedBundle.model_validate_json(valid_raw)
+    assert result.claims == []
+    assert len(client.completions.calls) == 3
+    prompts = [call["messages"][1]["content"] for call in client.completions.calls]
+    assert "字段错误摘要：" not in prompts[0]
+    attempt_one_summary = generation_retry_summary(prompts[1])
+    attempt_two_summary = generation_retry_summary(prompts[2])
+    assert "<extra_field> [extra_forbidden]" in attempt_one_summary
+    assert "claim_policy_mismatch" not in attempt_one_summary
+    assert "<extra_field> [extra_forbidden]" in attempt_two_summary
+    assert (
+        "claims [claim_policy_mismatch]: claim_policy=must_be_empty "
+        "expected_count=0 actual_count=5"
+        in attempt_two_summary
+    )
+    assert "attempt=0" in attempt_one_summary
+    assert "attempt=0" in attempt_two_summary
+    assert "attempt=1" in attempt_two_summary
+    assert attempt_two_summary.index("attempt=0") < attempt_two_summary.index(
+        "attempt=1"
+    )
+    assert "必须同时修复" in attempt_two_summary
+    assert "重新违反先前约束" in attempt_two_summary
+    assert "retries=2" in caplog.text
+    for sentinel in (
+        "PROMPT_SENTINEL",
+        "RAW_RESPONSE_SENTINEL",
+        "SOURCE_BLOCK_SENTINEL",
+        "CLAIM_TEXT_SENTINEL",
+        "API_KEY_SENTINEL",
+        "PYDANTIC_INPUT_SENTINEL",
+    ):
+        assert sentinel not in attempt_one_summary
+        assert sentinel not in attempt_two_summary
+        assert sentinel not in caplog.text
+
+
+def test_live_generation_cross_attempt_retry_exhaustion_preserves_last_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_schema_invalid = json.loads(valid_generation_json())
+    first_schema_invalid["first_unexpected"] = "FIRST_RAW_SENTINEL"
+    last_schema_invalid = json.loads(valid_generation_json())
+    last_schema_invalid["last_unexpected"] = "LAST_RAW_SENTINEL"
+    client = FakeClient(
+        [
+            json.dumps(first_schema_invalid),
+            generation_json_with_claims(present=False),
+            json.dumps(last_schema_invalid),
+        ]
+    )
+    service = Hy3Service(settings=live_settings(), client=client)
+    monkeypatch.setattr(
+        service,
+        "_load_mock_response",
+        lambda: pytest.fail("Live retry exhaustion must not load Mock data"),
+    )
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        service.generate(
+            claim_policy="required",
+            paper_metadata={"title": "Synthetic"},
+            source_blocks=load_source_blocks()[:2],
+        )
+
+    assert len(client.completions.calls) == 3
+    assert client.completions.responses == []
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.validation_boundary == "generated_bundle_schema_invalid"
+    assert exc_info.value.retries == 2
+    assert "<extra_field> [extra_forbidden]" in (
+        exc_info.value.field_error_summary or ""
+    )
+    assert "last_unexpected" not in (exc_info.value.field_error_summary or "")
+    assert "FIRST_RAW_SENTINEL" not in (exc_info.value.field_error_summary or "")
+    assert "LAST_RAW_SENTINEL" not in (exc_info.value.field_error_summary or "")
+
+
+def test_generated_bundle_validation_summary_excludes_dynamic_validator_value() -> None:
+    sentence_id_sentinel = "UNKNOWN_SENTENCE_ID_SENTINEL"
+    invalid = json.loads(valid_generation_json())
+    invalid["claims"][0]["sentence_id"] = sentence_id_sentinel
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        Hy3Service._validate_generated_bundle(
+            json.dumps(invalid),
+            "required",
+        )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert (
+        exc_info.value.validation_boundary
+        == "generated_bundle_schema_invalid"
+    )
+    safe_summary = exc_info.value.field_error_summary or ""
+    assert sentence_id_sentinel not in safe_summary
+    assert "$ [value_error]: Value failed validation." in safe_summary
+
+
+def test_live_generation_retry_summary_excludes_dynamic_validator_value(
+    caplog: Any,
+) -> None:
+    sentence_id_sentinel = "UNKNOWN_SENTENCE_ID_SENTINEL"
+    invalid = json.loads(valid_generation_json())
+    invalid["claims"][0]["sentence_id"] = sentence_id_sentinel
+    valid_raw = valid_generation_json()
+    client = FakeClient([json.dumps(invalid), valid_raw])
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        result = Hy3Service(
+            settings=live_settings(),
+            client=client,
+        ).generate(
+            claim_policy="required",
+            paper_metadata={"title": "Synthetic"},
+            source_blocks=load_source_blocks()[:2],
+        )
+
+    assert result == GeneratedBundle.model_validate_json(valid_raw)
+    assert len(client.completions.calls) == 2
+    retry_prompt = client.completions.calls[1]["messages"][1]["content"]
+    retry_summary = generation_retry_summary(retry_prompt)
+    assert sentence_id_sentinel not in retry_summary
+    assert sentence_id_sentinel not in caplog.text
+    assert "$ [value_error]: Value failed validation." in retry_summary
+
+
+def test_generated_bundle_top_level_extra_key_uses_safe_location() -> None:
+    extra_key_sentinel = "TOP_LEVEL_EXTRA_KEY_SENTINEL"
+    invalid = json.loads(valid_generation_json())
+    invalid[extra_key_sentinel] = "PRIVATE_EXTRA_VALUE"
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        Hy3Service._validate_generated_bundle(
+            json.dumps(invalid),
+            "required",
+        )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert (
+        exc_info.value.validation_boundary
+        == "generated_bundle_schema_invalid"
+    )
+    safe_summary = exc_info.value.field_error_summary or ""
+    assert extra_key_sentinel not in safe_summary
+    assert (
+        "<extra_field> [extra_forbidden]: Extra field is not permitted."
+        in safe_summary
+    )
+
+
+def test_generated_bundle_nested_extra_key_preserves_safe_parent_location() -> None:
+    extra_key_sentinel = "NESTED_EXTRA_KEY_SENTINEL"
+    invalid = json.loads(valid_generation_json())
+    invalid["document"]["sections"][0]["sentences"][0][
+        extra_key_sentinel
+    ] = "PRIVATE_NESTED_EXTRA_VALUE"
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        Hy3Service._validate_generated_bundle(
+            json.dumps(invalid),
+            "required",
+        )
+
+    safe_summary = exc_info.value.field_error_summary or ""
+    assert extra_key_sentinel not in safe_summary
+    assert (
+        "document.sections.0.sentences.0.<extra_field> "
+        "[extra_forbidden]: Extra field is not permitted."
+        in safe_summary
+    )
+
+
+def test_live_generation_retry_prompt_excludes_dynamic_extra_key(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: Any,
+) -> None:
+    extra_key_sentinel = "TOP_LEVEL_EXTRA_KEY_SENTINEL"
+    invalid = json.loads(valid_generation_json())
+    invalid[extra_key_sentinel] = "PRIVATE_EXTRA_VALUE"
+    valid_raw = valid_generation_json()
+    client = FakeClient([json.dumps(invalid), valid_raw])
+    service = Hy3Service(settings=live_settings(), client=client)
+    accepted_bundles: list[GeneratedBundle] = []
+    original_validate = service._validate_generated_bundle
+
+    def track_valid_bundle(
+        raw_response: Any,
+        claim_policy: str,
+    ) -> GeneratedBundle:
+        bundle = original_validate(raw_response, claim_policy)
+        accepted_bundles.append(bundle)
+        return bundle
+
+    monkeypatch.setattr(service, "_validate_generated_bundle", track_valid_bundle)
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        result = service.generate(
+            claim_policy="required",
+            paper_metadata={"title": "Synthetic"},
+            source_blocks=load_source_blocks()[:2],
+        )
+
+    assert result is accepted_bundles[-1]
+    assert result == GeneratedBundle.model_validate_json(valid_raw)
+    assert len(client.completions.calls) == 2
+    retry_prompt = client.completions.calls[1]["messages"][1]["content"]
+    retry_summary = generation_retry_summary(retry_prompt)
+    assert extra_key_sentinel not in retry_summary
+    assert extra_key_sentinel not in caplog.text
+    assert "<extra_field> [extra_forbidden]" in retry_summary
+
+
+def test_safe_validation_location_does_not_stringify_abnormal_segment() -> None:
+    class UnsafeLocationSegment:
+        def __str__(self) -> str:
+            raise AssertionError("unsafe location segment must not be stringified")
+
+    assert Hy3Service._safe_validation_location(
+        ("document", UnsafeLocationSegment()),
+        "value_error",
+    ) == "document.<location_segment>"
+    assert Hy3Service._safe_validation_location(
+        UnsafeLocationSegment(),
+        "value_error",
+    ) == "<location>"
+
+
 def test_mock_invalid_fixture_uses_generated_bundle_validation_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1353,7 +1707,8 @@ def test_live_extra_field_retries_without_echoing_invalid_value() -> None:
 
     assert len(client.completions.calls) == 2
     retry_prompt = client.completions.calls[1]["messages"][1]["content"]
-    assert "unexpected" in retry_prompt
+    assert "<extra_field> [extra_forbidden]" in retry_prompt
+    assert "unexpected" not in retry_prompt
     assert "MODEL_EXTRA_SECRET" not in retry_prompt
 
 
@@ -1379,6 +1734,8 @@ def test_live_non_json_fails_schema_after_two_retries(caplog) -> None:
     assert "prompt_tokens=303" in caplog.text
     assert "completion_tokens=159" in caplog.text
     assert "total_tokens=462" in caplog.text
+    assert "prompt_version=gen-v3" in caplog.text
+    assert "schema_version=generated-bundle-v1" in caplog.text
     assert "retries=2" in caplog.text
     for request in client.completions.calls[1:]:
         retry_prompt = request["messages"][1]["content"]
@@ -1538,7 +1895,7 @@ def test_live_run_log_contains_metadata_but_not_key_or_source_text(caplog) -> No
         )
 
     assert "model=hy3" in caplog.text
-    assert "prompt_version=gen-v2" in caplog.text
+    assert "prompt_version=gen-v3" in caplog.text
     assert "schema_version=generated-bundle-v1" in caplog.text
     assert "temperature=0" in caplog.text
     assert "max_completion_tokens=16384" in caplog.text

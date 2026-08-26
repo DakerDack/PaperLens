@@ -1,7 +1,7 @@
 from backend.app.models import ClaimPolicy
 
 
-GENERATION_PROMPT_VERSION = "gen-v2"
+GENERATION_PROMPT_VERSION = "gen-v3"
 GENERATION_SCHEMA_VERSION = "generated-bundle-v1"
 GENERATION_SCHEMA_NAME = "paperlens_generated_bundle_v1"
 DEEP_AUDIT_PROMPT_VERSION = "audit-v2"
@@ -87,6 +87,22 @@ def render_generation_prompt(
         paper_metadata_json=paper_metadata_json,
         source_blocks_json=source_blocks_json,
     )
+
+
+def render_generation_retry_prompt(
+    *,
+    validation_summaries: list[tuple[int, str]],
+) -> str:
+    lines = [
+        "字段错误摘要：以下为此前 attempts 已发现的全部安全契约错误。"
+        "本次必须同时修复全部历史契约错误，不得在修复新错误时"
+        "重新违反先前约束。"
+    ]
+    lines.extend(
+        f"- attempt={attempt}: {summary}"
+        for attempt, summary in validation_summaries
+    )
+    return "\n".join(lines)
 
 
 def render_deep_audit_prompt(
