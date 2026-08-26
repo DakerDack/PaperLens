@@ -166,7 +166,11 @@ export function App() {
     setAuditState("idle");
 
     try {
-      const generated = await generateProject(project.project_id, request.signal);
+      const generated = await generateProject(
+        project.project_id,
+        { claim_policy: "required" },
+        request.signal,
+      );
       setLastQuickReport(generated.quick_report ?? null);
       const nextProject = await getProject(project.project_id, request.signal);
       setProject(nextProject);

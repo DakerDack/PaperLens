@@ -680,6 +680,7 @@ def _require_utc(value: datetime) -> datetime:
 
 UtcDatetime = Annotated[AwareDatetime, AfterValidator(_require_utc)]
 ModelMode = Literal["mock", "live"]
+ClaimPolicy = Literal["required", "must_be_empty"]
 
 
 class ParseQualitySnapshot(StrictModel):
@@ -803,6 +804,10 @@ class ProjectView(StrictModel):
         ):
             raise ValueError("current version must be present in version summaries")
         return self
+
+
+class GenerationRequest(StrictModel):
+    claim_policy: ClaimPolicy
 
 
 class GenerationResponse(StrictModel):

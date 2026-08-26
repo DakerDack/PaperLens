@@ -233,6 +233,13 @@ describe("PaperLens workbench", () => {
   it("selects a sentence, exposes its excerpt, and sets the PDF target page", async () => {
     await reachQuickCheck();
 
+    expect(apiMocks.generateProject).toHaveBeenCalledWith(
+      "p-1",
+      { claim_policy: "required" },
+      expect.any(AbortSignal),
+    );
+    expect(screen.queryByRole("button", { name: /risk-only/i })).toBeNull();
+
     fireEvent.click(screen.getByRole("button", { name: /实验组表现更好/ }));
 
     expect(screen.getByText("第二页证据摘录")).toBeTruthy();

@@ -118,6 +118,13 @@ def valid_generation_json() -> str:
     return (FIXTURES / "generation_valid.json").read_text(encoding="utf-8")
 
 
+def generation_json_with_claims(*, present: bool) -> str:
+    payload = json.loads(valid_generation_json())
+    if not present:
+        payload["claims"] = []
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def generated_bundle() -> GeneratedBundle:
     return GeneratedBundle.model_validate_json(valid_generation_json())
 
@@ -233,11 +240,12 @@ def assert_closed_objects(node: object) -> None:
 
 def test_generation_prompt_centralizes_stage_two_contract() -> None:
     prompt = render_generation_prompt(
+        claim_policy="required",
         paper_metadata_json='{"title":"Synthetic"}',
         source_blocks_json='[{"block_id":"p01-b001","text":"Evidence"}]',
     )
 
-    assert GENERATION_PROMPT_VERSION == "gen-v1"
+    assert GENERATION_PROMPT_VERSION == "gen-v2"
     assert GENERATION_SCHEMA_VERSION == "generated-bundle-v1"
     assert GENERATION_SCHEMA_NAME == "paperlens_generated_bundle_v1"
     assert "只能依据输入中的 SourceBlock" in COMMON_SYSTEM_PROMPT
@@ -246,6 +254,9 @@ def test_generation_prompt_centralizes_stage_two_contract() -> None:
     assert "candidate_block_ids" in prompt
     assert "最多 3 个" in prompt
     assert "候选" in prompt
+    assert "claim_policy: required" in prompt
+    assert "claim_policy=required 时，claims 必须至少包含 1 项" in prompt
+    assert "claim_policy=must_be_empty 时，claims 必须严格为空数组" in prompt
     assert "不得生成页码、bbox、总分或合格结论" in prompt
     assert 'paper_metadata: {"title":"Synthetic"}' in prompt
     assert 'source_blocks: [{"block_id":"p01-b001","text":"Evidence"}]' in prompt
@@ -747,6 +758,7 @@ def test_live_deep_audit_missing_key_does_not_call_provider_or_mock(
 
 def test_mock_generation_returns_valid_generated_bundle() -> None:
     bundle = Hy3Service(settings=mock_settings()).generate(
+        claim_policy="required",
         paper_metadata={"title": "PaperLens synthetic fixture"},
         source_blocks=load_source_blocks(),
     )
@@ -756,6 +768,124 @@ def test_mock_generation_returns_valid_generated_bundle() -> None:
         SectionId
     )
     assert bundle.claims[0].candidate_block_ids == ["p01-b001"]
+
+
+@pytest.mark.parametrize(
+    ("claim_policy", "claims_present"),
+    [("required", True), ("must_be_empty", False)],
+)
+def test_live_generation_claim_policy_returns_legal_bundle_unchanged(
+    claim_policy: str,
+    claims_present: bool,
+) -> None:
+    raw = generation_json_with_claims(present=claims_present)
+    client = FakeClient([raw])
+
+    bundle = Hy3Service(settings=live_settings(), client=client).generate(
+        claim_policy=claim_policy,
+        paper_metadata={"title": "PaperLens synthetic fixture"},
+        source_blocks=load_source_blocks()[:2],
+    )
+
+    assert bundle == GeneratedBundle.model_validate_json(raw)
+    assert bool(bundle.claims) is claims_present
+    assert len(client.completions.calls) == 1
+    assert (
+        f"claim_policy: {claim_policy}"
+        in client.completions.calls[0]["messages"][1]["content"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("claim_policy", "claims_present"),
+    [("required", True), ("must_be_empty", False)],
+)
+def test_saved_generated_bundle_uses_same_claim_policy_validation_entry(
+    claim_policy: str,
+    claims_present: bool,
+) -> None:
+    bundle = GeneratedBundle.model_validate_json(
+        generation_json_with_claims(present=claims_present)
+    )
+
+    validated = Hy3Service.validate_claim_policy(bundle, claim_policy)
+
+    assert validated is bundle
+
+
+@pytest.mark.parametrize(
+    ("claim_policy", "claims_present", "expected_summary"),
+    [
+        (
+            "required",
+            False,
+            "claims [claim_policy_mismatch]: claim_policy=required "
+            "expected_count=at_least_1 actual_count=0",
+        ),
+        (
+            "must_be_empty",
+            True,
+            "claims [claim_policy_mismatch]: claim_policy=must_be_empty "
+            "expected_count=0 actual_count=5",
+        ),
+    ],
+)
+def test_live_generation_claim_policy_mismatch_uses_bounded_retry_and_safe_summary(
+    claim_policy: str,
+    claims_present: bool,
+    expected_summary: str,
+    caplog,
+) -> None:
+    raw = generation_json_with_claims(present=claims_present)
+    client = FakeClient([raw, raw, raw])
+
+    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            Hy3Service(settings=live_settings(), client=client).generate(
+                claim_policy=claim_policy,
+                paper_metadata={"title": "PaperLens synthetic fixture"},
+                source_blocks=load_source_blocks()[:2],
+            )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is True
+    assert exc_info.value.retries == 2
+    assert exc_info.value.field_error_summary == expected_summary
+    assert len(client.completions.calls) == 3
+    for request in client.completions.calls[1:]:
+        retry_prompt = request["messages"][1]["content"]
+        assert expected_summary in retry_prompt
+        assert retry_prompt.count("字段错误摘要：") == 1
+    private_claim_text = generated_bundle().claims[0].text
+    assert private_claim_text not in (exc_info.value.field_error_summary or "")
+    assert private_claim_text not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("claim_policy", "first_has_claims", "second_has_claims"),
+    [("required", False, True), ("must_be_empty", True, False)],
+)
+def test_live_generation_claim_policy_recovers_without_mutating_supplier_output(
+    claim_policy: str,
+    first_has_claims: bool,
+    second_has_claims: bool,
+) -> None:
+    valid_raw = generation_json_with_claims(present=second_has_claims)
+    client = FakeClient(
+        [
+            generation_json_with_claims(present=first_has_claims),
+            valid_raw,
+        ]
+    )
+
+    bundle = Hy3Service(settings=live_settings(), client=client).generate(
+        claim_policy=claim_policy,
+        paper_metadata={"title": "PaperLens synthetic fixture"},
+        source_blocks=load_source_blocks()[:2],
+    )
+
+    assert bundle == GeneratedBundle.model_validate_json(valid_raw)
+    assert len(client.completions.calls) == 2
 
 
 def test_mock_invalid_fixture_uses_generated_bundle_validation_chain(
@@ -769,6 +899,7 @@ def test_mock_invalid_fixture_uses_generated_bundle_validation_chain(
 
     with pytest.raises(Hy3ServiceError) as exc_info:
         service.generate(
+            claim_policy="required",
             paper_metadata={"title": "PaperLens synthetic fixture"},
             source_blocks=load_source_blocks(),
         )
@@ -791,6 +922,7 @@ def test_mock_unknown_candidate_block_remains_unverified_candidate(
     )
 
     bundle = service.generate(
+        claim_policy="required",
         paper_metadata={"title": "PaperLens synthetic fixture"},
         source_blocks=load_source_blocks(),
     )
@@ -804,6 +936,7 @@ def test_live_generation_uses_openai_chat_and_strict_generated_bundle_schema() -
     service = Hy3Service(settings=live_settings(), client=client)
 
     bundle = service.generate(
+        claim_policy="required",
         paper_metadata={"title": "PaperLens synthetic fixture"},
         source_blocks=load_source_blocks()[:3],
     )
@@ -833,6 +966,7 @@ def test_live_missing_fields_retries_with_only_field_error_summary() -> None:
     service = Hy3Service(settings=live_settings(), client=client)
 
     service.generate(
+        claim_policy="required",
         paper_metadata={"title": "PaperLens synthetic fixture"},
         source_blocks=load_source_blocks()[:2],
     )
@@ -854,6 +988,7 @@ def test_live_extra_field_retries_without_echoing_invalid_value() -> None:
     service = Hy3Service(settings=live_settings(), client=client)
 
     service.generate(
+        claim_policy="required",
         paper_metadata={"title": "PaperLens synthetic fixture"},
         source_blocks=load_source_blocks()[:2],
     )
@@ -873,6 +1008,7 @@ def test_live_non_json_fails_schema_after_two_retries(caplog) -> None:
     with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
         with pytest.raises(Hy3ServiceError) as exc_info:
             service.generate(
+                claim_policy="required",
                 paper_metadata={"title": "PaperLens synthetic fixture"},
                 source_blocks=source_blocks,
             )
@@ -909,6 +1045,7 @@ def test_live_schema_retry_logs_sum_of_invalid_and_valid_response_usage(
 
     with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
         bundle = Hy3Service(settings=live_settings(), client=client).generate(
+            claim_policy="required",
             paper_metadata={"title": "PaperLens synthetic fixture"},
             source_blocks=source_blocks,
         )
@@ -940,6 +1077,7 @@ def test_live_provider_failure_after_schema_response_preserves_prior_usage(
     with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
         with pytest.raises(Hy3ServiceError) as exc_info:
             Hy3Service(settings=live_settings(), client=client).generate(
+                claim_policy="required",
                 paper_metadata={"title": "PaperLens synthetic fixture"},
                 source_blocks=source_blocks,
             )
@@ -970,6 +1108,7 @@ def test_live_usage_component_stays_unknown_if_any_response_omits_it(
 
     with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
         Hy3Service(settings=live_settings(), client=client).generate(
+            claim_policy="required",
             paper_metadata={"title": "PaperLens synthetic fixture"},
             source_blocks=load_source_blocks()[:2],
         )
@@ -995,6 +1134,7 @@ def test_live_missing_key_fails_without_loading_mock(
 
     with pytest.raises(Hy3ServiceError) as exc_info:
         service.generate(
+            claim_policy="required",
             paper_metadata={"title": "PaperLens synthetic fixture"},
             source_blocks=load_source_blocks()[:2],
         )
@@ -1017,6 +1157,7 @@ def test_live_provider_failure_stays_failed_without_mock_fallback(
 
     with pytest.raises(Hy3ServiceError) as exc_info:
         service.generate(
+            claim_policy="required",
             paper_metadata={"title": "PaperLens synthetic fixture"},
             source_blocks=load_source_blocks()[:2],
         )
@@ -1033,12 +1174,13 @@ def test_live_run_log_contains_metadata_but_not_key_or_source_text(caplog) -> No
 
     with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
         Hy3Service(settings=live_settings(), client=client).generate(
+            claim_policy="required",
             paper_metadata={"title": "PaperLens synthetic fixture"},
             source_blocks=source_blocks,
         )
 
     assert "model=hy3" in caplog.text
-    assert "prompt_version=gen-v1" in caplog.text
+    assert "prompt_version=gen-v2" in caplog.text
     assert "schema_version=generated-bundle-v1" in caplog.text
     assert "temperature=0" in caplog.text
     assert "max_completion_tokens=4096" in caplog.text
@@ -1047,6 +1189,7 @@ def test_live_run_log_contains_metadata_but_not_key_or_source_text(caplog) -> No
     assert "latency_ms=" in caplog.text
     assert "retries=0" in caplog.text
     assert "error_code=NONE" in caplog.text
+    assert COMMON_SYSTEM_PROMPT not in caplog.text
     assert "unit-test-key" not in caplog.text
     assert all(block.text not in caplog.text for block in source_blocks)
 

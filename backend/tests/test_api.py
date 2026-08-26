@@ -355,13 +355,16 @@ def test_missing_project_and_pdf_use_stable_error_codes(tmp_path: Path) -> None:
 class RecordingGenerateService:
     def __init__(self) -> None:
         self.calls: list[tuple[dict[str, object], list[SourceBlock]]] = []
+        self.claim_policies: list[str | None] = []
 
     def generate(
         self,
         *,
+        claim_policy: str | None = None,
         paper_metadata: dict[str, object],
         source_blocks: list[SourceBlock],
     ) -> GeneratedBundle:
+        self.claim_policies.append(claim_policy)
         self.calls.append((paper_metadata, source_blocks))
         return generated_bundle()
 
@@ -370,9 +373,11 @@ class ZeroClaimGenerateService(RecordingGenerateService):
     def generate(
         self,
         *,
+        claim_policy: str | None = None,
         paper_metadata: dict[str, object],
         source_blocks: list[SourceBlock],
     ) -> GeneratedBundle:
+        self.claim_policies.append(claim_policy)
         self.calls.append((paper_metadata, source_blocks))
         return generated_bundle().model_copy(update={"claims": []})
 
@@ -458,6 +463,96 @@ def upload_parsed_project(client: TestClient) -> None:
     assert response.status_code == 201
 
 
+def generate_project(
+    client: TestClient,
+    *,
+    project_id: str = "project-001",
+    claim_policy: str = "required",
+):
+    return client.post(
+        f"/api/projects/{project_id}/generate",
+        json={"claim_policy": claim_policy},
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"claim_policy": "optional"},
+        {"claim_policy": "required", "source_blocks": []},
+    ],
+)
+def test_generate_requires_strict_claim_policy_without_calling_service(
+    tmp_path: Path,
+    payload: dict[str, object] | None,
+) -> None:
+    service = RecordingGenerateService()
+    with api_client(tmp_path, hy3_service=service) as (client, store, _):
+        upload_parsed_project(client)
+
+        if payload is None:
+            response = client.post("/api/projects/project-001/generate")
+        else:
+            response = client.post(
+                "/api/projects/project-001/generate",
+                json=payload,
+            )
+
+        assert response.status_code == 502
+        assert response.json()["error_code"] == "AUDIT_INCOMPLETE"
+        assert service.calls == []
+        assert store.get_project_view(
+            "project-001",
+            model_mode="mock",
+        ).stage.value == "parsed"
+
+
+def test_request_validation_messages_are_route_specific_and_safe(
+    tmp_path: Path,
+) -> None:
+    with api_client(tmp_path) as (client, store, _):
+        upload_parsed_project(client)
+
+        generation = client.post(
+            "/api/projects/project-001/generate",
+            json={},
+        )
+        deep_audit = client.post(
+            "/api/projects/project-001/audit",
+            json={},
+        )
+
+        assert generation.status_code == 502
+        assert generation.json() == {
+            "error_code": "AUDIT_INCOMPLETE",
+            "message": "The generation request is incomplete or invalid.",
+            "retryable": False,
+            "details": None,
+        }
+        assert deep_audit.status_code == 502
+        assert deep_audit.json() == {
+            "error_code": "AUDIT_INCOMPLETE",
+            "message": "The deep-audit request is incomplete or invalid.",
+            "retryable": False,
+            "details": None,
+        }
+        serialized = json.dumps(
+            [generation.json(), deep_audit.json()],
+            ensure_ascii=False,
+        )
+        assert "Field required" not in serialized
+        assert "validation" not in serialized.casefold()
+        assert store.row_counts() == {
+            "projects": 1,
+            "versions": 0,
+            "audits": 0,
+            "patches": 0,
+            "runs": 1,
+        }
+
+
 def test_generate_uses_only_saved_parse_snapshot_and_persists_quick_check(
     tmp_path: Path,
 ) -> None:
@@ -465,7 +560,7 @@ def test_generate_uses_only_saved_parse_snapshot_and_persists_quick_check(
     with api_client(tmp_path, hy3_service=service) as (client, store, _):
         upload_parsed_project(client)
 
-        response = client.post("/api/projects/project-001/generate")
+        response = generate_project(client)
 
         assert response.status_code == 200
         payload = response.json()
@@ -479,6 +574,7 @@ def test_generate_uses_only_saved_parse_snapshot_and_persists_quick_check(
         assert payload["evidence_records"]
         assert payload["quick_report"]["audit_status"] == "quick_complete"
         assert len(service.calls) == 1
+        assert service.claim_policies == ["required"]
         assert service.calls[0][0] == {}
         assert service.calls[0][1] == source_blocks()
 
@@ -511,11 +607,15 @@ def test_zero_claim_generation_can_complete_risk_only_api_audit(
     ) as (client, store, _):
         upload_parsed_project(client)
 
-        generated = client.post("/api/projects/project-001/generate")
+        generated = generate_project(
+            client,
+            claim_policy="must_be_empty",
+        )
         assert generated.status_code == 200
         assert generated.json()["stage"] == "quick_checked"
         assert generated.json()["claims"] == []
         assert generated.json()["evidence_records"] == []
+        assert generation.claim_policies == ["must_be_empty"]
         version_id = generated.json()["version_id"]
 
         audited = client.post(
@@ -597,13 +697,20 @@ def test_zero_claim_live_provider_retries_invalid_risk_categories_and_completes_
         hy3_api_key="unit-test-key",
     ) as (client, store, _):
         upload_parsed_project(client)
-        generated = client.post("/api/projects/project-001/generate")
+        generated = generate_project(
+            client,
+            claim_policy="must_be_empty",
+        )
 
         assert generated.status_code == 200
         assert generated.json()["stage"] == "quick_checked"
         assert generated.json()["model_mode"] == "live"
         assert generated.json()["claims"] == []
         assert generated.json()["evidence_records"] == []
+        assert (
+            "claim_policy: must_be_empty"
+            in live_client.completions.calls[0]["messages"][1]["content"]
+        )
 
         audited = client.post(
             "/api/projects/project-001/audit",
@@ -644,11 +751,14 @@ def test_generate_rejects_client_source_blocks_without_calling_service(
 
         response = client.post(
             "/api/projects/project-001/generate",
-            json={"source_blocks": [source_blocks()[0].model_dump(mode="json")]},
+            json={
+                "claim_policy": "required",
+                "source_blocks": [source_blocks()[0].model_dump(mode="json")],
+            },
         )
 
         assert response.status_code == 502
-        assert response.json()["error_code"] == "SCHEMA_INVALID"
+        assert response.json()["error_code"] == "AUDIT_INCOMPLETE"
         assert service.calls == []
         assert store.get_project_view(
             "project-001",
@@ -687,7 +797,7 @@ def test_generate_provider_or_schema_failure_stays_failed_without_mock(
     ) as (client, store, _):
         upload_parsed_project(client)
 
-        response = client.post("/api/projects/project-001/generate")
+        response = generate_project(client)
 
         assert response.status_code == status_code
         body = response.json()
@@ -709,6 +819,70 @@ def test_generate_provider_or_schema_failure_stays_failed_without_mock(
         assert b"SECRET-PROMPT" not in database_bytes
 
 
+def test_generation_success_and_failure_metadata_use_prompt_v2_without_prompt_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    success_metadata: list[object] = []
+    with api_client(tmp_path / "success") as (client, store, _):
+        original_save_generated_version = store.save_generated_version
+
+        def capture_success_metadata(**kwargs: object):
+            success_metadata.append(kwargs["metadata"])
+            return original_save_generated_version(**kwargs)
+
+        monkeypatch.setattr(
+            store,
+            "save_generated_version",
+            capture_success_metadata,
+        )
+        upload_parsed_project(client)
+
+        assert generate_project(client).status_code == 200
+
+        assert len(success_metadata) == 1
+        assert success_metadata[0].prompt_version == "gen-v2"
+        assert success_metadata[0].schema_version == "generated-bundle-v1"
+        assert (
+            "你是 PaperLens 的受约束学术内容处理模块。".encode("utf-8")
+            not in store.database_path.read_bytes()
+        )
+
+    failure_metadata: list[object] = []
+    failure = FailingGenerateService(
+        Hy3ServiceError(
+            "HY3_UNAVAILABLE",
+            "The generation service failed safely.",
+            retryable=True,
+        )
+    )
+    with api_client(
+        tmp_path / "failure",
+        model_mode="live",
+        hy3_service=failure,
+    ) as (client, store, _):
+        original_record_failure = store.record_failure
+
+        def capture_failure_metadata(**kwargs: object) -> None:
+            if kwargs["operation"] == "generate":
+                failure_metadata.append(kwargs["metadata"])
+            original_record_failure(**kwargs)
+
+        monkeypatch.setattr(store, "record_failure", capture_failure_metadata)
+        upload_parsed_project(client)
+
+        response = generate_project(client)
+
+        assert response.status_code == 503
+        assert len(failure_metadata) == 1
+        assert failure_metadata[0].prompt_version == "gen-v2"
+        assert failure_metadata[0].schema_version == "generated-bundle-v1"
+        assert (
+            "你是 PaperLens 的受约束学术内容处理模块。".encode("utf-8")
+            not in store.database_path.read_bytes()
+        )
+
+
 def test_quick_check_failure_keeps_generated_version_and_no_false_evidence(
     tmp_path: Path,
 ) -> None:
@@ -721,7 +895,7 @@ def test_quick_check_failure_keeps_generated_version_and_no_false_evidence(
     ) as (client, store, _):
         upload_parsed_project(client)
 
-        response = client.post("/api/projects/project-001/generate")
+        response = generate_project(client)
 
         assert response.status_code == 502
         assert response.json()["error_code"] == "AUDIT_INCOMPLETE"
@@ -744,7 +918,7 @@ def test_quick_check_failure_keeps_generated_version_and_no_false_evidence(
         assert store.row_counts()["runs"] == 3
 
         quick.should_fail = False
-        recovered = client.post("/api/projects/project-001/generate")
+        recovered = generate_project(client)
         recovered_payload = recovered.json()
 
         assert (recovered.status_code, recovered_payload.get("error_code")) == (
@@ -780,6 +954,64 @@ def test_quick_check_failure_keeps_generated_version_and_no_false_evidence(
         assert snapshots["report_json"] == 1
 
 
+@pytest.mark.parametrize(
+    ("initial_policy", "retry_policy"),
+    [
+        ("required", "must_be_empty"),
+        ("must_be_empty", "required"),
+    ],
+)
+def test_quick_check_recovery_rejects_cross_policy_saved_bundle_reuse(
+    tmp_path: Path,
+    initial_policy: str,
+    retry_policy: str,
+) -> None:
+    generation = (
+        RecordingGenerateService()
+        if initial_policy == "required"
+        else ZeroClaimGenerateService()
+    )
+    quick = FailingQuickAudit()
+    with api_client(
+        tmp_path,
+        hy3_service=generation,
+        audit_service=quick,
+    ) as (client, store, _):
+        upload_parsed_project(client)
+
+        first = generate_project(client, claim_policy=initial_policy)
+
+        assert first.status_code == 502
+        assert first.json()["error_code"] == "AUDIT_INCOMPLETE"
+        stable = client.get("/api/projects/project-001").json()
+        stable_counts = store.row_counts()
+        assert stable["stage"] == "failed"
+        assert stable["retryable_stage"] == "quick_checked"
+        assert bool(stable["claims"]) is (initial_policy == "required")
+        assert len(generation.calls) == 1
+        assert quick.calls == 1
+
+        rejected = generate_project(client, claim_policy=retry_policy)
+
+        assert rejected.status_code == 502
+        assert rejected.json() == {
+            "error_code": "AUDIT_INCOMPLETE",
+            "message": (
+                "The generated claims did not satisfy the requested claim policy."
+            ),
+            "retryable": True,
+            "details": {
+                "project_id": "project-001",
+                "version_id": stable["current_version_id"],
+            },
+        }
+        assert len(generation.calls) == 1
+        assert generation.claim_policies == [initial_policy]
+        assert quick.calls == 1
+        assert client.get("/api/projects/project-001").json() == stable
+        assert store.row_counts() == stable_counts
+
+
 def test_generate_recovers_generated_stage_after_quick_save_interruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -809,7 +1041,7 @@ def test_generate_recovers_generated_stage_after_quick_save_interruption(
             RuntimeError,
             match="injected interruption before quick transaction",
         ):
-            client.post("/api/projects/project-001/generate")
+            generate_project(client)
 
         generated = client.get("/api/projects/project-001").json()
         stable_version_id = generated["current_version_id"]
@@ -830,7 +1062,7 @@ def test_generate_recovers_generated_stage_after_quick_save_interruption(
             "runs": 2,
         }
 
-        recovered = client.post("/api/projects/project-001/generate")
+        recovered = generate_project(client)
         recovered_payload = recovered.json()
 
         assert (recovered.status_code, recovered_payload.get("error_code")) == (
@@ -862,20 +1094,73 @@ def test_generate_recovers_generated_stage_after_quick_save_interruption(
         }
 
 
+def test_generated_stage_recovery_rejects_cross_policy_after_save_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = RecordingGenerateService()
+    quick = FailingQuickAudit()
+    quick.should_fail = False
+    with api_client(
+        tmp_path,
+        hy3_service=generation,
+        audit_service=quick,
+    ) as (client, store, _):
+        upload_parsed_project(client)
+        original_save_quick_check = store.save_quick_check
+        save_attempts = 0
+
+        def interrupt_first_quick_save(**kwargs: object) -> None:
+            nonlocal save_attempts
+            save_attempts += 1
+            if save_attempts == 1:
+                raise RuntimeError("injected interruption before quick transaction")
+            original_save_quick_check(**kwargs)
+
+        monkeypatch.setattr(store, "save_quick_check", interrupt_first_quick_save)
+
+        with pytest.raises(
+            RuntimeError,
+            match="injected interruption before quick transaction",
+        ):
+            generate_project(client, claim_policy="required")
+
+        stable = client.get("/api/projects/project-001").json()
+        stable_counts = store.row_counts()
+        assert stable["stage"] == "generated"
+        assert stable["claims"]
+        assert len(generation.calls) == 1
+        assert quick.calls == 1
+        assert save_attempts == 1
+
+        rejected = generate_project(client, claim_policy="must_be_empty")
+
+        assert rejected.status_code == 502
+        assert rejected.json()["error_code"] == "AUDIT_INCOMPLETE"
+        assert rejected.json()["message"] == (
+            "The generated claims did not satisfy the requested claim policy."
+        )
+        assert len(generation.calls) == 1
+        assert quick.calls == 1
+        assert save_attempts == 1
+        assert client.get("/api/projects/project-001").json() == stable
+        assert store.row_counts() == stable_counts
+
+
 def test_generate_missing_or_wrong_stage_is_stable_and_non_destructive(
     tmp_path: Path,
 ) -> None:
     with api_client(tmp_path) as (client, store, _):
-        missing = client.post("/api/projects/missing/generate")
+        missing = generate_project(client, project_id="missing")
         assert missing.status_code == 404
         assert missing.json()["error_code"] == "PROJECT_NOT_FOUND"
 
         upload_parsed_project(client)
-        first = client.post("/api/projects/project-001/generate")
+        first = generate_project(client)
         assert first.status_code == 200
         stable = client.get("/api/projects/project-001").json()
 
-        repeated = client.post("/api/projects/project-001/generate")
+        repeated = generate_project(client)
         assert repeated.status_code == 409
         assert repeated.json()["error_code"] == "PROJECT_NOT_READY"
         assert client.get("/api/projects/project-001").json() == stable
@@ -936,7 +1221,7 @@ def test_deep_audit_rebuilds_rights_and_persists_same_redacted_report(
     wrapper = RecordingAuditWrapper(explicit_mock_audit_service(tmp_path))
     with api_client(tmp_path, audit_service=wrapper) as (client, store, _):
         upload_parsed_project(client)
-        generated = client.post("/api/projects/project-001/generate")
+        generated = generate_project(client)
         assert generated.status_code == 200
         quick_view = client.get("/api/projects/project-001").json()
 
@@ -999,7 +1284,7 @@ def test_deep_audit_rejects_client_rights_evidence_or_invalid_contract(
     wrapper = RecordingAuditWrapper(explicit_mock_audit_service(tmp_path))
     with api_client(tmp_path, audit_service=wrapper) as (client, store, _):
         upload_parsed_project(client)
-        assert client.post("/api/projects/project-001/generate").status_code == 200
+        assert generate_project(client).status_code == 200
         stable = client.get("/api/projects/project-001").json()
 
         response = client.post(
@@ -1064,7 +1349,7 @@ def test_deep_audit_failure_preserves_quick_snapshot_and_safe_error(
         audit_service=failing,
     ) as (client, store, _):
         upload_parsed_project(client)
-        assert client.post("/api/projects/project-001/generate").status_code == 200
+        assert generate_project(client).status_code == 200
         stable = client.get("/api/projects/project-001").json()
 
         response = client.post(
@@ -1140,7 +1425,7 @@ def test_failed_reaudit_keeps_last_complete_audit_and_evidence(
     switchable = FailOnSecondDeepAudit(explicit_mock_audit_service(tmp_path))
     with api_client(tmp_path, audit_service=switchable) as (client, store, _):
         upload_parsed_project(client)
-        assert client.post("/api/projects/project-001/generate").status_code == 200
+        assert generate_project(client).status_code == 200
         completed = client.post(
             "/api/projects/project-001/audit",
             json=VALID_AUDIT_REQUEST,
@@ -1182,7 +1467,7 @@ def test_complete_mock_api_and_database_exclude_secrets_prompts_and_raw_output(
         )
         assert upload.status_code == 201
         project_id = upload.json()["project_id"]
-        generation = client.post(f"/api/projects/{project_id}/generate")
+        generation = generate_project(client, project_id=project_id)
         assert generation.status_code == 200
         audit = client.post(
             f"/api/projects/{project_id}/audit",

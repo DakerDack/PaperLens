@@ -225,7 +225,7 @@ created -> parsed -> generated -> quick_checked -> deep_audited
 | `POST /api/projects` | 上传并解析 PDF | 项目、解析质量、`SourceBlock` 统计 | `PDF_INVALID`、`PARSE_FAILED`、`PARSE_QUALITY_LOW`、`RIGHTS_NOT_CONFIRMED` |
 | `GET /api/projects/{id}` | 读取完整当前状态 | 当前文档、审计、版本列表 | `PROJECT_NOT_FOUND` |
 | `GET /api/projects/{id}/pdf` | 读取本地 PDF | PDF 文件流 | `PDF_NOT_FOUND` |
-| `POST /api/projects/{id}/generate` | 联合生成并自动快速检查 | 文档、主张、规则结果 | `PROJECT_NOT_READY`、`HY3_CONFIG_MISSING`、`HY3_UNAVAILABLE`、`SCHEMA_INVALID` |
+| `POST /api/projects/{id}/generate` | 按显式 claims 策略联合生成并自动快速检查 | 文档、主张、规则结果 | `PROJECT_NOT_READY`、`HY3_CONFIG_MISSING`、`HY3_UNAVAILABLE`、`SCHEMA_INVALID`、`AUDIT_INCOMPLETE` |
 | `POST /api/projects/{id}/audit` | 批量运行完整语义审计和评分 | 完整 `AuditReport` | `PROJECT_NOT_READY`、`EVIDENCE_NOT_READY`、`HY3_CONFIG_MISSING`、`SCHEMA_INVALID`、`AUDIT_INCOMPLETE`、`HY3_UNAVAILABLE` |
 | `POST /api/projects/{id}/revisions` | 生成补丁预览，不改当前版本 | `EditPatch` | `TARGET_STALE`、`PATCH_INVALID` |
 | `POST /api/projects/{id}/revisions/{patch_id}/accept` | 接受补丁并生成新版本 | 新版本和快速检查结果 | `TARGET_STALE`、`PATCH_INVALID` |
@@ -685,7 +685,7 @@ JSON 列使用以下包装模型：
 - `RunMetadata {message, retryable, retryable_stage, model, prompt_version, schema_version}`；除 `retryable` 外均允许 `null`，只保存脱敏错误说明和短元数据，写入 `runs.metadata_json`。
 - `runs.operation` 只允许 `parse/generate/quick_check/deep_audit`，`runs.mode` 只允许 `local/mock/live`，`runs.status` 只允许 `succeeded/failed`。这些枚举同样定义在 `models.py`。
 
-阶段 4 核心 API 使用以下响应模型；时间字段使用带时区 UTC `datetime`，所有对象 `extra="forbid"`：
+阶段 4 核心 API 使用以下请求与响应模型；时间字段使用带时区 UTC `datetime`，所有对象 `extra="forbid"`：
 
 ```text
 ProjectCreateResponse
@@ -720,6 +720,9 @@ ProjectView
   created_at: datetime
   updated_at: datetime
 
+GenerationRequest
+  claim_policy: required|must_be_empty
+
 GenerationResponse
   project_id: Identifier
   version_id: Identifier
@@ -746,7 +749,7 @@ DeepAuditResponse
 请求和状态约束固定如下：
 
 - `POST /api/projects` 使用 multipart，字段固定为 `file` 和 `rights_confirmed`。`rights_confirmed` 不是 `true` 时必须在读取或保存 PDF 前返回 `RIGHTS_NOT_CONFIRMED`；不得创建项目、PDF 或 run 记录。文件名必须以 `.pdf` 结尾且内容以 PDF 魔数开头；读取时按 `MAX_PDF_MB + 1 byte` 有界检查，超限后立即停止并删除本请求的临时文件。
-- `POST /api/projects/{id}/generate` 不接收请求体。服务只读取已保存并重新通过 `ParseSnapshot` 校验的 `SourceBlock[]`。`Hy3Service.generate` 成功后先用一个事务保存初始版本并将稳定阶段推进到 `generated`；随后运行 `AuditService.quick_check`，再用第二个事务保存证据快照、快速报告并推进到 `quick_checked`。快速检查失败不得删除已成功生成的版本。
+- `POST /api/projects/{id}/generate` 必须接收严格 JSON `GenerationRequest`，调用方必须显式提交且只能提交 `claim_policy`，不得提交 `SourceBlock`、证据、页码、bbox、评分或 rights；字段缺失、非法枚举或额外字段统一返回 HTTP 502 / `AUDIT_INCOMPLETE`，不得暴露框架原始验证细节。`claim_policy=required` 要求 `GeneratedBundle.claims` 至少 1 条；`claim_policy=must_be_empty` 要求其恰好为 0 条。不匹配时不得补齐、过滤或改写供应商输出，统一返回 `AUDIT_INCOMPLETE`。服务只读取已保存并重新通过 `ParseSnapshot` 校验的 `SourceBlock[]`；首次供应商结果和快速检查失败后复用的已保存 bundle 必须经过 `Hy3Service` 同一 claims 数量策略校验，复用时不得再次调用供应商。policy 不匹配时不得运行快速检查、创建新版本、审计或伪造 run，并保留已有稳定 bundle 与失败状态；同 policy 恢复继续只重试快速检查。`Hy3Service.generate` 成功后先用一个事务保存初始版本并将稳定阶段推进到 `generated`；随后运行 `AuditService.quick_check`，再用第二个事务保存证据快照、快速报告并推进到 `quick_checked`。快速检查失败不得删除已成功生成的版本。
 - `POST /api/projects/{id}/audit` 只接收 `DeepAuditRequest`。API 从 `projects.rights_confirmed` 构造 `ComplianceContext.rights_or_license_confirmed`，不得接受客户端覆盖；其余四个披露和标识字段来自请求。完整审计只读取当前版本已保存的 `ContentDraft`、`AtomicClaim[]` 和 `EvidenceRecord[]`。
 - `GET /api/projects/{id}` 返回 `ProjectView`，只从已通过 Pydantic 重新验证的数据库快照构造；不得暴露 `pdf_path`、SQL 行、Hy3 原始响应或供应商敏感自由文本。
 - `GET /api/projects/{id}/pdf` 只返回当前项目固定 `source.pdf`，并设置 `application/pdf`；数据库路径缺失、越界或文件不存在统一返回 `PDF_NOT_FOUND`。
@@ -765,11 +768,11 @@ DeepAuditResponse
 | 502 | `SCHEMA_INVALID`、`AUDIT_INCOMPLETE` |
 | 503 | `PARSE_FAILED`、`HY3_CONFIG_MISSING`、`HY3_UNAVAILABLE` |
 
-上传字段缺失或类型错误仍使用对应的 `PDF_INVALID`/`RIGHTS_NOT_CONFIRMED`；`DeepAuditRequest` 结构或组合无效使用 `AUDIT_INCOMPLETE`。所有业务失败都返回现有 `ErrorResponse`，不得把 FastAPI 默认验证体、Python 异常、SQL、绝对路径、Prompt、原始论文或 API Key 返回给客户端。
+上传字段缺失或类型错误仍使用对应的 `PDF_INVALID`/`RIGHTS_NOT_CONFIRMED`；`GenerationRequest` 缺失、非法枚举或额外字段，以及 `DeepAuditRequest` 结构或组合无效，均使用 HTTP 502 / `AUDIT_INCOMPLETE`。两条路由分别返回安全的 generation request / deep-audit request 错误消息。所有业务失败都返回现有 `ErrorResponse`，不得把 FastAPI 默认验证体、Python 异常、SQL、绝对路径、Prompt、原始论文或 API Key 返回给客户端。
 
 ## 6. Hy3 Prompt 模板
 
-所有 Prompt 保存在 `backend/app/prompts.py`，使用版本常量，例如 `GENERATION_PROMPT_VERSION = "gen-v1"`。不得把 Prompt 分散在路由、测试和前端。
+所有 Prompt 保存在 `backend/app/prompts.py`，使用版本常量，例如 `GENERATION_PROMPT_VERSION = "gen-v2"`。不得把 Prompt 分散在路由、测试和前端。加入 `claim_policy` 后只升级 Prompt 版本；`GeneratedBundle` 输出结构未改变，因此生成 Schema 版本仍为 `generated-bundle-v1`。
 
 ### 6.1 共同系统约束
 
@@ -787,9 +790,12 @@ DeepAuditResponse
 任务：面向本科生生成一份可核验论文解读，并同步给出每个句子的原子主张候选。
 
 输入：
+- claim_policy: {{claim_policy}}
 - paper_metadata: {{paper_metadata_json}}
 - source_blocks: {{source_blocks_json}}
 
+claim_policy=required 时，claims 必须至少包含 1 项。
+claim_policy=must_be_empty 时，claims 必须严格为空数组；不得删除或过滤非空供应商输出来满足策略。
 正文固定为五区：研究问题、方法与数据、主要结果、限制条件、通俗解释。
 每句话必须有稳定 sentence_id。
 每条 AtomicClaim 只表达一个可独立判断真假的事实，并关联 sentence_id。
@@ -1059,6 +1065,7 @@ python -m pytest backend/tests -q
 - API 失败后旧版本仍可读取。
 - 不存在的项目和 PDF 返回稳定错误码；版本、补丁和修订路径留到阶段 6 测试。
 - 权限未确认不创建项目、PDF 或 run；生成和审计不接受客户端 SourceBlock、已验证证据、页码、bbox、分数或 rights 覆盖。
+- 生成必须显式接收严格 `GenerationRequest.claim_policy`；缺失、非法或额外字段使用 HTTP 502 / `AUDIT_INCOMPLETE`。首次结果与恢复复用的 bundle 都经过同一策略校验，两个 policy 方向不匹配时均不增加供应商、快速检查、版本、审计或 run 副作用。
 - `parse_json/content_json/claims_json/evidence_json/report_json/metadata_json/usage_json` 写入前和读取后都经过固定 Pydantic 模型验证。
 - 完整审计保存并返回阶段 3 已脱敏的风险结果；数据库和 API 中不存在 Hy3 原始敏感自由文本。
 

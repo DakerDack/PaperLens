@@ -45,6 +45,7 @@ export type ProjectStage =
   | "patch_pending"
   | "failed";
 export type ModelMode = "mock" | "live";
+export type ClaimPolicy = "required" | "must_be_empty";
 export type DisclosureStatus = "present" | "missing";
 export type GeneratedContentLabelApplicability = "applicable" | "not_applicable";
 export type GeneratedContentLabelStatus = "present" | "missing" | "not_applicable";
@@ -245,6 +246,10 @@ export interface GenerationResponse {
   claims: AtomicClaim[];
   evidence_records: EvidenceRecord[];
   quick_report: AuditReport;
+}
+
+export interface GenerationRequest {
+  claim_policy: ClaimPolicy;
 }
 
 export interface DeepAuditRequest {

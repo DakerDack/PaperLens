@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from backend.app.models import (
     AtomicClaim,
+    ClaimPolicy,
     ContentDraft,
     DeepAuditResult,
     EvidenceRecord,
@@ -92,6 +93,7 @@ class Hy3Service:
     def generate(
         self,
         *,
+        claim_policy: ClaimPolicy,
         paper_metadata: dict[str, Any],
         source_blocks: list[SourceBlock],
     ) -> GeneratedBundle:
@@ -101,15 +103,20 @@ class Hy3Service:
         try:
             if self.settings.paperlens_model_mode == "mock":
                 bundle = self._validate_generated_bundle(
-                    self._load_mock_response()
+                    self._load_mock_response(),
+                    claim_policy,
                 )
             else:
                 self._require_live_config()
                 prompt = self._build_generation_prompt(
+                    claim_policy=claim_policy,
                     paper_metadata=paper_metadata,
                     source_blocks=source_blocks,
                 )
-                bundle, retries, usage = self._generate_live(prompt)
+                bundle, retries, usage = self._generate_live(
+                    prompt,
+                    claim_policy,
+                )
         except Hy3ServiceError as exc:
             self._log_run(
                 started_at=started_at,
@@ -220,6 +227,7 @@ class Hy3Service:
     def _generate_live(
         self,
         original_prompt: str,
+        claim_policy: ClaimPolicy,
     ) -> tuple[GeneratedBundle, int, UsageTuple]:
         field_error_summary: str | None = None
         cumulative_usage: UsageTuple | None = None
@@ -263,7 +271,10 @@ class Hy3Service:
             raw_response = self._extract_response_content(response)
             try:
                 return (
-                    self._validate_generated_bundle(raw_response),
+                    self._validate_generated_bundle(
+                        raw_response,
+                        claim_policy,
+                    ),
                     attempt,
                     cumulative_usage,
                 )
@@ -368,6 +379,7 @@ class Hy3Service:
     @staticmethod
     def _build_generation_prompt(
         *,
+        claim_policy: ClaimPolicy,
         paper_metadata: dict[str, Any],
         source_blocks: list[SourceBlock],
     ) -> str:
@@ -382,6 +394,7 @@ class Hy3Service:
             separators=(",", ":"),
         )
         return render_generation_prompt(
+            claim_policy=claim_policy,
             paper_metadata_json=paper_metadata_json,
             source_blocks_json=source_blocks_json,
         )
@@ -452,7 +465,36 @@ class Hy3Service:
             ) from exc
 
     @staticmethod
-    def _validate_generated_bundle(raw_response: Any) -> GeneratedBundle:
+    def validate_claim_policy(
+        bundle: GeneratedBundle,
+        claim_policy: ClaimPolicy,
+    ) -> GeneratedBundle:
+        actual_count = len(bundle.claims)
+        if claim_policy == "required":
+            policy_satisfied = actual_count >= 1
+            expected_count = "at_least_1"
+        else:
+            policy_satisfied = actual_count == 0
+            expected_count = "0"
+        if not policy_satisfied:
+            raise Hy3ServiceError(
+                "AUDIT_INCOMPLETE",
+                "The generated claims did not satisfy the requested claim policy.",
+                retryable=True,
+                field_error_summary=(
+                    "claims [claim_policy_mismatch]: "
+                    f"claim_policy={claim_policy} "
+                    f"expected_count={expected_count} "
+                    f"actual_count={actual_count}"
+                ),
+            )
+        return bundle
+
+    @staticmethod
+    def _validate_generated_bundle(
+        raw_response: Any,
+        claim_policy: ClaimPolicy,
+    ) -> GeneratedBundle:
         if not isinstance(raw_response, (str, bytes, bytearray)):
             raise Hy3ServiceError(
                 "SCHEMA_INVALID",
@@ -463,7 +505,7 @@ class Hy3Service:
                 ),
             )
         try:
-            return GeneratedBundle.model_validate_json(raw_response)
+            bundle = GeneratedBundle.model_validate_json(raw_response)
         except ValidationError as exc:
             raise Hy3ServiceError(
                 "SCHEMA_INVALID",
@@ -471,6 +513,8 @@ class Hy3Service:
                 retryable=False,
                 field_error_summary=Hy3Service._field_error_summary(exc),
             ) from exc
+
+        return Hy3Service.validate_claim_policy(bundle, claim_policy)
 
     @staticmethod
     def _validate_deep_audit_input(

@@ -16,6 +16,7 @@ from backend.app.models import (
     EditPatch,
     EvidenceRecord,
     EvidenceSnapshot,
+    GenerationRequest,
     GenerationResponse,
     GeneratedBundle,
     ParseQualitySnapshot,
@@ -895,6 +896,30 @@ def test_stage_four_core_api_models_enforce_fixed_contracts() -> None:
     assert view.versions == [version]
     assert generation.stage.value == "quick_checked"
     assert audit_request.generated_content_label_status.value == "not_applicable"
+
+
+@pytest.mark.parametrize("claim_policy", ["required", "must_be_empty"])
+def test_generation_request_accepts_only_explicit_claim_policies(
+    claim_policy: str,
+) -> None:
+    request = GenerationRequest.model_validate({"claim_policy": claim_policy})
+
+    assert request.claim_policy == claim_policy
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"claim_policy": "optional"},
+        {"claim_policy": "required", "unexpected": True},
+    ],
+)
+def test_generation_request_rejects_missing_invalid_or_extra_fields(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        GenerationRequest.model_validate(payload)
 
 
 @pytest.mark.parametrize(

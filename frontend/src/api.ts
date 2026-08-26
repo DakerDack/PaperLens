@@ -2,6 +2,7 @@ import type {
   DeepAuditRequest,
   DeepAuditResponse,
   ErrorResponse,
+  GenerationRequest,
   GenerationResponse,
   HealthResponse,
   ProjectCreateResponse,
@@ -186,10 +187,13 @@ export async function getProjectPdf(
 
 export function generateProject(
   projectId: string,
+  input: GenerationRequest,
   signal?: AbortSignal,
 ): Promise<GenerationResponse> {
   return requestJson<GenerationResponse>(projectPath(projectId, "/generate"), {
     method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
     signal,
   });
 }

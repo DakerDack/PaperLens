@@ -45,7 +45,7 @@ describe("PaperLens API client", () => {
     await createProject(pdf);
     await getProject("p-1");
     await getProjectPdf("p-1");
-    await generateProject("p-1");
+    await generateProject("p-1", { claim_policy: "required" });
     await auditProject("p-1", {
       source_disclosure_status: "present",
       ai_assistance_disclosure_status: "present",
@@ -64,6 +64,11 @@ describe("PaperLens API client", () => {
     expect(fetchMock.mock.calls[3]?.[0]).toBe(
       `${API_BASE_URL}/api/projects/p-1/generate`,
     );
+    expect(fetchMock.mock.calls[3]?.[1]).toMatchObject({
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ claim_policy: "required" }),
+    });
     expect(fetchMock.mock.calls[4]?.[0]).toBe(`${API_BASE_URL}/api/projects/p-1/audit`);
   });
 

@@ -11,13 +11,14 @@ from pydantic import ValidationError
 
 from backend.app.audit_service import AuditServiceError
 from backend.app.document_service import DocumentParseError
-from backend.app.hy3_service import Hy3ServiceError
+from backend.app.hy3_service import Hy3Service, Hy3ServiceError
 from backend.app.models import (
     ComplianceContext,
     DeepAuditRequest,
     DeepAuditResponse,
     EvidenceSnapshot,
     ErrorResponse,
+    GenerationRequest,
     GenerationResponse,
     HealthResponse,
     ParseQualitySnapshot,
@@ -134,9 +135,15 @@ def register_error_handlers(app: FastAPI) -> None:
                 content=payload.model_dump(mode="json"),
             )
 
+        route_path = getattr(route, "path", None)
+        message = (
+            "The generation request is incomplete or invalid."
+            if route_path == "/api/projects/{project_id}/generate"
+            else "The deep-audit request is incomplete or invalid."
+        )
         payload = ErrorResponse(
             error_code="AUDIT_INCOMPLETE",
-            message="The deep-audit request is incomplete or invalid.",
+            message=message,
             retryable=False,
             details=None,
         )
@@ -310,14 +317,11 @@ async def create_project(
     "/projects/{project_id}/generate",
     response_model=GenerationResponse,
 )
-async def generate_project(project_id: str, request: Request) -> GenerationResponse:
-    if await request.body():
-        raise AppError(
-            "SCHEMA_INVALID",
-            "The generation request must not contain a request body.",
-            status_code=502,
-            retryable=False,
-        )
+async def generate_project(
+    project_id: str,
+    generation_request: GenerationRequest,
+    request: Request,
+) -> GenerationResponse:
 
     settings = _settings(request)
     store = _store(request)
@@ -326,6 +330,7 @@ async def generate_project(project_id: str, request: Request) -> GenerationRespo
         generation_started = datetime.now(timezone.utc)
         try:
             bundle = request.app.state.hy3_service.generate(
+                claim_policy=generation_request.claim_policy,
                 paper_metadata={},
                 source_blocks=parse_snapshot.blocks,
             )
@@ -375,6 +380,20 @@ async def generate_project(project_id: str, request: Request) -> GenerationRespo
             ended_at=generation_ended,
             mode=settings.paperlens_model_mode,
         )
+    else:
+        try:
+            bundle = Hy3Service.validate_claim_policy(
+                bundle,
+                generation_request.claim_policy,
+            )
+        except Hy3ServiceError as error:
+            raise AppError(
+                error.error_code,
+                error.message,
+                status_code=_ERROR_STATUS[error.error_code],
+                retryable=error.retryable,
+                details={"project_id": project_id, "version_id": version_id},
+            ) from error
 
     quick_started = datetime.now(timezone.utc)
     try:

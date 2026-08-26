@@ -1,4 +1,7 @@
-GENERATION_PROMPT_VERSION = "gen-v1"
+from backend.app.models import ClaimPolicy
+
+
+GENERATION_PROMPT_VERSION = "gen-v2"
 GENERATION_SCHEMA_VERSION = "generated-bundle-v1"
 GENERATION_SCHEMA_NAME = "paperlens_generated_bundle_v1"
 DEEP_AUDIT_PROMPT_VERSION = "audit-v2"
@@ -23,8 +26,12 @@ DEEP_AUDIT_SYSTEM_PROMPT = """你是 PaperLens 的受约束深度审计模块。
 GENERATION_USER_PROMPT_TEMPLATE = """任务：面向本科生生成一份可核验论文解读，并同步给出每个句子的原子主张候选。
 
 输入：
+- claim_policy: {claim_policy}
 - paper_metadata: {paper_metadata_json}
 - source_blocks: {source_blocks_json}
+
+claim_policy=required 时，claims 必须至少包含 1 项。
+claim_policy=must_be_empty 时，claims 必须严格为空数组；不得生成、删除或隐藏任何 claim。
 
 document.sections 固定为以下五区，且每个 section_id 恰好出现一次：
 - research_question：研究问题
@@ -71,10 +78,12 @@ sensitive_information 的 evidence_excerpt 必须为 null，reason 和 remediati
 
 def render_generation_prompt(
     *,
+    claim_policy: ClaimPolicy,
     paper_metadata_json: str,
     source_blocks_json: str,
 ) -> str:
     return GENERATION_USER_PROMPT_TEMPLATE.format(
+        claim_policy=claim_policy,
         paper_metadata_json=paper_metadata_json,
         source_blocks_json=source_blocks_json,
     )
