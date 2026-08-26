@@ -4,7 +4,7 @@ import json
 import logging
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Literal
 
 from openai import OpenAI, OpenAIError
 from pydantic import ValidationError
@@ -34,7 +34,7 @@ from backend.app.prompts import (
 from backend.app.settings import Settings, settings as app_settings
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error.paperlens.hy3_service")
 
 MOCK_GENERATION_FIXTURE = (
     Path(__file__).resolve().parents[1]
@@ -59,6 +59,28 @@ DEEP_AUDIT_THINKING = "disabled"
 UsageTuple = tuple[int | None, int | None, int | None]
 SemanticPair = tuple[AtomicClaim, EvidenceRecord]
 SemanticPairKey = tuple[str, str]
+GenerationValidationBoundary = Literal[
+    "response_content_missing",
+    "json_invalid",
+    "generated_bundle_schema_invalid",
+    "claim_policy_mismatch",
+    "none",
+    "unknown",
+]
+SafeFinishReason = Literal[
+    "stop",
+    "length",
+    "content_filter",
+    "tool_calls",
+    "missing",
+    "unknown",
+]
+_SAFE_FINISH_REASONS = frozenset({
+    "stop",
+    "length",
+    "content_filter",
+    "tool_calls",
+})
 
 
 class Hy3ServiceError(RuntimeError):
@@ -71,6 +93,7 @@ class Hy3ServiceError(RuntimeError):
         field_error_summary: str | None = None,
         retries: int = 0,
         usage: UsageTuple = (None, None, None),
+        validation_boundary: GenerationValidationBoundary = "unknown",
     ) -> None:
         super().__init__(message)
         self.error_code = error_code
@@ -79,6 +102,7 @@ class Hy3ServiceError(RuntimeError):
         self.field_error_summary = field_error_summary
         self.retries = retries
         self.usage = usage
+        self.validation_boundary = validation_boundary
 
 
 class Hy3Service:
@@ -252,6 +276,13 @@ class Hy3Service:
                     },
                 )
             except OpenAIError as exc:
+                self._log_generation_attempt(
+                    attempt=attempt,
+                    completion_tokens=None,
+                    finish_reason="missing",
+                    validation_boundary="unknown",
+                    error_code="HY3_UNAVAILABLE",
+                )
                 raise Hy3ServiceError(
                     "HY3_UNAVAILABLE",
                     "The Hy3 provider request failed.",
@@ -264,21 +295,27 @@ class Hy3Service:
                     ),
                 ) from exc
 
+            attempt_usage = self._extract_usage(response)
             cumulative_usage = self._accumulate_usage(
                 cumulative_usage,
-                self._extract_usage(response),
+                attempt_usage,
             )
             raw_response = self._extract_response_content(response)
             try:
-                return (
-                    self._validate_generated_bundle(
-                        raw_response,
-                        claim_policy,
-                    ),
-                    attempt,
-                    cumulative_usage,
+                bundle = self._validate_generated_bundle(
+                    raw_response,
+                    claim_policy,
                 )
             except Hy3ServiceError as exc:
+                self._log_generation_attempt(
+                    attempt=attempt,
+                    completion_tokens=self._safe_completion_tokens(
+                        attempt_usage[1]
+                    ),
+                    finish_reason=self._safe_finish_reason(response),
+                    validation_boundary=exc.validation_boundary,
+                    error_code=exc.error_code,
+                )
                 exc.retries = attempt
                 exc.usage = cumulative_usage
                 if attempt >= self.settings.hy3_max_retries:
@@ -286,6 +323,18 @@ class Hy3Service:
                 field_error_summary = (
                     exc.field_error_summary or "$ [schema_invalid]"
                 )
+                continue
+
+            self._log_generation_attempt(
+                attempt=attempt,
+                completion_tokens=self._safe_completion_tokens(
+                    attempt_usage[1]
+                ),
+                finish_reason=self._safe_finish_reason(response),
+                validation_boundary="none",
+                error_code="NONE",
+            )
+            return bundle, attempt, cumulative_usage
 
         raise AssertionError("unreachable schema retry state")
 
@@ -487,6 +536,7 @@ class Hy3Service:
                     f"expected_count={expected_count} "
                     f"actual_count={actual_count}"
                 ),
+                validation_boundary="claim_policy_mismatch",
             )
         return bundle
 
@@ -503,6 +553,11 @@ class Hy3Service:
                 field_error_summary=(
                     "$ [json_type]: response content must be JSON text"
                 ),
+                validation_boundary=(
+                    "response_content_missing"
+                    if raw_response is None
+                    else "unknown"
+                ),
             )
         try:
             bundle = GeneratedBundle.model_validate_json(raw_response)
@@ -512,6 +567,9 @@ class Hy3Service:
                 "The model response did not match GeneratedBundle.",
                 retryable=False,
                 field_error_summary=Hy3Service._field_error_summary(exc),
+                validation_boundary=(
+                    Hy3Service._generated_bundle_validation_boundary(exc)
+                ),
             ) from exc
 
         return Hy3Service.validate_claim_policy(bundle, claim_policy)
@@ -633,6 +691,21 @@ class Hy3Service:
         return summary[:800]
 
     @staticmethod
+    def _generated_bundle_validation_boundary(
+        error: ValidationError,
+    ) -> GenerationValidationBoundary:
+        if any(
+            item.get("type") == "json_invalid"
+            for item in error.errors(
+                include_url=False,
+                include_context=False,
+                include_input=False,
+            )
+        ):
+            return "json_invalid"
+        return "generated_bundle_schema_invalid"
+
+    @staticmethod
     def _extract_response_content(response: Any) -> Any:
         choices = getattr(response, "choices", None)
         if not choices:
@@ -650,6 +723,24 @@ class Hy3Service:
             getattr(usage, "completion_tokens", None),
             getattr(usage, "total_tokens", None),
         )
+
+    @staticmethod
+    def _safe_finish_reason(response: Any) -> SafeFinishReason:
+        choices = getattr(response, "choices", None)
+        if not choices:
+            return "missing"
+        finish_reason = getattr(choices[0], "finish_reason", None)
+        if finish_reason is None:
+            return "missing"
+        if finish_reason in _SAFE_FINISH_REASONS:
+            return finish_reason
+        return "unknown"
+
+    @staticmethod
+    def _safe_completion_tokens(value: Any) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
 
     @staticmethod
     def _accumulate_usage(
@@ -684,6 +775,34 @@ class Hy3Service:
         if isinstance(model_extra, dict):
             return model_extra.get(field_name)
         return None
+
+    @staticmethod
+    def _log_generation_attempt(
+        *,
+        attempt: int,
+        completion_tokens: int | None,
+        finish_reason: SafeFinishReason,
+        validation_boundary: GenerationValidationBoundary,
+        error_code: str,
+    ) -> None:
+        completion_limit_reached = (
+            completion_tokens is not None
+            and completion_tokens >= GENERATION_MAX_COMPLETION_TOKENS
+        )
+        logger.info(
+            "hy3_generation_attempt operation=generation attempt=%s "
+            "completion_tokens=%s configured_completion_limit=%s "
+            "completion_limit_reached=%s finish_reason=%s "
+            "validation_boundary=%s error_code=%s retry_count=%s",
+            attempt,
+            completion_tokens if completion_tokens is not None else "null",
+            GENERATION_MAX_COMPLETION_TOKENS,
+            "true" if completion_limit_reached else "false",
+            finish_reason,
+            validation_boundary,
+            error_code,
+            attempt,
+        )
 
     def _log_run(
         self,

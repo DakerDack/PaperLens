@@ -1,6 +1,9 @@
 import json
 import logging
+import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -211,8 +214,10 @@ def deep_audit_with_risk_category_coverage(variant: str) -> str:
 
 
 def completion_response(
-    content: str,
+    content: Any,
     usage: tuple[int | None, int | None, int | None] | None,
+    *,
+    finish_reason: str | None = None,
 ) -> SimpleNamespace:
     usage_payload = None
     if usage is not None:
@@ -222,9 +227,22 @@ def completion_response(
             total_tokens=usage[2],
         )
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=content),
+                finish_reason=finish_reason,
+            )
+        ],
         usage=usage_payload,
     )
+
+
+def generation_attempt_logs(caplog: Any) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("hy3_generation_attempt ")
+    ]
 
 
 def assert_closed_objects(node: object) -> None:
@@ -392,7 +410,7 @@ def test_live_deep_audit_schema_error_retries_and_logs_safely(caplog) -> None:
     client = FakeClient([invalid, valid_deep_audit_json()])
     source_secret = verified_claim_evidence_pairs()[0][1].quote
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         result = Hy3Service(
             settings=live_settings(),
             client=client,
@@ -466,7 +484,7 @@ def test_live_deep_audit_retries_invalid_risk_category_coverage(
         f"unique_count={unique_count}"
     )
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         with pytest.raises(Hy3ServiceError) as exc_info:
             Hy3Service(settings=live_settings(), client=client).deep_audit(
                 document=generated_bundle().document,
@@ -509,7 +527,7 @@ def test_live_risk_only_deep_audit_retries_invalid_categories_then_succeeds(
         ]
     )
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         result = Hy3Service(settings=live_settings(), client=client).deep_audit(
             document=generated_bundle().document,
             claim_evidence_pairs=[],
@@ -556,7 +574,7 @@ def test_live_deep_audit_empty_pairs_requires_empty_semantic_judgments(
         ]
     )
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         result = Hy3Service(settings=live_settings(), client=client).deep_audit(
             document=generated_bundle().document,
             claim_evidence_pairs=[],
@@ -639,7 +657,7 @@ def test_live_deep_audit_three_schema_failures_accumulate_usage(caplog) -> None:
         ]
     )
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         with pytest.raises(Hy3ServiceError) as exc_info:
             Hy3Service(settings=live_settings(), client=client).deep_audit(
                 document=generated_bundle().document,
@@ -667,7 +685,7 @@ def test_live_deep_audit_provider_failure_preserves_prior_usage(caplog) -> None:
         ]
     )
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         with pytest.raises(Hy3ServiceError) as exc_info:
             Hy3Service(settings=live_settings(), client=client).deep_audit(
                 document=generated_bundle().document,
@@ -839,7 +857,7 @@ def test_live_generation_claim_policy_mismatch_uses_bounded_retry_and_safe_summa
     raw = generation_json_with_claims(present=claims_present)
     client = FakeClient([raw, raw, raw])
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         with pytest.raises(Hy3ServiceError) as exc_info:
             Hy3Service(settings=live_settings(), client=client).generate(
                 claim_policy=claim_policy,
@@ -960,6 +978,332 @@ def test_live_generation_uses_openai_chat_and_strict_generated_bundle_schema() -
     assert_closed_objects(response_format["json_schema"]["schema"])
 
 
+@pytest.mark.parametrize(
+    ("import_order", "log_level", "expected_attempt_logs"),
+    [
+        ("configure_then_import", "info", 1),
+        ("import_then_configure", "info", 1),
+        ("configure_then_import", "warning", 0),
+        ("import_then_configure", "warning", 0),
+    ],
+    ids=[
+        "info-configure-then-import",
+        "info-import-then-configure",
+        "warning-configure-then-import",
+        "warning-import-then-configure",
+    ],
+)
+def test_generation_diagnostic_respects_uvicorn_logging_order(
+    import_order: str,
+    log_level: str,
+    expected_attempt_logs: int,
+    tmp_path: Path,
+) -> None:
+    probe = """
+import sys
+
+from uvicorn import Config
+
+
+def configure_logging() -> None:
+    Config("paperlens.logging_probe:app", log_level=sys.argv[2]).configure_logging()
+
+
+if sys.argv[1] == "configure_then_import":
+    configure_logging()
+    from backend.app.hy3_service import Hy3Service
+elif sys.argv[1] == "import_then_configure":
+    from backend.app.hy3_service import Hy3Service
+    configure_logging()
+else:
+    raise AssertionError("unknown import order")
+
+Hy3Service._log_generation_attempt(
+    attempt=2,
+    completion_tokens=4096,
+    finish_reason="length",
+    validation_boundary="json_invalid",
+    error_code="SCHEMA_INVALID",
+)
+"""
+    environment = {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+        "PYTHONUTF8": "1",
+    }
+    for name in ("SYSTEMROOT", "TEMP", "TMP", "WINDIR"):
+        value = os.environ.get(name)
+        if value is not None:
+            environment[name] = value
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe, import_order, log_level],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 0, (
+        f"probe returncode={result.returncode} "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    output = result.stdout + result.stderr
+    marker = "hy3_generation_attempt operation=generation "
+    assert output.count(marker) == expected_attempt_logs
+    for sentinel in (
+        "PROMPT_SENTINEL",
+        "RAW_RESPONSE_SENTINEL",
+        "SOURCE_BLOCK_SENTINEL",
+        "CLAIM_TEXT_SENTINEL",
+        "API_KEY_SENTINEL",
+    ):
+        assert sentinel not in output
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "completion_tokens", "limit_reached"),
+    [
+        ("length", 4096, "true"),
+        ("stop", 53, "false"),
+    ],
+)
+def test_live_generation_logs_safe_finish_and_per_attempt_completion_limit(
+    finish_reason: str,
+    completion_tokens: int,
+    limit_reached: str,
+    caplog: Any,
+) -> None:
+    raw = valid_generation_json()
+    client = FakeClient(
+        [
+            completion_response(
+                raw,
+                (101, completion_tokens, 101 + completion_tokens),
+                finish_reason=finish_reason,
+            )
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        bundle = Hy3Service(settings=live_settings(), client=client).generate(
+            claim_policy="required",
+            paper_metadata={"title": "PaperLens synthetic fixture"},
+            source_blocks=load_source_blocks()[:2],
+        )
+
+    assert bundle == GeneratedBundle.model_validate_json(raw)
+    logs = generation_attempt_logs(caplog)
+    assert len(logs) == 1
+    assert "operation=generation" in logs[0]
+    assert "attempt=0" in logs[0]
+    assert f"completion_tokens={completion_tokens}" in logs[0]
+    assert "configured_completion_limit=4096" in logs[0]
+    assert f"completion_limit_reached={limit_reached}" in logs[0]
+    assert f"finish_reason={finish_reason}" in logs[0]
+    assert "validation_boundary=none" in logs[0]
+    assert "error_code=NONE" in logs[0]
+
+
+@pytest.mark.parametrize(
+    ("raw_response", "claim_policy", "expected_boundary", "error_code"),
+    [
+        (
+            "RAW_JSON_INVALID_SENTINEL",
+            "required",
+            "json_invalid",
+            "SCHEMA_INVALID",
+        ),
+        (
+            json.dumps({"document": {"title": "SCHEMA_VALUE_SENTINEL"}}),
+            "required",
+            "generated_bundle_schema_invalid",
+            "SCHEMA_INVALID",
+        ),
+        (
+            generation_json_with_claims(present=False),
+            "required",
+            "claim_policy_mismatch",
+            "AUDIT_INCOMPLETE",
+        ),
+    ],
+)
+def test_live_generation_logs_validation_boundary_without_changing_public_error(
+    raw_response: str,
+    claim_policy: str,
+    expected_boundary: str,
+    error_code: str,
+    caplog: Any,
+) -> None:
+    client = FakeClient(
+        [
+            completion_response(
+                raw_response,
+                (11, 7, 18),
+                finish_reason="stop",
+            )
+            for _ in range(3)
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            Hy3Service(settings=live_settings(), client=client).generate(
+                claim_policy=claim_policy,
+                paper_metadata={"title": "PaperLens synthetic fixture"},
+                source_blocks=load_source_blocks()[:2],
+            )
+
+    assert exc_info.value.error_code == error_code
+    assert exc_info.value.retries == 2
+    assert len(client.completions.calls) == 3
+    logs = generation_attempt_logs(caplog)
+    assert len(logs) == 3
+    assert [f"attempt={attempt}" in log for attempt, log in enumerate(logs)] == [
+        True,
+        True,
+        True,
+    ]
+    assert all(f"validation_boundary={expected_boundary}" in log for log in logs)
+    assert all(f"error_code={error_code}" in log for log in logs)
+
+
+def test_live_generation_logs_missing_content_boundary_safely(caplog: Any) -> None:
+    client = FakeClient(
+        [
+            completion_response(
+                None,
+                (11, 0, 11),
+                finish_reason=None,
+            )
+            for _ in range(3)
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            Hy3Service(settings=live_settings(), client=client).generate(
+                claim_policy="required",
+                paper_metadata={"title": "PaperLens synthetic fixture"},
+                source_blocks=load_source_blocks()[:2],
+            )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retries == 2
+    logs = generation_attempt_logs(caplog)
+    assert len(logs) == 3
+    assert all("finish_reason=missing" in log for log in logs)
+    assert all("validation_boundary=response_content_missing" in log for log in logs)
+
+
+def test_generation_attempt_logs_contain_only_safe_fixed_metadata(caplog: Any) -> None:
+    schema_invalid = json.loads(valid_generation_json())
+    schema_invalid["PYDANTIC_RAW_FIELD_SENTINEL"] = "PRIVATE_FIELD_VALUE"
+    policy_invalid = json.loads(valid_generation_json())
+    policy_invalid["claims"][0]["text"] = "CLAIM_TEXT_SENTINEL"
+    source_blocks = load_source_blocks()[:2]
+    source_blocks[0] = source_blocks[0].model_copy(
+        update={"text": "SOURCE_BLOCK_SENTINEL"}
+    )
+    client = FakeClient(
+        [
+            completion_response(
+                "RAW_RESPONSE_SENTINEL",
+                (None, None, None),
+                finish_reason="PRIVATE_FINISH_REASON_SENTINEL",
+            ),
+            completion_response(
+                json.dumps(schema_invalid),
+                (13, 7, 20),
+                finish_reason="content_filter",
+            ),
+            completion_response(
+                json.dumps(policy_invalid),
+                (17, 8, 25),
+                finish_reason="tool_calls",
+            ),
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            Hy3Service(
+                settings=live_settings(hy3_api_key="API_KEY_SENTINEL"),
+                client=client,
+            ).generate(
+                claim_policy="must_be_empty",
+                paper_metadata={"title": "PROMPT_SENTINEL"},
+                source_blocks=source_blocks,
+            )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    logs = generation_attempt_logs(caplog)
+    assert len(logs) == 3
+    expected_keys = {
+        "operation",
+        "attempt",
+        "completion_tokens",
+        "configured_completion_limit",
+        "completion_limit_reached",
+        "finish_reason",
+        "validation_boundary",
+        "error_code",
+        "retry_count",
+    }
+    finish_reasons = {
+        "stop",
+        "length",
+        "content_filter",
+        "tool_calls",
+        "missing",
+        "unknown",
+    }
+    boundaries = {
+        "response_content_missing",
+        "json_invalid",
+        "generated_bundle_schema_invalid",
+        "claim_policy_mismatch",
+        "none",
+        "unknown",
+    }
+    for log in logs:
+        fields = dict(item.split("=", 1) for item in log.split()[1:])
+        assert set(fields) == expected_keys
+        assert fields["operation"] == "generation"
+        assert fields["attempt"] in {"0", "1", "2"}
+        assert fields["retry_count"] == fields["attempt"]
+        completion_tokens = fields["completion_tokens"]
+        assert completion_tokens == "null" or int(completion_tokens) >= 0
+        assert fields["configured_completion_limit"] == "4096"
+        assert fields["completion_limit_reached"] in {"true", "false"}
+        assert fields["finish_reason"] in finish_reasons
+        assert fields["validation_boundary"] in boundaries
+        assert fields["error_code"] in {
+            "SCHEMA_INVALID",
+            "AUDIT_INCOMPLETE",
+        }
+
+    assert "finish_reason=unknown" in logs[0]
+    assert "completion_tokens=null" in logs[0]
+    assert "validation_boundary=json_invalid" in logs[0]
+    assert "validation_boundary=generated_bundle_schema_invalid" in logs[1]
+    assert "validation_boundary=claim_policy_mismatch" in logs[2]
+    for sentinel in (
+        "RAW_RESPONSE_SENTINEL",
+        "PROMPT_SENTINEL",
+        "SOURCE_BLOCK_SENTINEL",
+        "CLAIM_TEXT_SENTINEL",
+        "API_KEY_SENTINEL",
+        "PYDANTIC_RAW_FIELD_SENTINEL",
+        "PRIVATE_FIELD_VALUE",
+        "PRIVATE_FINISH_REASON_SENTINEL",
+    ):
+        assert sentinel not in caplog.text
+
+
 def test_live_missing_fields_retries_with_only_field_error_summary() -> None:
     invalid = '{"document":{"title":"MODEL_MISSING_SECRET"}}'
     client = FakeClient([invalid, valid_generation_json()])
@@ -1005,7 +1349,7 @@ def test_live_non_json_fails_schema_after_two_retries(caplog) -> None:
     service = Hy3Service(settings=live_settings(), client=client)
     source_blocks = load_source_blocks()[:2]
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         with pytest.raises(Hy3ServiceError) as exc_info:
             service.generate(
                 claim_policy="required",
@@ -1043,7 +1387,7 @@ def test_live_schema_retry_logs_sum_of_invalid_and_valid_response_usage(
     )
     source_blocks = load_source_blocks()[:2]
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         bundle = Hy3Service(settings=live_settings(), client=client).generate(
             claim_policy="required",
             paper_metadata={"title": "PaperLens synthetic fixture"},
@@ -1074,7 +1418,7 @@ def test_live_provider_failure_after_schema_response_preserves_prior_usage(
     )
     source_blocks = load_source_blocks()[:2]
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         with pytest.raises(Hy3ServiceError) as exc_info:
             Hy3Service(settings=live_settings(), client=client).generate(
                 claim_policy="required",
@@ -1106,7 +1450,7 @@ def test_live_usage_component_stays_unknown_if_any_response_omits_it(
         ]
     )
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         Hy3Service(settings=live_settings(), client=client).generate(
             claim_policy="required",
             paper_metadata={"title": "PaperLens synthetic fixture"},
@@ -1172,7 +1516,7 @@ def test_live_run_log_contains_metadata_but_not_key_or_source_text(caplog) -> No
     client = FakeClient([valid_generation_json()])
     source_blocks = load_source_blocks()[:2]
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         Hy3Service(settings=live_settings(), client=client).generate(
             claim_policy="required",
             paper_metadata={"title": "PaperLens synthetic fixture"},
@@ -1245,7 +1589,7 @@ def test_models_endpoint_provider_error_is_stable_and_sanitized(
         lambda: pytest.fail("Model probe failure must not load Mock data"),
     )
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         with pytest.raises(Hy3ServiceError) as exc_info:
             service.check_model_online()
 
@@ -1271,7 +1615,7 @@ def test_models_endpoint_missing_hy3_is_unavailable_without_mock(
         lambda: pytest.fail("Model probe failure must not load Mock data"),
     )
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         with pytest.raises(Hy3ServiceError) as exc_info:
             service.check_model_online()
 
@@ -1298,7 +1642,7 @@ def test_models_endpoint_rejects_non_online_hy3_without_mock(
         lambda: pytest.fail("Model probe failure must not load Mock data"),
     )
 
-    with caplog.at_level(logging.INFO, logger="backend.app.hy3_service"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         with pytest.raises(Hy3ServiceError) as exc_info:
             service.check_model_online()
 
