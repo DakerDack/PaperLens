@@ -11,7 +11,12 @@ import pytest
 from openai import OpenAIError
 from pydantic import TypeAdapter
 
-from backend.app.hy3_service import Hy3Service, Hy3ServiceError
+from backend.app.hy3_service import (
+    DEEP_AUDIT_MAX_COMPLETION_TOKENS,
+    GENERATION_MAX_COMPLETION_TOKENS,
+    Hy3Service,
+    Hy3ServiceError,
+)
 from backend.app.models import (
     AtomicClaim,
     DeepAuditResult,
@@ -280,6 +285,11 @@ def test_generation_prompt_centralizes_stage_two_contract() -> None:
     assert 'source_blocks: [{"block_id":"p01-b001","text":"Evidence"}]' in prompt
 
 
+def test_generation_and_deep_audit_output_budgets_remain_independent() -> None:
+    assert GENERATION_MAX_COMPLETION_TOKENS == 16384
+    assert DEEP_AUDIT_MAX_COMPLETION_TOKENS == 4096
+
+
 def test_deep_audit_prompt_centralizes_v2_document_contract() -> None:
     prompt = render_deep_audit_prompt(
         content_draft_json=(
@@ -391,6 +401,7 @@ def test_live_deep_audit_uses_one_strict_batch_request() -> None:
     assert request["model"] == "hy3"
     assert request["stream"] is False
     assert request["temperature"] == 0
+    assert request["max_completion_tokens"] == 4096
     assert request["extra_body"] == {"thinking": {"type": "disabled"}}
     response_format = request["response_format"]
     assert response_format["type"] == "json_schema"
@@ -965,7 +976,7 @@ def test_live_generation_uses_openai_chat_and_strict_generated_bundle_schema() -
     assert request["model"] == "hy3"
     assert request["stream"] is False
     assert request["temperature"] == 0
-    assert request["max_completion_tokens"] == 4096
+    assert request["max_completion_tokens"] == 16384
     assert request["extra_body"] == {"thinking": {"type": "disabled"}}
     assert request["messages"][0] == {
         "role": "system",
@@ -1067,8 +1078,11 @@ Hy3Service._log_generation_attempt(
 @pytest.mark.parametrize(
     ("finish_reason", "completion_tokens", "limit_reached"),
     [
-        ("length", 4096, "true"),
         ("stop", 53, "false"),
+        ("stop", 4096, "false"),
+        ("stop", 16383, "false"),
+        ("length", 16384, "true"),
+        ("length", 16385, "true"),
     ],
 )
 def test_live_generation_logs_safe_finish_and_per_attempt_completion_limit(
@@ -1101,7 +1115,7 @@ def test_live_generation_logs_safe_finish_and_per_attempt_completion_limit(
     assert "operation=generation" in logs[0]
     assert "attempt=0" in logs[0]
     assert f"completion_tokens={completion_tokens}" in logs[0]
-    assert "configured_completion_limit=4096" in logs[0]
+    assert "configured_completion_limit=16384" in logs[0]
     assert f"completion_limit_reached={limit_reached}" in logs[0]
     assert f"finish_reason={finish_reason}" in logs[0]
     assert "validation_boundary=none" in logs[0]
@@ -1277,7 +1291,7 @@ def test_generation_attempt_logs_contain_only_safe_fixed_metadata(caplog: Any) -
         assert fields["retry_count"] == fields["attempt"]
         completion_tokens = fields["completion_tokens"]
         assert completion_tokens == "null" or int(completion_tokens) >= 0
-        assert fields["configured_completion_limit"] == "4096"
+        assert fields["configured_completion_limit"] == "16384"
         assert fields["completion_limit_reached"] in {"true", "false"}
         assert fields["finish_reason"] in finish_reasons
         assert fields["validation_boundary"] in boundaries
@@ -1527,7 +1541,7 @@ def test_live_run_log_contains_metadata_but_not_key_or_source_text(caplog) -> No
     assert "prompt_version=gen-v2" in caplog.text
     assert "schema_version=generated-bundle-v1" in caplog.text
     assert "temperature=0" in caplog.text
-    assert "max_completion_tokens=4096" in caplog.text
+    assert "max_completion_tokens=16384" in caplog.text
     assert "prompt_tokens=101" in caplog.text
     assert "completion_tokens=53" in caplog.text
     assert "latency_ms=" in caplog.text
