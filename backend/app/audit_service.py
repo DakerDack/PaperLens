@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from collections.abc import Iterable
+from typing import Literal
 
 from pydantic import ValidationError
 from rank_bm25 import BM25Okapi
 
-from backend.app.hy3_service import Hy3Service
+from backend.app.hy3_service import (
+    Hy3Service,
+    build_safe_diagnostic_message,
+)
 from backend.app.models import (
     AtomicClaim,
     AuditReport,
@@ -44,6 +49,22 @@ from backend.app.models import (
     dimension_score,
     fixed_risk_hard_failures,
 )
+
+
+logger = logging.getLogger("uvicorn.error.paperlens.audit_service")
+
+AuditValidationBoundary = Literal[
+    "compliance_context_validation",
+    "deep_audit_result_validation",
+    "evidence_pair_validation",
+    "semantic_pair_validation",
+    "risk_category_validation",
+    "risk_location_validation",
+    "risk_excerpt_validation",
+    "risk_assessment_construction",
+    "dimension_construction",
+    "final_report_construction",
+]
 
 
 _HYPHENATED_LINE_BREAK = re.compile(
@@ -265,6 +286,48 @@ class AuditServiceError(RuntimeError):
         self.retryable = retryable
 
 
+def _audit_service_error(
+    error_code: str,
+    message: str,
+    *,
+    retryable: bool,
+    validation_boundary: AuditValidationBoundary,
+    validation_error: ValidationError | None = None,
+) -> AuditServiceError:
+    if validation_error is None:
+        validation_error_count = 0
+        validation_error_type = "none"
+        validation_location = "none"
+    else:
+        (
+            validation_error_count,
+            validation_error_type,
+            validation_location,
+        ) = Hy3Service._validation_error_diagnostic(validation_error)
+    message_prefix = (
+        "audit_postprocessing_failure operation=audit_postprocessing "
+        "attempt=0 retry_count=0 completion_tokens=null "
+        "configured_completion_limit=null completion_limit_reached=false "
+        f"finish_reason=missing validation_boundary={validation_boundary} "
+        f"error_code={error_code} "
+        f"validation_error_count={validation_error_count} "
+        f"validation_error_type={validation_error_type} "
+        "validation_location="
+    )
+    logger.info(
+        "%s",
+        build_safe_diagnostic_message(
+            message_prefix,
+            validation_location,
+        ),
+    )
+    return AuditServiceError(
+        error_code,
+        message,
+        retryable=retryable,
+    )
+
+
 def _normalize_hyphenated_line_breaks(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text)
     normalized = _HYPHENATED_LINE_BREAK.sub("", normalized)
@@ -343,10 +406,11 @@ class AuditService:
         for evidence in evidence_records:
             claim = claims.get(evidence.claim_id)
             if claim is None:
-                raise AuditServiceError(
+                raise _audit_service_error(
                     "AUDIT_INCOMPLETE",
                     "Evidence references a claim outside the generated bundle.",
                     retryable=False,
+                    validation_boundary="evidence_pair_validation",
                 )
             if (
                 claim.auditability == Auditability.NON_AUDITABLE
@@ -372,10 +436,14 @@ class AuditService:
                 compliance_context.model_dump(mode="json")
             )
         except (AttributeError, ValidationError) as exc:
-            raise AuditServiceError(
+            raise _audit_service_error(
                 "AUDIT_INCOMPLETE",
                 "Deep audit compliance context is incomplete.",
                 retryable=False,
+                validation_boundary="compliance_context_validation",
+                validation_error=(
+                    exc if isinstance(exc, ValidationError) else None
+                ),
             ) from exc
         if not validated_context.rights_or_license_confirmed:
             raise AuditServiceError(
@@ -396,10 +464,11 @@ class AuditService:
             validated_context,
         )
         if report.risk_assessment is None:
-            raise AuditServiceError(
+            raise _audit_service_error(
                 "AUDIT_INCOMPLETE",
                 "Deep audit risk assessment is missing.",
                 retryable=False,
+                validation_boundary="final_report_construction",
             )
         safe_result = DeepAuditResult(
             semantic_judgments=result.semantic_judgments,
@@ -418,14 +487,29 @@ class AuditService:
             validated_context = ComplianceContext.model_validate(
                 compliance_context.model_dump(mode="json")
             )
+        except (AttributeError, ValidationError) as exc:
+            raise _audit_service_error(
+                "AUDIT_INCOMPLETE",
+                "Deep audit context or result is incomplete.",
+                retryable=False,
+                validation_boundary="compliance_context_validation",
+                validation_error=(
+                    exc if isinstance(exc, ValidationError) else None
+                ),
+            ) from exc
+        try:
             validated_result = DeepAuditResult.model_validate(
                 deep_audit_result.model_dump(mode="json")
             )
         except (AttributeError, ValidationError) as exc:
-            raise AuditServiceError(
+            raise _audit_service_error(
                 "AUDIT_INCOMPLETE",
                 "Deep audit context or result is incomplete.",
                 retryable=False,
+                validation_boundary="deep_audit_result_validation",
+                validation_error=(
+                    exc if isinstance(exc, ValidationError) else None
+                ),
             ) from exc
 
         semantic_judgments = validated_result.semantic_judgments
@@ -442,10 +526,11 @@ class AuditService:
             len(actual_pairs) != len(set(actual_pairs))
             or set(actual_pairs) != expected_pairs
         ):
-            raise AuditServiceError(
+            raise _audit_service_error(
                 "AUDIT_INCOMPLETE",
                 "Semantic judgments must cover every verified evidence pair exactly once.",
                 retryable=True,
+                validation_boundary="semantic_pair_validation",
             )
 
         _validate_risk_findings(bundle.document, validated_result.risk_findings)
@@ -463,24 +548,36 @@ class AuditService:
                 level_points=risk_points,
             )
         except ValidationError as exc:
-            raise AuditServiceError(
+            raise _audit_service_error(
                 "AUDIT_INCOMPLETE",
                 "Risk assessment could not be completed.",
                 retryable=False,
+                validation_boundary="risk_assessment_construction",
+                validation_error=exc,
             ) from exc
 
-        dimensions, level_points = _build_dimensions(
-            bundle,
-            evidence_records,
-            semantic_judgments,
-            risk_points=risk_points,
-            risk_metrics=risk_metrics,
-        )
-        if set(level_points) != set(DimensionId):
-            raise AuditServiceError(
+        try:
+            dimensions, level_points = _build_dimensions(
+                bundle,
+                evidence_records,
+                semantic_judgments,
+                risk_points=risk_points,
+                risk_metrics=risk_metrics,
+            )
+        except ValidationError as exc:
+            raise _audit_service_error(
                 "AUDIT_INCOMPLETE",
                 "All eight dimension results are required before scoring.",
                 retryable=False,
+                validation_boundary="dimension_construction",
+                validation_error=exc,
+            ) from exc
+        if set(level_points) != set(DimensionId):
+            raise _audit_service_error(
+                "AUDIT_INCOMPLETE",
+                "All eight dimension results are required before scoring.",
+                retryable=False,
+                validation_boundary="dimension_construction",
             )
 
         hard_failures = _deduplicate(
@@ -493,15 +590,24 @@ class AuditService:
             hard_failures,
         )
 
-        return AuditReport(
-            audit_status=AuditStatus.DEEP_COMPLETE,
-            dimensions=dimensions,
-            risk_assessment=risk_assessment,
-            hard_failures=hard_failures,
-            core_gate_passed=core_gate_passed,
-            overall_score=overall_score,
-            decision=decision,
-        )
+        try:
+            return AuditReport(
+                audit_status=AuditStatus.DEEP_COMPLETE,
+                dimensions=dimensions,
+                risk_assessment=risk_assessment,
+                hard_failures=hard_failures,
+                core_gate_passed=core_gate_passed,
+                overall_score=overall_score,
+                decision=decision,
+            )
+        except ValidationError as exc:
+            raise _audit_service_error(
+                "AUDIT_INCOMPLETE",
+                "The final audit report could not be completed.",
+                retryable=False,
+                validation_boundary="final_report_construction",
+                validation_error=exc,
+            ) from exc
 
     def verify_claim_evidence(
         self,
@@ -1201,10 +1307,11 @@ def _validate_risk_findings(
 ) -> None:
     categories = [finding.category for finding in risk_findings]
     if len(categories) != len(RiskCategory) or set(categories) != set(RiskCategory):
-        raise AuditServiceError(
+        raise _audit_service_error(
             "AUDIT_INCOMPLETE",
             "Risk findings must cover each required category exactly once.",
             retryable=True,
+            validation_boundary="risk_category_validation",
         )
 
     sentence_texts = {
@@ -1214,39 +1321,44 @@ def _validate_risk_findings(
     }
     for finding in risk_findings:
         if finding.status == RiskStatus.DETECTED and not finding.locations:
-            raise AuditServiceError(
+            raise _audit_service_error(
                 "AUDIT_INCOMPLETE",
                 "A detected risk finding requires at least one location.",
                 retryable=True,
+                validation_boundary="risk_location_validation",
             )
         if finding.status == RiskStatus.NOT_DETECTED and finding.locations:
-            raise AuditServiceError(
+            raise _audit_service_error(
                 "AUDIT_INCOMPLETE",
                 "A not-detected risk finding cannot contain locations.",
                 retryable=True,
+                validation_boundary="risk_location_validation",
             )
 
         for location in finding.locations:
             if location.location_type == RiskLocationType.SENTENCE:
                 if location.sentence_id is None:
-                    raise AuditServiceError(
+                    raise _audit_service_error(
                         "AUDIT_INCOMPLETE",
                         "A sentence risk location requires a sentence identifier.",
                         retryable=True,
+                        validation_boundary="risk_location_validation",
                     )
                 source_text = sentence_texts.get(location.sentence_id or "")
                 if source_text is None:
-                    raise AuditServiceError(
+                    raise _audit_service_error(
                         "AUDIT_INCOMPLETE",
                         "A risk location references an unknown generated sentence.",
                         retryable=True,
+                        validation_boundary="risk_location_validation",
                     )
             elif location.location_type == RiskLocationType.TITLE:
                 if location.sentence_id is not None:
-                    raise AuditServiceError(
+                    raise _audit_service_error(
                         "AUDIT_INCOMPLETE",
                         "A title risk location cannot contain a sentence identifier.",
                         retryable=True,
+                        validation_boundary="risk_location_validation",
                     )
                 source_text = document.title
             else:
@@ -1254,10 +1366,11 @@ def _validate_risk_findings(
                     location.sentence_id is not None
                     or location.evidence_excerpt is not None
                 ):
-                    raise AuditServiceError(
+                    raise _audit_service_error(
                         "AUDIT_INCOMPLETE",
                         "A document risk location must not contain sentence details.",
                         retryable=True,
+                        validation_boundary="risk_location_validation",
                     )
                 source_text = ""
 
@@ -1265,10 +1378,11 @@ def _validate_risk_findings(
                 finding.category == RiskCategory.SENSITIVE_INFORMATION
                 and location.evidence_excerpt is not None
             ):
-                raise AuditServiceError(
+                raise _audit_service_error(
                     "AUDIT_INCOMPLETE",
                     "Sensitive risk locations cannot contain evidence excerpts.",
                     retryable=True,
+                    validation_boundary="risk_excerpt_validation",
                 )
 
             if location.evidence_excerpt is not None and (
@@ -1276,10 +1390,11 @@ def _validate_risk_findings(
                 or normalize_evidence_text(location.evidence_excerpt)
                 not in normalize_evidence_text(source_text)
             ):
-                raise AuditServiceError(
+                raise _audit_service_error(
                     "AUDIT_INCOMPLETE",
                     "A risk excerpt could not be verified in generated content.",
                     retryable=True,
+                    validation_boundary="risk_excerpt_validation",
                 )
 
 def _risk_level(

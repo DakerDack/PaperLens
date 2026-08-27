@@ -55,18 +55,43 @@ GENERATION_THINKING = "disabled"
 DEEP_AUDIT_TEMPERATURE = 0
 DEEP_AUDIT_MAX_COMPLETION_TOKENS = 4096
 DEEP_AUDIT_THINKING = "disabled"
+SAFE_DIAGNOSTIC_MAX_LENGTH = 512
+_DIAGNOSTIC_TRUNCATION_MARKER = "<truncated>"
+_SAFE_DIAGNOSTIC_INTEGER_MAX = 999_999_999_999_999_999
+_SAFE_DIAGNOSTIC_FALLBACK_MESSAGE = (
+    "hy3_diagnostic_fallback operation=unknown attempt=null "
+    "completion_tokens=null configured_completion_limit=null "
+    "completion_limit_reached=false finish_reason=unknown "
+    "validation_boundary=none error_code=null retry_count=null "
+    "validation_error_count=null "
+    "validation_error_type=other_validation_error "
+    "validation_location=<truncated>"
+)
 
 
 UsageTuple = tuple[int | None, int | None, int | None]
 SemanticPair = tuple[AtomicClaim, EvidenceRecord]
 SemanticPairKey = tuple[str, str]
-GenerationValidationBoundary = Literal[
-    "response_content_missing",
+Hy3ValidationBoundary = Literal[
+    "provider_unavailable",
+    "content_missing",
     "json_invalid",
     "generated_bundle_schema_invalid",
-    "claim_policy_mismatch",
+    "claim_policy_invalid",
+    "deep_audit_schema_invalid",
+    "semantic_pair_invalid",
+    "risk_category_coverage_invalid",
     "none",
-    "unknown",
+]
+SafeValidationErrorType = Literal[
+    "json_invalid",
+    "missing",
+    "extra_forbidden",
+    "enum",
+    "literal_error",
+    "value_error",
+    "other_validation_error",
+    "none",
 ]
 SafeFinishReason = Literal[
     "stop",
@@ -82,6 +107,24 @@ _SAFE_FINISH_REASONS = frozenset({
     "content_filter",
     "tool_calls",
 })
+_SAFE_LOG_FINISH_REASONS = _SAFE_FINISH_REASONS | {"missing", "unknown"}
+_SAFE_VALIDATION_BOUNDARIES = frozenset({
+    "provider_unavailable",
+    "content_missing",
+    "json_invalid",
+    "generated_bundle_schema_invalid",
+    "claim_policy_invalid",
+    "deep_audit_schema_invalid",
+    "semantic_pair_invalid",
+    "risk_category_coverage_invalid",
+    "none",
+})
+_SAFE_DIAGNOSTIC_ERROR_CODES = frozenset({
+    "NONE",
+    "HY3_UNAVAILABLE",
+    "SCHEMA_INVALID",
+    "AUDIT_INCOMPLETE",
+})
 _SAFE_VALIDATION_ERROR_MESSAGES = {
     "json_invalid": "JSON text is invalid.",
     "missing": "Required field is missing.",
@@ -91,6 +134,37 @@ _SAFE_VALIDATION_ERROR_MESSAGES = {
     "value_error": "Value failed validation.",
 }
 _DEFAULT_SAFE_VALIDATION_ERROR_MESSAGE = "Value failed validation."
+_SAFE_VALIDATION_ERROR_TYPES = frozenset(
+    _SAFE_VALIDATION_ERROR_MESSAGES
+)
+
+
+def build_safe_diagnostic_message(
+    message_prefix: str,
+    validation_location: str,
+) -> str:
+    if not isinstance(message_prefix, str):
+        return _SAFE_DIAGNOSTIC_FALLBACK_MESSAGE
+    if not isinstance(validation_location, str):
+        validation_location = "none"
+    available_location_length = (
+        SAFE_DIAGNOSTIC_MAX_LENGTH - len(message_prefix)
+    )
+    if available_location_length < len(_DIAGNOSTIC_TRUNCATION_MARKER):
+        return _SAFE_DIAGNOSTIC_FALLBACK_MESSAGE
+    if len(validation_location) > available_location_length:
+        preserved_length = (
+            available_location_length
+            - len(_DIAGNOSTIC_TRUNCATION_MARKER)
+        )
+        validation_location = (
+            validation_location[:preserved_length]
+            + _DIAGNOSTIC_TRUNCATION_MARKER
+        )
+    message = message_prefix + validation_location
+    if len(message) > SAFE_DIAGNOSTIC_MAX_LENGTH:
+        return _SAFE_DIAGNOSTIC_FALLBACK_MESSAGE
+    return message
 
 
 class Hy3ServiceError(RuntimeError):
@@ -103,7 +177,10 @@ class Hy3ServiceError(RuntimeError):
         field_error_summary: str | None = None,
         retries: int = 0,
         usage: UsageTuple = (None, None, None),
-        validation_boundary: GenerationValidationBoundary = "unknown",
+        validation_boundary: Hy3ValidationBoundary = "none",
+        validation_error_count: int = 0,
+        validation_error_type: SafeValidationErrorType = "none",
+        validation_location: str = "none",
     ) -> None:
         super().__init__(message)
         self.error_code = error_code
@@ -113,6 +190,9 @@ class Hy3ServiceError(RuntimeError):
         self.retries = retries
         self.usage = usage
         self.validation_boundary = validation_boundary
+        self.validation_error_count = validation_error_count
+        self.validation_error_type = validation_error_type
+        self.validation_location = validation_location
 
 
 class Hy3Service:
@@ -292,7 +372,7 @@ class Hy3Service:
                     attempt=attempt,
                     completion_tokens=None,
                     finish_reason="missing",
-                    validation_boundary="unknown",
+                    validation_boundary="provider_unavailable",
                     error_code="HY3_UNAVAILABLE",
                 )
                 raise Hy3ServiceError(
@@ -327,6 +407,9 @@ class Hy3Service:
                     finish_reason=self._safe_finish_reason(response),
                     validation_boundary=exc.validation_boundary,
                     error_code=exc.error_code,
+                    validation_error_count=exc.validation_error_count,
+                    validation_error_type=exc.validation_error_type,
+                    validation_location=exc.validation_location,
                 )
                 exc.retries = attempt
                 exc.usage = cumulative_usage
@@ -382,6 +465,13 @@ class Hy3Service:
                     },
                 )
             except OpenAIError as exc:
+                self._log_deep_audit_attempt(
+                    attempt=attempt,
+                    completion_tokens=None,
+                    finish_reason="missing",
+                    validation_boundary="provider_unavailable",
+                    error_code="HY3_UNAVAILABLE",
+                )
                 raise Hy3ServiceError(
                     "HY3_UNAVAILABLE",
                     "The Hy3 provider request failed.",
@@ -394,21 +484,30 @@ class Hy3Service:
                     ),
                 ) from exc
 
+            attempt_usage = self._extract_usage(response)
             cumulative_usage = self._accumulate_usage(
                 cumulative_usage,
-                self._extract_usage(response),
+                attempt_usage,
             )
             raw_response = self._extract_response_content(response)
             try:
-                return (
-                    self._validate_deep_audit_result(
-                        raw_response,
-                        expected_pairs,
-                    ),
-                    attempt,
-                    cumulative_usage,
+                result = self._validate_deep_audit_result(
+                    raw_response,
+                    expected_pairs,
                 )
             except Hy3ServiceError as exc:
+                self._log_deep_audit_attempt(
+                    attempt=attempt,
+                    completion_tokens=self._safe_completion_tokens(
+                        attempt_usage[1]
+                    ),
+                    finish_reason=self._safe_finish_reason(response),
+                    validation_boundary=exc.validation_boundary,
+                    error_code=exc.error_code,
+                    validation_error_count=exc.validation_error_count,
+                    validation_error_type=exc.validation_error_type,
+                    validation_location=exc.validation_location,
+                )
                 exc.retries = attempt
                 exc.usage = cumulative_usage
                 if attempt >= self.settings.hy3_max_retries:
@@ -416,6 +515,18 @@ class Hy3Service:
                 field_error_summary = (
                     exc.field_error_summary or "$ [schema_invalid]"
                 )
+                continue
+
+            self._log_deep_audit_attempt(
+                attempt=attempt,
+                completion_tokens=self._safe_completion_tokens(
+                    attempt_usage[1]
+                ),
+                finish_reason=self._safe_finish_reason(response),
+                validation_boundary="none",
+                error_code="NONE",
+            )
+            return result, attempt, cumulative_usage
 
         raise AssertionError("unreachable schema retry state")
 
@@ -549,7 +660,7 @@ class Hy3Service:
                     f"expected_count={expected_count} "
                     f"actual_count={actual_count}"
                 ),
-                validation_boundary="claim_policy_mismatch",
+                validation_boundary="claim_policy_invalid",
             )
         return bundle
 
@@ -567,14 +678,19 @@ class Hy3Service:
                     "$ [json_type]: response content must be JSON text"
                 ),
                 validation_boundary=(
-                    "response_content_missing"
+                    "content_missing"
                     if raw_response is None
-                    else "unknown"
+                    else "json_invalid"
                 ),
             )
         try:
             bundle = GeneratedBundle.model_validate_json(raw_response)
         except ValidationError as exc:
+            (
+                validation_error_count,
+                validation_error_type,
+                validation_location,
+            ) = Hy3Service._validation_error_diagnostic(exc)
             raise Hy3ServiceError(
                 "SCHEMA_INVALID",
                 "The model response did not match GeneratedBundle.",
@@ -583,6 +699,9 @@ class Hy3Service:
                 validation_boundary=(
                     Hy3Service._generated_bundle_validation_boundary(exc)
                 ),
+                validation_error_count=validation_error_count,
+                validation_error_type=validation_error_type,
+                validation_location=validation_location,
             ) from exc
 
         return Hy3Service.validate_claim_policy(bundle, claim_policy)
@@ -633,15 +752,31 @@ class Hy3Service:
                 field_error_summary=(
                     "$ [json_type]: response content must be JSON text"
                 ),
+                validation_boundary=(
+                    "content_missing"
+                    if raw_response is None
+                    else "json_invalid"
+                ),
             )
         try:
             result = DeepAuditResult.model_validate_json(raw_response)
         except ValidationError as exc:
+            (
+                validation_error_count,
+                validation_error_type,
+                validation_location,
+            ) = Hy3Service._validation_error_diagnostic(exc)
             raise Hy3ServiceError(
                 "SCHEMA_INVALID",
                 "The model response did not match DeepAuditResult v2.",
                 retryable=False,
                 field_error_summary=Hy3Service._field_error_summary(exc),
+                validation_boundary=(
+                    Hy3Service._deep_audit_validation_boundary(exc)
+                ),
+                validation_error_count=validation_error_count,
+                validation_error_type=validation_error_type,
+                validation_location=validation_location,
             ) from exc
 
         actual_pairs = [
@@ -663,6 +798,7 @@ class Hy3Service:
                     f"actual_count={len(actual_pairs)} "
                     f"unique_count={len(unique_actual_pairs)}"
                 ),
+                validation_boundary="semantic_pair_invalid",
             )
 
         risk_categories = [
@@ -685,6 +821,7 @@ class Hy3Service:
                     f"actual_count={len(risk_categories)} "
                     f"unique_count={len(unique_risk_categories)}"
                 ),
+                validation_boundary="risk_category_coverage_invalid",
             )
         return result
 
@@ -719,13 +856,16 @@ class Hy3Service:
             include_context=False,
             include_input=False,
         )[:8]:
-            error_type = str(item.get("type", "validation_error"))
+            raw_error_type = str(item.get("type", "validation_error"))
+            error_type = Hy3Service._safe_validation_error_type(
+                raw_error_type
+            )
             location = Hy3Service._safe_validation_location(
                 item.get("loc", ()),
-                error_type,
+                raw_error_type,
             )
             message = _SAFE_VALIDATION_ERROR_MESSAGES.get(
-                error_type,
+                raw_error_type,
                 _DEFAULT_SAFE_VALIDATION_ERROR_MESSAGE,
             )
             summaries.append(f"{location} [{error_type}]: {message}")
@@ -733,9 +873,39 @@ class Hy3Service:
         return summary[:800]
 
     @staticmethod
+    def _safe_validation_error_type(
+        error_type: str,
+    ) -> SafeValidationErrorType:
+        if error_type in _SAFE_VALIDATION_ERROR_TYPES:
+            return error_type  # type: ignore[return-value]
+        return "other_validation_error"
+
+    @staticmethod
+    def _validation_error_diagnostic(
+        error: ValidationError,
+    ) -> tuple[int, SafeValidationErrorType, str]:
+        items = error.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )
+        if not items:
+            return (0, "none", "none")
+        first = items[0]
+        raw_error_type = str(first.get("type", "validation_error"))
+        return (
+            len(items),
+            Hy3Service._safe_validation_error_type(raw_error_type),
+            Hy3Service._safe_validation_location(
+                first.get("loc", ()),
+                raw_error_type,
+            ),
+        )
+
+    @staticmethod
     def _generated_bundle_validation_boundary(
         error: ValidationError,
-    ) -> GenerationValidationBoundary:
+    ) -> Hy3ValidationBoundary:
         if any(
             item.get("type") == "json_invalid"
             for item in error.errors(
@@ -746,6 +916,21 @@ class Hy3Service:
         ):
             return "json_invalid"
         return "generated_bundle_schema_invalid"
+
+    @staticmethod
+    def _deep_audit_validation_boundary(
+        error: ValidationError,
+    ) -> Hy3ValidationBoundary:
+        if any(
+            item.get("type") == "json_invalid"
+            for item in error.errors(
+                include_url=False,
+                include_context=False,
+                include_input=False,
+            )
+        ):
+            return "json_invalid"
+        return "deep_audit_schema_invalid"
 
     @staticmethod
     def _extract_response_content(response: Any) -> Any:
@@ -761,9 +946,15 @@ class Hy3Service:
         if usage is None:
             return (None, None, None)
         return (
-            getattr(usage, "prompt_tokens", None),
-            getattr(usage, "completion_tokens", None),
-            getattr(usage, "total_tokens", None),
+            Hy3Service._safe_diagnostic_integer(
+                getattr(usage, "prompt_tokens", None)
+            ),
+            Hy3Service._safe_diagnostic_integer(
+                getattr(usage, "completion_tokens", None)
+            ),
+            Hy3Service._safe_diagnostic_integer(
+                getattr(usage, "total_tokens", None)
+            ),
         )
 
     @staticmethod
@@ -780,7 +971,15 @@ class Hy3Service:
 
     @staticmethod
     def _safe_completion_tokens(value: Any) -> int | None:
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return Hy3Service._safe_diagnostic_integer(value)
+
+    @staticmethod
+    def _safe_diagnostic_integer(value: Any) -> int | None:
+        if (
+            type(value) is not int
+            or value < 0
+            or value > _SAFE_DIAGNOSTIC_INTEGER_MAX
+        ):
             return None
         return value
 
@@ -796,9 +995,13 @@ class Hy3Service:
             previous: int | None,
             current: int | None,
         ) -> int | None:
-            if previous is None or current is None:
+            safe_previous = Hy3Service._safe_diagnostic_integer(previous)
+            safe_current = Hy3Service._safe_diagnostic_integer(current)
+            if safe_previous is None or safe_current is None:
                 return None
-            return previous + current
+            return Hy3Service._safe_diagnostic_integer(
+                safe_previous + safe_current
+            )
 
         return (
             add_component(accumulated[0], received[0]),
@@ -824,26 +1027,140 @@ class Hy3Service:
         attempt: int,
         completion_tokens: int | None,
         finish_reason: SafeFinishReason,
-        validation_boundary: GenerationValidationBoundary,
+        validation_boundary: Hy3ValidationBoundary,
         error_code: str,
+        validation_error_count: int = 0,
+        validation_error_type: SafeValidationErrorType = "none",
+        validation_location: str = "none",
     ) -> None:
+        Hy3Service._log_attempt(
+            event_name="hy3_generation_attempt",
+            operation="generation",
+            attempt=attempt,
+            completion_tokens=completion_tokens,
+            configured_completion_limit=GENERATION_MAX_COMPLETION_TOKENS,
+            finish_reason=finish_reason,
+            validation_boundary=validation_boundary,
+            error_code=error_code,
+            validation_error_count=validation_error_count,
+            validation_error_type=validation_error_type,
+            validation_location=validation_location,
+        )
+
+    @staticmethod
+    def _log_deep_audit_attempt(
+        *,
+        attempt: int,
+        completion_tokens: int | None,
+        finish_reason: SafeFinishReason,
+        validation_boundary: Hy3ValidationBoundary,
+        error_code: str,
+        validation_error_count: int = 0,
+        validation_error_type: SafeValidationErrorType = "none",
+        validation_location: str = "none",
+    ) -> None:
+        Hy3Service._log_attempt(
+            event_name="hy3_deep_audit_attempt",
+            operation="deep_audit",
+            attempt=attempt,
+            completion_tokens=completion_tokens,
+            configured_completion_limit=DEEP_AUDIT_MAX_COMPLETION_TOKENS,
+            finish_reason=finish_reason,
+            validation_boundary=validation_boundary,
+            error_code=error_code,
+            validation_error_count=validation_error_count,
+            validation_error_type=validation_error_type,
+            validation_location=validation_location,
+        )
+
+    @staticmethod
+    def _log_attempt(
+        *,
+        event_name: Literal[
+            "hy3_generation_attempt",
+            "hy3_deep_audit_attempt",
+        ],
+        operation: Literal["generation", "deep_audit"],
+        attempt: int,
+        completion_tokens: int | None,
+        configured_completion_limit: int,
+        finish_reason: SafeFinishReason,
+        validation_boundary: Hy3ValidationBoundary,
+        error_code: str,
+        validation_error_count: int,
+        validation_error_type: SafeValidationErrorType,
+        validation_location: str,
+    ) -> None:
+        safe_attempt = Hy3Service._safe_diagnostic_integer(attempt)
+        safe_completion_tokens = Hy3Service._safe_diagnostic_integer(
+            completion_tokens
+        )
+        safe_configured_limit = Hy3Service._safe_diagnostic_integer(
+            configured_completion_limit
+        )
+        safe_validation_error_count = Hy3Service._safe_diagnostic_integer(
+            validation_error_count
+        )
+        safe_finish_reason = (
+            finish_reason
+            if isinstance(finish_reason, str)
+            and finish_reason in _SAFE_LOG_FINISH_REASONS
+            else "unknown"
+        )
+        safe_validation_boundary = (
+            validation_boundary
+            if isinstance(validation_boundary, str)
+            and validation_boundary in _SAFE_VALIDATION_BOUNDARIES
+            else "none"
+        )
+        safe_error_code = (
+            error_code
+            if isinstance(error_code, str)
+            and error_code in _SAFE_DIAGNOSTIC_ERROR_CODES
+            else "null"
+        )
+        safe_validation_error_type = (
+            validation_error_type
+            if isinstance(validation_error_type, str)
+            and validation_error_type
+            in _SAFE_VALIDATION_ERROR_TYPES | {"none", "other_validation_error"}
+            else "other_validation_error"
+        )
+        safe_validation_location = (
+            validation_location
+            if isinstance(validation_location, str)
+            else "none"
+        )
         completion_limit_reached = (
-            completion_tokens is not None
-            and completion_tokens >= GENERATION_MAX_COMPLETION_TOKENS
+            safe_completion_tokens is not None
+            and safe_configured_limit is not None
+            and safe_completion_tokens >= safe_configured_limit
+        )
+        message_prefix = (
+            f"{event_name} operation={operation} "
+            "attempt="
+            f"{safe_attempt if safe_attempt is not None else 'null'} "
+            "completion_tokens="
+            f"{safe_completion_tokens if safe_completion_tokens is not None else 'null'} "
+            "configured_completion_limit="
+            f"{safe_configured_limit if safe_configured_limit is not None else 'null'} "
+            "completion_limit_reached="
+            f"{'true' if completion_limit_reached else 'false'} "
+            f"finish_reason={safe_finish_reason} "
+            f"validation_boundary={safe_validation_boundary} "
+            f"error_code={safe_error_code} retry_count="
+            f"{safe_attempt if safe_attempt is not None else 'null'} "
+            "validation_error_count="
+            f"{safe_validation_error_count if safe_validation_error_count is not None else 'null'} "
+            f"validation_error_type={safe_validation_error_type} "
+            "validation_location="
         )
         logger.info(
-            "hy3_generation_attempt operation=generation attempt=%s "
-            "completion_tokens=%s configured_completion_limit=%s "
-            "completion_limit_reached=%s finish_reason=%s "
-            "validation_boundary=%s error_code=%s retry_count=%s",
-            attempt,
-            completion_tokens if completion_tokens is not None else "null",
-            GENERATION_MAX_COMPLETION_TOKENS,
-            "true" if completion_limit_reached else "false",
-            finish_reason,
-            validation_boundary,
-            error_code,
-            attempt,
+            "%s",
+            build_safe_diagnostic_message(
+                message_prefix,
+                safe_validation_location,
+            ),
         )
 
     def _log_run(
@@ -859,8 +1176,17 @@ class Hy3Service:
         max_completion_tokens: int = GENERATION_MAX_COMPLETION_TOKENS,
         thinking: str = GENERATION_THINKING,
     ) -> None:
-        prompt_tokens, completion_tokens, total_tokens = usage
-        latency_ms = max(0, round((time.perf_counter() - started_at) * 1000))
+        prompt_tokens, completion_tokens, total_tokens = (
+            self._safe_diagnostic_integer(value) for value in usage
+        )
+        latency_ms = self._safe_diagnostic_integer(
+            max(0, round((time.perf_counter() - started_at) * 1000))
+        )
+        safe_retries = self._safe_diagnostic_integer(retries)
+        safe_temperature = self._safe_diagnostic_integer(temperature)
+        safe_max_completion_tokens = self._safe_diagnostic_integer(
+            max_completion_tokens
+        )
         logger.info(
             "hy3_run model=%s prompt_version=%s schema_version=%s mode=%s "
             "temperature=%s max_completion_tokens=%s thinking=%s "
@@ -870,13 +1196,13 @@ class Hy3Service:
             prompt_version,
             schema_version,
             self.settings.paperlens_model_mode,
-            temperature,
-            max_completion_tokens,
+            safe_temperature,
+            safe_max_completion_tokens,
             thinking,
             prompt_tokens,
             completion_tokens,
             total_tokens,
             latency_ms,
-            retries,
+            safe_retries,
             error_code,
         )

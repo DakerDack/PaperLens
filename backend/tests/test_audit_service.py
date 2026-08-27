@@ -1,8 +1,11 @@
 import json
+import logging
 from pathlib import Path
 
 import pytest
 from pydantic import TypeAdapter
+
+import backend.app.audit_service as audit_module
 
 from backend.app.audit_service import (
     DIMENSION_WEIGHTS,
@@ -12,6 +15,7 @@ from backend.app.audit_service import (
     required_section_flags,
     should_split_sentence,
 )
+from backend.app.hy3_service import Hy3Service, SAFE_DIAGNOSTIC_MAX_LENGTH
 from backend.app.models import (
     AtomicClaim,
     AuditStatus,
@@ -34,6 +38,82 @@ from backend.app.models import (
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
+SAFE_DIAGNOSTIC_FIELD_NAMES = {
+    "operation",
+    "attempt",
+    "retry_count",
+    "completion_tokens",
+    "configured_completion_limit",
+    "completion_limit_reached",
+    "finish_reason",
+    "validation_boundary",
+    "error_code",
+    "validation_error_count",
+    "validation_error_type",
+    "validation_location",
+}
+
+
+class InvalidModelPayload:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def model_dump(self, *, mode: str) -> dict[str, object]:
+        assert mode == "json"
+        return self.payload
+
+
+def audit_postprocessing_logs(caplog: object) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("audit_postprocessing_failure ")
+    ]
+
+
+def audit_log_fields(message: str) -> dict[str, str]:
+    return dict(item.split("=", 1) for item in message.split()[1:])
+
+
+def assert_safe_audit_failure_log(
+    caplog: object,
+    *,
+    boundary: str,
+    error_code: str = "AUDIT_INCOMPLETE",
+    validation_error_count: str = "0",
+    validation_error_type: str = "none",
+    validation_location: str = "none",
+) -> None:
+    logs = audit_postprocessing_logs(caplog)
+    assert len(logs) == 1
+    fields = audit_log_fields(logs[0])
+    assert set(fields) == SAFE_DIAGNOSTIC_FIELD_NAMES
+    assert fields == {
+        "operation": "audit_postprocessing",
+        "attempt": "0",
+        "retry_count": "0",
+        "completion_tokens": "null",
+        "configured_completion_limit": "null",
+        "completion_limit_reached": "false",
+        "finish_reason": "missing",
+        "validation_boundary": boundary,
+        "error_code": error_code,
+        "validation_error_count": validation_error_count,
+        "validation_error_type": validation_error_type,
+        "validation_location": validation_location,
+    }
+    assert SAFE_DIAGNOSTIC_MAX_LENGTH == 512
+    assert len(logs[0]) <= SAFE_DIAGNOSTIC_MAX_LENGTH
+    for sentinel in (
+        "PROMPT_SENTINEL",
+        "RAW_RESPONSE_SENTINEL",
+        "SOURCE_BLOCK_SENTINEL",
+        "CLAIM_TEXT_SENTINEL",
+        "EVIDENCE_TEXT_SENTINEL",
+        "API_KEY_SENTINEL",
+        "PYDANTIC_INPUT_SENTINEL",
+    ):
+        assert sentinel not in logs[0]
 
 
 def source_block(
@@ -2259,3 +2339,412 @@ def test_invalid_compliance_context_is_audit_incomplete() -> None:
         )
 
     assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+
+
+def test_audit_diagnostic_classifies_compliance_context_validation(
+    caplog,
+) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    pairs = AuditService().semantic_pairs(bundle, records)
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+    invalid_context = InvalidModelPayload(
+        {
+            "rights_or_license_confirmed": True,
+            "source_disclosure_status": "PYDANTIC_INPUT_SENTINEL",
+            "ai_assistance_disclosure_status": "present",
+            "generated_content_label_applicability": "not_applicable",
+            "generated_content_label_status": "not_applicable",
+        }
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(AuditServiceError) as exc_info:
+            AuditService().score(
+                bundle,
+                records,
+                result,
+                invalid_context,
+            )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is False
+    assert_safe_audit_failure_log(
+        caplog,
+        boundary="compliance_context_validation",
+        validation_error_count="1",
+        validation_error_type="enum",
+        validation_location="source_disclosure_status",
+    )
+
+
+def test_audit_diagnostic_classifies_deep_audit_result_validation(
+    caplog,
+) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    invalid_result = InvalidModelPayload(
+        {
+            "semantic_judgments": [],
+            "risk_findings": "PYDANTIC_INPUT_SENTINEL",
+        }
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(AuditServiceError) as exc_info:
+            AuditService().score(
+                bundle,
+                records,
+                invalid_result,
+                compliance_context(),
+            )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is False
+    assert_safe_audit_failure_log(
+        caplog,
+        boundary="deep_audit_result_validation",
+        validation_error_count="1",
+        validation_error_type="other_validation_error",
+        validation_location="risk_findings",
+    )
+
+
+def test_audit_diagnostic_classifies_risk_category_validation_without_mutation(
+    caplog,
+) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    pairs = AuditService().semantic_pairs(bundle, records)
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+    invalid_result = result.model_copy(
+        update={"risk_findings": result.risk_findings[:2]}
+    )
+    original_findings = invalid_result.model_dump(mode="json")["risk_findings"]
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(AuditServiceError) as exc_info:
+            AuditService().score(
+                bundle,
+                records,
+                invalid_result,
+                compliance_context(),
+            )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is True
+    assert invalid_result.model_dump(mode="json")["risk_findings"] == (
+        original_findings
+    )
+    assert len(invalid_result.risk_findings) == 2
+    assert_safe_audit_failure_log(
+        caplog,
+        boundary="risk_category_validation",
+    )
+
+
+def test_audit_postprocessing_diagnostic_bounds_final_long_location(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    long_location = "LONG_AUDIT_LOCATION_SENTINEL_" * 35
+    assert len(long_location) >= 900
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    pairs = AuditService().semantic_pairs(bundle, records)
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+    invalid_context = InvalidModelPayload(
+        {
+            "rights_or_license_confirmed": True,
+            "source_disclosure_status": "PYDANTIC_INPUT_SENTINEL",
+            "ai_assistance_disclosure_status": "present",
+            "generated_content_label_applicability": "not_applicable",
+            "generated_content_label_status": "not_applicable",
+        }
+    )
+    monkeypatch.setattr(
+        Hy3Service,
+        "_validation_error_diagnostic",
+        staticmethod(lambda _error: (1, "value_error", long_location)),
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(AuditServiceError) as exc_info:
+            AuditService().score(
+                bundle,
+                records,
+                result,
+                invalid_context,
+            )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is False
+    logs = audit_postprocessing_logs(caplog)
+    assert len(logs) == 1
+    fields = audit_log_fields(logs[0])
+    assert set(fields) == SAFE_DIAGNOSTIC_FIELD_NAMES
+    assert fields["operation"] == "audit_postprocessing"
+    assert fields["attempt"] == "0"
+    assert fields["retry_count"] == "0"
+    assert fields["validation_boundary"] == "compliance_context_validation"
+    assert fields["error_code"] == "AUDIT_INCOMPLETE"
+    assert fields["validation_location"].endswith("<truncated>")
+    assert long_location not in logs[0]
+    assert len(logs[0]) <= SAFE_DIAGNOSTIC_MAX_LENGTH
+
+
+def test_audit_diagnostic_classifies_evidence_pair_validation(
+    caplog,
+) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    invalid_record = records[0].model_copy(
+        update={
+            "claim_id": "CLAIM_TEXT_SENTINEL",
+            "quote": "EVIDENCE_TEXT_SENTINEL",
+        }
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(AuditServiceError) as exc_info:
+            AuditService().semantic_pairs(bundle, [invalid_record])
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is False
+    assert_safe_audit_failure_log(
+        caplog,
+        boundary="evidence_pair_validation",
+    )
+
+
+def test_audit_diagnostic_classifies_semantic_pair_validation(
+    caplog,
+) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    pairs = AuditService().semantic_pairs(bundle, records)
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+    invalid = result.model_copy(
+        update={"semantic_judgments": result.semantic_judgments[:-1]}
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(AuditServiceError) as exc_info:
+            AuditService().score(
+                bundle,
+                records,
+                invalid,
+                compliance_context(),
+            )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is True
+    assert_safe_audit_failure_log(
+        caplog,
+        boundary="semantic_pair_validation",
+    )
+
+
+def test_audit_diagnostic_classifies_risk_location_validation(
+    caplog,
+) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    pairs = AuditService().semantic_pairs(bundle, records)
+    result = RecordingDeepAudit(
+        risk_findings=risk_findings_with(
+            "author_impersonation",
+            "detected",
+            locations=[],
+            reason="RAW_RESPONSE_SENTINEL",
+        )
+    ).deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(AuditServiceError) as exc_info:
+            AuditService().score(
+                bundle,
+                records,
+                result,
+                compliance_context(),
+            )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is True
+    assert_safe_audit_failure_log(
+        caplog,
+        boundary="risk_location_validation",
+    )
+
+
+def test_audit_diagnostic_classifies_risk_excerpt_validation(
+    caplog,
+) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    pairs = AuditService().semantic_pairs(bundle, records)
+    result = RecordingDeepAudit(
+        risk_findings=risk_findings_with(
+            "academic_integrity",
+            "detected",
+            locations=[
+                {
+                    "location_type": "sentence",
+                    "sentence_id": "s-001",
+                    "evidence_excerpt": "EVIDENCE_TEXT_SENTINEL",
+                }
+            ],
+        )
+    ).deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(AuditServiceError) as exc_info:
+            AuditService().score(
+                bundle,
+                records,
+                result,
+                compliance_context(),
+            )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is True
+    assert_safe_audit_failure_log(
+        caplog,
+        boundary="risk_excerpt_validation",
+    )
+
+
+def test_audit_diagnostic_classifies_risk_assessment_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    pairs = AuditService().semantic_pairs(bundle, records)
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+    risk_assessment_model = audit_module.RiskAssessment
+
+    def invalid_risk_assessment(**_kwargs):
+        return risk_assessment_model.model_validate({})
+
+    monkeypatch.setattr(
+        audit_module,
+        "RiskAssessment",
+        invalid_risk_assessment,
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(AuditServiceError) as exc_info:
+            AuditService().score(
+                bundle,
+                records,
+                result,
+                compliance_context(),
+            )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is False
+    assert_safe_audit_failure_log(
+        caplog,
+        boundary="risk_assessment_construction",
+        validation_error_count="3",
+        validation_error_type="missing",
+        validation_location="compliance_context",
+    )
+
+
+def test_audit_diagnostic_classifies_dimension_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    pairs = AuditService().semantic_pairs(bundle, records)
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+    monkeypatch.setattr(
+        audit_module,
+        "_build_dimensions",
+        lambda *_args, **_kwargs: ([], {}),
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(AuditServiceError) as exc_info:
+            AuditService().score(
+                bundle,
+                records,
+                result,
+                compliance_context(),
+            )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is False
+    assert_safe_audit_failure_log(
+        caplog,
+        boundary="dimension_construction",
+    )
+
+
+def test_audit_diagnostic_classifies_final_report_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    pairs = AuditService().semantic_pairs(bundle, records)
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=pairs,
+    )
+    audit_report_model = audit_module.AuditReport
+
+    def invalid_audit_report(**_kwargs):
+        return audit_report_model.model_validate({})
+
+    monkeypatch.setattr(
+        audit_module,
+        "AuditReport",
+        invalid_audit_report,
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(AuditServiceError) as exc_info:
+            AuditService().score(
+                bundle,
+                records,
+                result,
+                compliance_context(),
+            )
+
+    assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
+    assert exc_info.value.retryable is False
+    assert_safe_audit_failure_log(
+        caplog,
+        boundary="final_report_construction",
+        validation_error_count="6",
+        validation_error_type="missing",
+        validation_location="audit_status",
+    )

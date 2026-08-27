@@ -14,6 +14,7 @@ from pydantic import TypeAdapter
 from backend.app.hy3_service import (
     DEEP_AUDIT_MAX_COMPLETION_TOKENS,
     GENERATION_MAX_COMPLETION_TOKENS,
+    SAFE_DIAGNOSTIC_MAX_LENGTH,
     Hy3Service,
     Hy3ServiceError,
 )
@@ -250,10 +251,59 @@ def generation_attempt_logs(caplog: Any) -> list[str]:
     ]
 
 
+def deep_audit_attempt_logs(caplog: Any) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("hy3_deep_audit_attempt ")
+    ]
+
+
+def hy3_run_logs(caplog: Any) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("hy3_run ")
+    ]
+
+
 def generation_retry_summary(prompt: str) -> str:
     marker = "\n\n字段错误摘要："
     assert marker in prompt
     return prompt.split(marker, 1)[1]
+
+
+def attempt_log_fields(message: str) -> dict[str, str]:
+    return dict(item.split("=", 1) for item in message.split()[1:])
+
+
+def assert_safe_attempt_log_fields(
+    message: str,
+    *,
+    operation: str,
+    boundary: str,
+    error_code: str,
+) -> None:
+    fields = attempt_log_fields(message)
+    assert set(fields) == {
+        "operation",
+        "attempt",
+        "retry_count",
+        "completion_tokens",
+        "configured_completion_limit",
+        "completion_limit_reached",
+        "finish_reason",
+        "validation_boundary",
+        "error_code",
+        "validation_error_count",
+        "validation_error_type",
+        "validation_location",
+    }
+    assert fields["operation"] == operation
+    assert fields["validation_boundary"] == boundary
+    assert fields["error_code"] == error_code
+    assert SAFE_DIAGNOSTIC_MAX_LENGTH == 512
+    assert len(message) <= SAFE_DIAGNOSTIC_MAX_LENGTH
 
 
 def assert_closed_objects(node: object) -> None:
@@ -690,6 +740,18 @@ def test_live_deep_audit_three_schema_failures_accumulate_usage(caplog) -> None:
     assert "completion_tokens=27" in caplog.text
     assert "total_tokens=68" in caplog.text
     assert all(value not in caplog.text for value in private_values)
+    attempt_logs = deep_audit_attempt_logs(caplog)
+    assert len(attempt_logs) == 3
+    assert [attempt_log_fields(log)["attempt"] for log in attempt_logs] == [
+        "0",
+        "1",
+        "2",
+    ]
+    assert all(
+        attempt_log_fields(log)["retry_count"]
+        == attempt_log_fields(log)["attempt"]
+        for log in attempt_logs
+    )
 
 
 def test_live_deep_audit_provider_failure_preserves_prior_usage(caplog) -> None:
@@ -1429,6 +1491,525 @@ Hy3Service._log_generation_attempt(
         assert sentinel not in output
 
 
+def test_live_generation_provider_failure_uses_closed_attempt_boundary(
+    caplog: Any,
+) -> None:
+    client = FakeClient([OpenAIError("RAW_RESPONSE_SENTINEL")])
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            Hy3Service(
+                settings=live_settings(hy3_max_retries=0),
+                client=client,
+            ).generate(
+                claim_policy="required",
+                paper_metadata={"title": "PROMPT_SENTINEL"},
+                source_blocks=load_source_blocks()[:2],
+            )
+
+    assert exc_info.value.error_code == "HY3_UNAVAILABLE"
+    logs = generation_attempt_logs(caplog)
+    assert len(logs) == 1
+    assert_safe_attempt_log_fields(
+        logs[0],
+        operation="generation",
+        boundary="provider_unavailable",
+        error_code="HY3_UNAVAILABLE",
+    )
+    assert "RAW_RESPONSE_SENTINEL" not in caplog.text
+    assert "PROMPT_SENTINEL" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("variant", "expected_boundary", "expected_error_code"),
+    [
+        ("content_missing", "content_missing", "SCHEMA_INVALID"),
+        ("json_invalid", "json_invalid", "SCHEMA_INVALID"),
+        (
+            "schema_invalid",
+            "deep_audit_schema_invalid",
+            "SCHEMA_INVALID",
+        ),
+        ("semantic_pair", "semantic_pair_invalid", "AUDIT_INCOMPLETE"),
+        (
+            "risk_category",
+            "risk_category_coverage_invalid",
+            "AUDIT_INCOMPLETE",
+        ),
+        ("valid", "none", "NONE"),
+    ],
+)
+def test_live_deep_audit_emits_one_closed_diagnostic_per_attempt(
+    variant: str,
+    expected_boundary: str,
+    expected_error_code: str,
+    caplog: Any,
+) -> None:
+    payload = json.loads(valid_deep_audit_json())
+    if variant == "content_missing":
+        raw_response: Any = None
+    elif variant == "json_invalid":
+        raw_response = "RAW_RESPONSE_SENTINEL"
+    elif variant == "schema_invalid":
+        payload.pop("risk_findings")
+        raw_response = json.dumps(payload)
+    elif variant == "semantic_pair":
+        payload["semantic_judgments"][0]["block_id"] = "CLAIM_TEXT_SENTINEL"
+        raw_response = json.dumps(payload)
+    elif variant == "risk_category":
+        payload["risk_findings"] = payload["risk_findings"][:2]
+        raw_response = json.dumps(payload)
+    else:
+        raw_response = json.dumps(payload)
+    client = FakeClient(
+        [completion_response(raw_response, (11, 7, 18), finish_reason="stop")]
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        if expected_error_code == "NONE":
+            result = Hy3Service(
+                settings=live_settings(hy3_max_retries=0),
+                client=client,
+            ).deep_audit(
+                document=generated_bundle().document,
+                claim_evidence_pairs=verified_claim_evidence_pairs(),
+            )
+            assert isinstance(result, DeepAuditResult)
+        else:
+            with pytest.raises(Hy3ServiceError) as exc_info:
+                Hy3Service(
+                    settings=live_settings(hy3_max_retries=0),
+                    client=client,
+                ).deep_audit(
+                    document=generated_bundle().document,
+                    claim_evidence_pairs=verified_claim_evidence_pairs(),
+                )
+            assert exc_info.value.error_code == expected_error_code
+
+    logs = deep_audit_attempt_logs(caplog)
+    assert len(logs) == 1
+    assert_safe_attempt_log_fields(
+        logs[0],
+        operation="deep_audit",
+        boundary=expected_boundary,
+        error_code=expected_error_code,
+    )
+    assert "configured_completion_limit=4096" in logs[0]
+    assert "attempt=0" in logs[0]
+    assert "retry_count=0" in logs[0]
+    fields = attempt_log_fields(logs[0])
+    if variant == "json_invalid":
+        assert fields["validation_error_count"] == "1"
+        assert fields["validation_error_type"] == "json_invalid"
+        assert fields["validation_location"] == "$"
+    elif variant == "schema_invalid":
+        assert fields["validation_error_count"] == "1"
+        assert fields["validation_error_type"] == "missing"
+        assert fields["validation_location"] == "risk_findings"
+    elif variant in {"semantic_pair", "risk_category", "content_missing"}:
+        assert fields["validation_error_count"] == "0"
+        assert fields["validation_error_type"] == "none"
+        assert fields["validation_location"] == "none"
+    for sentinel in (
+        "RAW_RESPONSE_SENTINEL",
+        "CLAIM_TEXT_SENTINEL",
+        "PROMPT_SENTINEL",
+        "SOURCE_BLOCK_SENTINEL",
+        "API_KEY_SENTINEL",
+    ):
+        assert sentinel not in caplog.text
+
+
+def test_live_deep_audit_provider_failure_uses_closed_attempt_boundary(
+    caplog: Any,
+) -> None:
+    client = FakeClient([OpenAIError("RAW_RESPONSE_SENTINEL")])
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            Hy3Service(
+                settings=live_settings(hy3_max_retries=0),
+                client=client,
+            ).deep_audit(
+                document=generated_bundle().document,
+                claim_evidence_pairs=verified_claim_evidence_pairs(),
+            )
+
+    assert exc_info.value.error_code == "HY3_UNAVAILABLE"
+    logs = deep_audit_attempt_logs(caplog)
+    assert len(logs) == 1
+    assert_safe_attempt_log_fields(
+        logs[0],
+        operation="deep_audit",
+        boundary="provider_unavailable",
+        error_code="HY3_UNAVAILABLE",
+    )
+    assert "RAW_RESPONSE_SENTINEL" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("variant", "expected_type", "expected_location"),
+    [
+        ("extra", "extra_forbidden", "<extra_field>"),
+        ("unknown_type", "other_validation_error", "document.title"),
+    ],
+)
+def test_generation_diagnostic_redacts_validation_type_and_location(
+    variant: str,
+    expected_type: str,
+    expected_location: str,
+    caplog: Any,
+) -> None:
+    payload = json.loads(valid_generation_json())
+    if variant == "extra":
+        payload["PYDANTIC_RAW_FIELD_SENTINEL"] = "RAW_RESPONSE_SENTINEL"
+    else:
+        payload["document"]["title"] = ""
+    client = FakeClient(
+        [
+            completion_response(
+                json.dumps(payload),
+                (11, 7, 18),
+                finish_reason="stop",
+            )
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(Hy3ServiceError):
+            Hy3Service(
+                settings=live_settings(hy3_max_retries=0),
+                client=client,
+            ).generate(
+                claim_policy="required",
+                paper_metadata={"title": "PROMPT_SENTINEL"},
+                source_blocks=load_source_blocks()[:2],
+            )
+
+    logs = generation_attempt_logs(caplog)
+    assert len(logs) == 1
+    fields = attempt_log_fields(logs[0])
+    assert fields["validation_error_count"] == "1"
+    assert fields["validation_error_type"] == expected_type
+    assert fields["validation_location"] == expected_location
+    for sentinel in (
+        "PYDANTIC_RAW_FIELD_SENTINEL",
+        "RAW_RESPONSE_SENTINEL",
+        "PROMPT_SENTINEL",
+    ):
+        assert sentinel not in caplog.text
+
+
+def test_generation_diagnostic_bounds_final_rendered_long_location(
+    caplog: Any,
+) -> None:
+    long_location = "LONG_GENERATION_LOCATION_SENTINEL_" * 30
+    assert len(long_location) >= 900
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        Hy3Service._log_generation_attempt(
+            attempt=2,
+            completion_tokens=16384,
+            finish_reason="length",
+            validation_boundary="json_invalid",
+            error_code="SCHEMA_INVALID",
+            validation_error_count=1,
+            validation_error_type="json_invalid",
+            validation_location=long_location,
+        )
+
+    logs = generation_attempt_logs(caplog)
+    assert len(logs) == 1
+    assert_safe_attempt_log_fields(
+        logs[0],
+        operation="generation",
+        boundary="json_invalid",
+        error_code="SCHEMA_INVALID",
+    )
+    fields = attempt_log_fields(logs[0])
+    assert fields["attempt"] == "2"
+    assert fields["retry_count"] == "2"
+    assert fields["validation_location"].endswith("<truncated>")
+    assert long_location not in logs[0]
+    assert len(logs[0]) <= SAFE_DIAGNOSTIC_MAX_LENGTH
+
+
+def test_deep_audit_diagnostic_bounds_final_rendered_long_location(
+    caplog: Any,
+) -> None:
+    long_location = "LONG_DEEP_AUDIT_LOCATION_SENTINEL_" * 30
+    assert len(long_location) >= 900
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        Hy3Service._log_deep_audit_attempt(
+            attempt=2,
+            completion_tokens=4096,
+            finish_reason="length",
+            validation_boundary="deep_audit_schema_invalid",
+            error_code="SCHEMA_INVALID",
+            validation_error_count=1,
+            validation_error_type="other_validation_error",
+            validation_location=long_location,
+        )
+
+    logs = deep_audit_attempt_logs(caplog)
+    assert len(logs) == 1
+    assert_safe_attempt_log_fields(
+        logs[0],
+        operation="deep_audit",
+        boundary="deep_audit_schema_invalid",
+        error_code="SCHEMA_INVALID",
+    )
+    fields = attempt_log_fields(logs[0])
+    assert fields["attempt"] == "2"
+    assert fields["retry_count"] == "2"
+    assert fields["validation_location"].endswith("<truncated>")
+    assert long_location not in logs[0]
+    assert len(logs[0]) <= SAFE_DIAGNOSTIC_MAX_LENGTH
+
+
+def test_live_generation_huge_usage_does_not_mask_valid_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: Any,
+) -> None:
+    huge_count = 10**800
+    huge_count_text = str(huge_count)
+    client = FakeClient(
+        [
+            completion_response(
+                valid_generation_json(),
+                (11, huge_count, huge_count + 11),
+                finish_reason="length",
+            )
+        ]
+    )
+    service = Hy3Service(settings=live_settings(), client=client)
+    accepted: list[GeneratedBundle] = []
+    original_validator = service._validate_generated_bundle
+
+    def track_valid_bundle(
+        raw_response: Any,
+        claim_policy: str,
+    ) -> GeneratedBundle:
+        bundle = original_validator(raw_response, claim_policy)  # type: ignore[arg-type]
+        accepted.append(bundle)
+        return bundle
+
+    monkeypatch.setattr(service, "_validate_generated_bundle", track_valid_bundle)
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        result = service.generate(
+            claim_policy="required",
+            paper_metadata={"title": "PaperLens synthetic fixture"},
+            source_blocks=load_source_blocks()[:2],
+        )
+
+    assert result is accepted[0]
+    attempt_logs = generation_attempt_logs(caplog)
+    assert len(attempt_logs) == 1
+    assert_safe_attempt_log_fields(
+        attempt_logs[0],
+        operation="generation",
+        boundary="none",
+        error_code="NONE",
+    )
+    assert attempt_log_fields(attempt_logs[0])["completion_tokens"] == "null"
+    run_logs = hy3_run_logs(caplog)
+    assert len(run_logs) == 1
+    assert len(run_logs[0]) <= SAFE_DIAGNOSTIC_MAX_LENGTH
+    assert huge_count_text not in caplog.text
+
+
+def test_live_generation_huge_usage_preserves_schema_error(caplog: Any) -> None:
+    huge_count = 10**800
+    huge_count_text = str(huge_count)
+    client = FakeClient(
+        [
+            completion_response(
+                "RAW_JSON_INVALID_SENTINEL",
+                (11, huge_count, huge_count + 11),
+                finish_reason="length",
+            )
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            Hy3Service(
+                settings=live_settings(hy3_max_retries=0),
+                client=client,
+            ).generate(
+                claim_policy="required",
+                paper_metadata={"title": "PaperLens synthetic fixture"},
+                source_blocks=load_source_blocks()[:2],
+            )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retryable is False
+    attempt_logs = generation_attempt_logs(caplog)
+    assert len(attempt_logs) == 1
+    assert_safe_attempt_log_fields(
+        attempt_logs[0],
+        operation="generation",
+        boundary="json_invalid",
+        error_code="SCHEMA_INVALID",
+    )
+    assert attempt_log_fields(attempt_logs[0])["completion_tokens"] == "null"
+    run_logs = hy3_run_logs(caplog)
+    assert len(run_logs) == 1
+    assert len(run_logs[0]) <= SAFE_DIAGNOSTIC_MAX_LENGTH
+    assert huge_count_text not in caplog.text
+    assert "RAW_JSON_INVALID_SENTINEL" not in caplog.text
+
+
+def test_live_deep_audit_huge_usage_does_not_mask_valid_result(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: Any,
+) -> None:
+    huge_count = 10**800
+    huge_count_text = str(huge_count)
+    client = FakeClient(
+        [
+            completion_response(
+                valid_deep_audit_json(),
+                (17, huge_count, huge_count + 17),
+                finish_reason="length",
+            )
+        ]
+    )
+    service = Hy3Service(settings=live_settings(), client=client)
+    accepted: list[DeepAuditResult] = []
+    original_validator = service._validate_deep_audit_result
+
+    def track_valid_result(
+        raw_response: Any,
+        expected_pairs: set[tuple[str, str]],
+    ) -> DeepAuditResult:
+        result = original_validator(raw_response, expected_pairs)
+        accepted.append(result)
+        return result
+
+    monkeypatch.setattr(service, "_validate_deep_audit_result", track_valid_result)
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        result = service.deep_audit(
+            document=generated_bundle().document,
+            claim_evidence_pairs=verified_claim_evidence_pairs(),
+        )
+
+    assert result is accepted[0]
+    attempt_logs = deep_audit_attempt_logs(caplog)
+    assert len(attempt_logs) == 1
+    assert_safe_attempt_log_fields(
+        attempt_logs[0],
+        operation="deep_audit",
+        boundary="none",
+        error_code="NONE",
+    )
+    assert attempt_log_fields(attempt_logs[0])["completion_tokens"] == "null"
+    run_logs = hy3_run_logs(caplog)
+    assert len(run_logs) == 1
+    assert len(run_logs[0]) <= SAFE_DIAGNOSTIC_MAX_LENGTH
+    assert huge_count_text not in caplog.text
+
+
+def test_live_deep_audit_huge_usage_preserves_schema_error(caplog: Any) -> None:
+    huge_count = 10**800
+    huge_count_text = str(huge_count)
+    client = FakeClient(
+        [
+            completion_response(
+                "RAW_DEEP_AUDIT_JSON_INVALID_SENTINEL",
+                (17, huge_count, huge_count + 17),
+                finish_reason="length",
+            )
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            Hy3Service(
+                settings=live_settings(hy3_max_retries=0),
+                client=client,
+            ).deep_audit(
+                document=generated_bundle().document,
+                claim_evidence_pairs=verified_claim_evidence_pairs(),
+            )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retryable is False
+    attempt_logs = deep_audit_attempt_logs(caplog)
+    assert len(attempt_logs) == 1
+    assert_safe_attempt_log_fields(
+        attempt_logs[0],
+        operation="deep_audit",
+        boundary="json_invalid",
+        error_code="SCHEMA_INVALID",
+    )
+    assert attempt_log_fields(attempt_logs[0])["completion_tokens"] == "null"
+    run_logs = hy3_run_logs(caplog)
+    assert len(run_logs) == 1
+    assert len(run_logs[0]) <= SAFE_DIAGNOSTIC_MAX_LENGTH
+    assert huge_count_text not in caplog.text
+    assert "RAW_DEEP_AUDIT_JSON_INVALID_SENTINEL" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("operation", "configured_limit"),
+    [
+        ("generation", GENERATION_MAX_COMPLETION_TOKENS),
+        ("deep_audit", DEEP_AUDIT_MAX_COMPLETION_TOKENS),
+    ],
+)
+@pytest.mark.parametrize("unsafe_number", [True, -1, 10**800])
+def test_attempt_diagnostic_normalizes_unsafe_numbers_without_throwing(
+    operation: str,
+    configured_limit: int,
+    unsafe_number: Any,
+    caplog: Any,
+) -> None:
+    long_location = "DIRECT_NUMERIC_DIAGNOSTIC_SENTINEL_" * 30
+    assert len(long_location) >= 900
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        if operation == "generation":
+            Hy3Service._log_generation_attempt(
+                attempt=unsafe_number,
+                completion_tokens=unsafe_number,
+                finish_reason="length",
+                validation_boundary="json_invalid",
+                error_code="SCHEMA_INVALID",
+                validation_error_count=unsafe_number,
+                validation_error_type="json_invalid",
+                validation_location=long_location,
+            )
+            logs = generation_attempt_logs(caplog)
+        else:
+            Hy3Service._log_deep_audit_attempt(
+                attempt=unsafe_number,
+                completion_tokens=unsafe_number,
+                finish_reason="length",
+                validation_boundary="deep_audit_schema_invalid",
+                error_code="SCHEMA_INVALID",
+                validation_error_count=unsafe_number,
+                validation_error_type="other_validation_error",
+                validation_location=long_location,
+            )
+            logs = deep_audit_attempt_logs(caplog)
+
+    assert len(logs) == 1
+    fields = attempt_log_fields(logs[0])
+    assert fields["operation"] == operation
+    assert fields["attempt"] == "null"
+    assert fields["retry_count"] == "null"
+    assert fields["completion_tokens"] == "null"
+    assert fields["configured_completion_limit"] == str(configured_limit)
+    assert fields["validation_error_count"] == "null"
+    assert fields["validation_location"].endswith("<truncated>")
+    assert long_location not in logs[0]
+    assert len(logs[0]) <= SAFE_DIAGNOSTIC_MAX_LENGTH
+
+
 @pytest.mark.parametrize(
     ("finish_reason", "completion_tokens", "limit_reached"),
     [
@@ -1494,7 +2075,7 @@ def test_live_generation_logs_safe_finish_and_per_attempt_completion_limit(
         (
             generation_json_with_claims(present=False),
             "required",
-            "claim_policy_mismatch",
+            "claim_policy_invalid",
             "AUDIT_INCOMPLETE",
         ),
     ],
@@ -1564,7 +2145,7 @@ def test_live_generation_logs_missing_content_boundary_safely(caplog: Any) -> No
     logs = generation_attempt_logs(caplog)
     assert len(logs) == 3
     assert all("finish_reason=missing" in log for log in logs)
-    assert all("validation_boundary=response_content_missing" in log for log in logs)
+    assert all("validation_boundary=content_missing" in log for log in logs)
 
 
 def test_generation_attempt_logs_contain_only_safe_fixed_metadata(caplog: Any) -> None:
@@ -1620,6 +2201,9 @@ def test_generation_attempt_logs_contain_only_safe_fixed_metadata(caplog: Any) -
         "validation_boundary",
         "error_code",
         "retry_count",
+        "validation_error_count",
+        "validation_error_type",
+        "validation_location",
     }
     finish_reasons = {
         "stop",
@@ -1630,12 +2214,12 @@ def test_generation_attempt_logs_contain_only_safe_fixed_metadata(caplog: Any) -
         "unknown",
     }
     boundaries = {
-        "response_content_missing",
+        "content_missing",
         "json_invalid",
         "generated_bundle_schema_invalid",
-        "claim_policy_mismatch",
+        "claim_policy_invalid",
+        "provider_unavailable",
         "none",
-        "unknown",
     }
     for log in logs:
         fields = dict(item.split("=", 1) for item in log.split()[1:])
@@ -1658,7 +2242,7 @@ def test_generation_attempt_logs_contain_only_safe_fixed_metadata(caplog: Any) -
     assert "completion_tokens=null" in logs[0]
     assert "validation_boundary=json_invalid" in logs[0]
     assert "validation_boundary=generated_bundle_schema_invalid" in logs[1]
-    assert "validation_boundary=claim_policy_mismatch" in logs[2]
+    assert "validation_boundary=claim_policy_invalid" in logs[2]
     for sentinel in (
         "RAW_RESPONSE_SENTINEL",
         "PROMPT_SENTINEL",
