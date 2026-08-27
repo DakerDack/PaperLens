@@ -202,6 +202,22 @@ def valid_deep_audit_json() -> str:
     return (FIXTURES / "deep_audit_valid.json").read_text(encoding="utf-8")
 
 
+def risk_only_deep_audit_with_extra_finding_field(
+    *,
+    field_name: str,
+    field_value: str,
+) -> tuple[str, str]:
+    valid_payload = json.loads(valid_deep_audit_json())
+    valid_payload["semantic_judgments"] = []
+    invalid_payload = json.loads(json.dumps(valid_payload))
+    for finding in invalid_payload["risk_findings"]:
+        finding[field_name] = field_value
+    return (
+        json.dumps(invalid_payload, ensure_ascii=False),
+        json.dumps(valid_payload, ensure_ascii=False),
+    )
+
+
 def deep_audit_with_risk_category_coverage(variant: str) -> str:
     payload = json.loads(valid_deep_audit_json())
     findings = payload["risk_findings"]
@@ -324,7 +340,7 @@ def test_generation_prompt_centralizes_stage_two_contract() -> None:
         source_blocks_json='[{"block_id":"p01-b001","text":"Evidence"}]',
     )
 
-    assert GENERATION_PROMPT_VERSION == "gen-v3"
+    assert GENERATION_PROMPT_VERSION == "gen-v4"
     assert GENERATION_SCHEMA_VERSION == "generated-bundle-v1"
     assert GENERATION_SCHEMA_NAME == "paperlens_generated_bundle_v1"
     assert "只能依据输入中的 SourceBlock" in COMMON_SYSTEM_PROMPT
@@ -373,6 +389,46 @@ def test_deep_audit_prompt_centralizes_v2_document_contract() -> None:
     assert "页码" in prompt and "bbox" in prompt
     assert "不得补充给定 evidence 之外的知识或证据" in prompt
     assert '"claim_id":"c-001"' in prompt
+
+
+def test_deep_audit_prompt_makes_risk_only_output_shape_explicit() -> None:
+    prompt = render_deep_audit_prompt(
+        content_draft_json='{"title":"Synthetic","sections":[]}',
+        verified_claim_evidence_pairs_json="[]",
+    )
+
+    assert "items 为空时，semantic_judgments 必须为空数组" in prompt
+    assert "risk_findings 必须仍为长度恰好为 3 的数组" in prompt
+    ordered_categories = [
+        "risk_findings[0].category 必须为 sensitive_information",
+        "risk_findings[1].category 必须为 author_impersonation",
+        "risk_findings[2].category 必须为 academic_integrity",
+    ]
+    assert all(rule in prompt for rule in ordered_categories)
+    assert [prompt.index(rule) for rule in ordered_categories] == sorted(
+        prompt.index(rule) for rule in ordered_categories
+    )
+    assert "禁止缺失、重复、增加类别或返回空 risk_findings" in prompt
+
+
+def test_deep_audit_prompt_makes_risk_finding_location_nesting_explicit() -> None:
+    prompt = render_deep_audit_prompt(
+        content_draft_json='{"title":"Synthetic","sections":[]}',
+        verified_claim_evidence_pairs_json="[]",
+    )
+
+    assert (
+        "RiskFinding 对象只能且必须包含 category、status、locations、reason、remediation"
+        in prompt
+    )
+    assert (
+        "RiskLocation 对象只能且必须包含 location_type、sentence_id、evidence_excerpt"
+        in prompt
+    )
+    assert "evidence_excerpt 只能存在于 locations 数组的 RiskLocation 对象中" in prompt
+    assert "evidence_excerpt 不得成为 RiskFinding 顶层字段" in prompt
+    assert "reason 和 remediation 只属于 RiskFinding，不属于 RiskLocation" in prompt
+    assert "禁止返回任何未列出的键" in prompt
 
 
 def test_mock_deep_audit_returns_valid_deep_audit_result() -> None:
@@ -472,6 +528,41 @@ def test_live_deep_audit_uses_one_strict_batch_request() -> None:
     assert "overall_score" not in user_prompt
 
 
+def test_deep_audit_response_format_requires_each_risk_category_exactly_once() -> None:
+    response_format = Hy3Service._deep_audit_response_format()
+    schema = response_format["json_schema"]["schema"]
+    risk_findings = schema["properties"]["risk_findings"]
+
+    assert risk_findings["minItems"] == 3
+    assert risk_findings["maxItems"] == 3
+    coverage_rules = risk_findings["allOf"]
+    assert len(coverage_rules) == 3
+
+    constrained_categories = set()
+    for rule in coverage_rules:
+        assert rule["minContains"] == 1
+        assert rule["maxContains"] == 1
+        constrained_finding = rule["contains"]
+        assert constrained_finding["type"] == "object"
+        assert constrained_finding["additionalProperties"] is False
+        assert set(constrained_finding["required"]) == {
+            "category",
+            "status",
+            "reason",
+            "locations",
+            "remediation",
+        }
+        constrained_categories.add(
+            constrained_finding["properties"]["category"]["const"]
+        )
+
+    assert constrained_categories == {
+        "sensitive_information",
+        "author_impersonation",
+        "academic_integrity",
+    }
+
+
 def test_live_deep_audit_schema_error_retries_and_logs_safely(caplog) -> None:
     invalid = "DEEP_AUDIT_PRIVATE_INVALID_RESPONSE"
     client = FakeClient([invalid, valid_deep_audit_json()])
@@ -502,6 +593,144 @@ def test_live_deep_audit_schema_error_retries_and_logs_safely(caplog) -> None:
         not in caplog.text
     )
     assert "unit-test-key" not in caplog.text
+
+
+def test_live_deep_audit_extra_field_uses_actionable_safe_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: Any,
+) -> None:
+    field_name = "RISK_FINDING_DYNAMIC_FIELD_SENTINEL"
+    field_value = "RISK_FINDING_DYNAMIC_VALUE_SENTINEL"
+    invalid_raw, valid_raw = risk_only_deep_audit_with_extra_finding_field(
+        field_name=field_name,
+        field_value=field_value,
+    )
+    client = FakeClient([invalid_raw, valid_raw])
+    service = Hy3Service(settings=live_settings(), client=client)
+    validation_inputs: list[Any] = []
+    rejected_summaries: list[str] = []
+    original_validate = service._validate_deep_audit_result
+
+    def track_validation(
+        raw_response: Any,
+        expected_pairs: set[tuple[str, str]],
+    ) -> DeepAuditResult:
+        validation_inputs.append(raw_response)
+        try:
+            return original_validate(raw_response, expected_pairs)
+        except Hy3ServiceError as exc:
+            rejected_summaries.append(exc.field_error_summary or "")
+            raise
+
+    monkeypatch.setattr(service, "_validate_deep_audit_result", track_validation)
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        result = service.deep_audit(
+            document=generated_bundle().document,
+            claim_evidence_pairs=[],
+        )
+
+    expected_message = (
+        "RiskFinding objects may contain only category, status, locations, "
+        "reason, and remediation. RiskLocation objects may contain only "
+        "location_type, sentence_id, and evidence_excerpt; evidence_excerpt "
+        "must appear only inside locations."
+    )
+    assert validation_inputs == [invalid_raw, valid_raw]
+    assert len(rejected_summaries) == 1
+    safe_summary = rejected_summaries[0]
+    assert expected_message in safe_summary
+    assert all(
+        f"risk_findings.{index}.<extra_field> [extra_forbidden]" in safe_summary
+        for index in range(3)
+    )
+    assert result == DeepAuditResult.model_validate_json(valid_raw)
+    assert len(client.completions.calls) == 2
+    retry_prompt = client.completions.calls[1]["messages"][1]["content"]
+    assert "字段错误摘要：" in retry_prompt
+    assert "risk_findings.0.<extra_field>" in retry_prompt
+    assert expected_message in retry_prompt
+    assert (
+        Hy3Service._safe_validation_error_message(
+            "extra_forbidden",
+            "risk_findings.0.locations.0.<extra_field>",
+        )
+        == "Extra field is not permitted."
+    )
+    assert "retries=1" in caplog.text
+    for sentinel in (field_name, field_value):
+        assert sentinel not in retry_prompt
+        assert sentinel not in safe_summary
+        assert sentinel not in caplog.text
+
+
+def test_live_deep_audit_extra_field_exhaustion_stays_failed_without_mock(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: Any,
+) -> None:
+    field_name = "RISK_FINDING_EXHAUSTION_FIELD_SENTINEL"
+    field_value = "RISK_FINDING_EXHAUSTION_VALUE_SENTINEL"
+    invalid_raw, _ = risk_only_deep_audit_with_extra_finding_field(
+        field_name=field_name,
+        field_value=field_value,
+    )
+    client = FakeClient([invalid_raw, invalid_raw, invalid_raw])
+    service = Hy3Service(settings=live_settings(), client=client)
+    monkeypatch.setattr(
+        service,
+        "_load_mock_deep_audit_response",
+        lambda: pytest.fail("Live schema failure must not load Mock data"),
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            service.deep_audit(
+                document=generated_bundle().document,
+                claim_evidence_pairs=[],
+            )
+
+    error = exc_info.value
+    assert error.error_code == "SCHEMA_INVALID"
+    assert error.validation_boundary == "deep_audit_schema_invalid"
+    assert error.validation_error_count == 3
+    assert error.validation_error_type == "extra_forbidden"
+    assert error.validation_location == "risk_findings.0.<extra_field>"
+    assert error.retries == 2
+    assert len(client.completions.calls) == 3
+    assert client.completions.responses == []
+    assert all(
+        request["max_completion_tokens"] == 4096
+        for request in client.completions.calls
+    )
+    assert "risk_findings.0.<extra_field>" in (error.field_error_summary or "")
+    attempts = deep_audit_attempt_logs(caplog)
+    assert len(attempts) == 3
+    assert all(
+        attempt_log_fields(message)["validation_boundary"]
+        == "deep_audit_schema_invalid"
+        for message in attempts
+    )
+    assert all(
+        attempt_log_fields(message)["validation_error_type"]
+        == "extra_forbidden"
+        for message in attempts
+    )
+    assert all(
+        attempt_log_fields(message)["validation_location"]
+        == "risk_findings.0.<extra_field>"
+        for message in attempts
+    )
+    for request in client.completions.calls[1:]:
+        retry_prompt = request["messages"][1]["content"]
+        assert "risk_findings.0.<extra_field>" in retry_prompt
+    for sentinel in (field_name, field_value):
+        assert sentinel not in str(error)
+        assert sentinel not in (error.field_error_summary or "")
+        assert sentinel not in caplog.text
+        assert all(
+            sentinel not in request["messages"][1]["content"]
+            for request in client.completions.calls
+        )
 
 
 def test_live_deep_audit_retries_schema_valid_semantic_pair_mismatch() -> None:
@@ -581,6 +810,7 @@ def test_live_deep_audit_retries_invalid_risk_category_coverage(
 
 
 def test_live_risk_only_deep_audit_retries_invalid_categories_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
     caplog,
 ) -> None:
     invalid = json.loads(deep_audit_with_risk_category_coverage("missing"))
@@ -593,13 +823,27 @@ def test_live_risk_only_deep_audit_retries_invalid_categories_then_succeeds(
             completion_response(json.dumps(valid), (13, 9, 22)),
         ]
     )
+    service = Hy3Service(settings=live_settings(), client=client)
+    accepted_results: list[DeepAuditResult] = []
+    original_validate = service._validate_deep_audit_result
+
+    def track_valid_result(
+        raw_response: Any,
+        expected_pairs: set[tuple[str, str]],
+    ) -> DeepAuditResult:
+        result = original_validate(raw_response, expected_pairs)
+        accepted_results.append(result)
+        return result
+
+    monkeypatch.setattr(service, "_validate_deep_audit_result", track_valid_result)
 
     with caplog.at_level(logging.INFO, logger="uvicorn.error"):
-        result = Hy3Service(settings=live_settings(), client=client).deep_audit(
+        result = service.deep_audit(
             document=generated_bundle().document,
             claim_evidence_pairs=[],
         )
 
+    assert result is accepted_results[-1]
     assert result.semantic_judgments == []
     categories = [finding.category.value for finding in result.risk_findings]
     assert len(categories) == 3
@@ -1181,6 +1425,114 @@ def test_live_generation_cross_attempt_retry_exhaustion_preserves_last_error(
     assert "last_unexpected" not in (exc_info.value.field_error_summary or "")
     assert "FIRST_RAW_SENTINEL" not in (exc_info.value.field_error_summary or "")
     assert "LAST_RAW_SENTINEL" not in (exc_info.value.field_error_summary or "")
+
+
+def test_live_generation_b_only_cross_field_sequence_uses_actionable_safe_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: Any,
+) -> None:
+    document_invalid = json.loads(valid_generation_json())
+    document_invalid["document"]["sections"][-1]["section_id"] = "limitations"
+    document_invalid["claims"][0]["candidate_block_ids"] = []
+    document_invalid["claims"][1]["candidate_quote"] = ""
+
+    claim_invalid = json.loads(valid_generation_json())
+    base_claim = claim_invalid["claims"][0]
+    claim_invalid["claims"] = []
+    for index in range(47):
+        claim = dict(base_claim)
+        claim["claim_id"] = f"c-live-{index:03d}"
+        claim_invalid["claims"].append(claim)
+    claim_invalid["claims"][45]["candidate_block_ids"] = []
+    claim_invalid["claims"][46]["candidate_quote"] = ""
+
+    client = FakeClient(
+        [
+            completion_response(
+                json.dumps(document_invalid),
+                (100, 13700, 13800),
+                finish_reason="stop",
+            ),
+            completion_response(
+                json.dumps(claim_invalid),
+                (100, 10228, 10328),
+                finish_reason="stop",
+            ),
+            completion_response(
+                '{"document":',
+                (100, 16384, 16484),
+                finish_reason="length",
+            ),
+        ]
+    )
+    service = Hy3Service(settings=live_settings(), client=client)
+    monkeypatch.setattr(
+        service,
+        "_load_mock_response",
+        lambda: pytest.fail("Live retry exhaustion must not load Mock data"),
+    )
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            service.generate(
+                claim_policy="required",
+                paper_metadata={"title": "Synthetic"},
+                source_blocks=load_source_blocks()[:2],
+            )
+
+    assert GENERATION_PROMPT_VERSION == "gen-v4"
+    assert len(client.completions.calls) == 3
+    assert client.completions.responses == []
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.validation_boundary == "json_invalid"
+    assert exc_info.value.retries == 2
+
+    prompts = [call["messages"][1]["content"] for call in client.completions.calls]
+    first_retry = generation_retry_summary(prompts[1])
+    last_retry = generation_retry_summary(prompts[2])
+    assert "attempt=0" in first_retry
+    assert "document [value_error]" in first_retry
+    assert "each required section exactly once" in first_retry
+    assert "globally unique sentence identifiers" in first_retry
+    assert "attempt=0" in last_retry
+    assert "attempt=1" in last_retry
+    assert last_retry.index("attempt=0") < last_retry.index("attempt=1")
+    assert "claims.45 [value_error]" in last_retry
+    assert "Auditable claims require 1 to 3 candidate block identifiers" in last_retry
+    assert "candidate quotes must be null or non-empty" in last_retry
+
+    attempts = generation_attempt_logs(caplog)
+    assert len(attempts) == 3
+    fields = [attempt_log_fields(message) for message in attempts]
+    assert [item["attempt"] for item in fields] == ["0", "1", "2"]
+    assert [item["completion_tokens"] for item in fields] == ["13700", "10228", "16384"]
+    assert [item["finish_reason"] for item in fields] == ["stop", "stop", "length"]
+    assert [item["completion_limit_reached"] for item in fields] == [
+        "false",
+        "false",
+        "true",
+    ]
+    assert [item["validation_boundary"] for item in fields] == [
+        "generated_bundle_schema_invalid",
+        "generated_bundle_schema_invalid",
+        "json_invalid",
+    ]
+    assert [item["error_code"] for item in fields] == [
+        "SCHEMA_INVALID",
+        "SCHEMA_INVALID",
+        "SCHEMA_INVALID",
+    ]
+    assert [item["validation_error_count"] for item in fields] == ["3", "2", "1"]
+    assert [item["validation_error_type"] for item in fields] == [
+        "value_error",
+        "value_error",
+        "json_invalid",
+    ]
+    assert [item["validation_location"] for item in fields] == [
+        "document",
+        "claims.45",
+        "$",
+    ]
 
 
 def test_generated_bundle_validation_summary_excludes_dynamic_validator_value() -> None:
@@ -2318,7 +2670,7 @@ def test_live_non_json_fails_schema_after_two_retries(caplog) -> None:
     assert "prompt_tokens=303" in caplog.text
     assert "completion_tokens=159" in caplog.text
     assert "total_tokens=462" in caplog.text
-    assert "prompt_version=gen-v3" in caplog.text
+    assert "prompt_version=gen-v4" in caplog.text
     assert "schema_version=generated-bundle-v1" in caplog.text
     assert "retries=2" in caplog.text
     for request in client.completions.calls[1:]:
@@ -2479,7 +2831,7 @@ def test_live_run_log_contains_metadata_but_not_key_or_source_text(caplog) -> No
         )
 
     assert "model=hy3" in caplog.text
-    assert "prompt_version=gen-v3" in caplog.text
+    assert "prompt_version=gen-v4" in caplog.text
     assert "schema_version=generated-bundle-v1" in caplog.text
     assert "temperature=0" in caplog.text
     assert "max_completion_tokens=16384" in caplog.text

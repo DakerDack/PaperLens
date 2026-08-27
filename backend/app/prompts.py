@@ -1,7 +1,7 @@
 from backend.app.models import ClaimPolicy
 
 
-GENERATION_PROMPT_VERSION = "gen-v3"
+GENERATION_PROMPT_VERSION = "gen-v4"
 GENERATION_SCHEMA_VERSION = "generated-bundle-v1"
 GENERATION_SCHEMA_NAME = "paperlens_generated_bundle_v1"
 DEEP_AUDIT_PROMPT_VERSION = "audit-v2"
@@ -40,12 +40,13 @@ document.sections 固定为以下五区，且每个 section_id 恰好出现一�
 - limitations：限制条件
 - plain_explanation：通俗解释
 
-每句话必须有稳定且唯一的 sentence_id。
+所有五区中的 sentence_id 必须全局唯一，不得在不同 section 中重复。
 每条 AtomicClaim 只表达一个可独立判断真假的事实，必须关联存在的 sentence_id，并使用唯一 claim_id。
 主张中的数字、样本、条件、比较对象和结论范围不得省略。
-candidate_block_ids 只能从输入选择，最多 3 个；它们只是尚未核验的候选来源。
-candidate_quote 必须复制候选来源块中的连续文本，或只对空白做规范化；它只是候选引文，不是已验证证据。
-建议、修辞和主观说明标记为 non_auditable；证据不足时使用空候选，不得猜测。
+candidate_block_ids 只能从输入选择，最多 3 个；auditability=auditable 时必须包含 1 至 3 个候选。
+candidate_quote 必须为 null 或非空字符串；非空时必须复制候选来源块中的连续文本，或只对空白做规范化；它只是候选引文，不是已验证证据。
+证据不足并使用空候选时，不得标记为 auditable；应根据主张性质标记为 needs_review 或 non_auditable，不得猜测。
+建议、修辞和主观说明标记为 non_auditable。
 不得生成页码、bbox、总分或合格结论。
 
 输出：严格符合 GeneratedBundle JSON Schema 的单个 JSON 对象。"""
@@ -63,9 +64,20 @@ DEEP_AUDIT_USER_PROMPT_TEMPLATE = """任务一：逐条判断 claim 是否被给
 证据不能直接支持时选择 insufficient，不得依靠常识补足。
 不得补充给定 evidence 之外的知识或证据，不得返回页码或 bbox。
 即使 items 为空，也必须继续执行任务二。
+items 为空时，semantic_judgments 必须为空数组；不得为不存在的配对生成判断。
 
 任务二：检查完整生成文档中的 sensitive_information、author_impersonation 和 academic_integrity。
 每个类别恰好返回一条 RiskFinding；non_auditable 句子也必须检查。
+risk_findings 必须仍为长度恰好为 3 的数组，并使用以下固定顺序：
+- risk_findings[0].category 必须为 sensitive_information
+- risk_findings[1].category 必须为 author_impersonation
+- risk_findings[2].category 必须为 academic_integrity
+禁止缺失、重复、增加类别或返回空 risk_findings。
+每个 RiskFinding 对象只能且必须包含 category、status、locations、reason、remediation。
+每个 RiskLocation 对象只能且必须包含 location_type、sentence_id、evidence_excerpt。
+evidence_excerpt 只能存在于 locations 数组的 RiskLocation 对象中；evidence_excerpt 不得成为 RiskFinding 顶层字段。
+reason 和 remediation 只属于 RiskFinding，不属于 RiskLocation。
+禁止返回任何未列出的键。
 RiskLocation 只能定位完整 ContentDraft 的 sentence、title 或 document，不得引用 SourceBlock。
 detected 必须至少给出一个合法位置；not_detected 的 locations 必须为空；unclear 可为空。
 非空 evidence_excerpt 最长 160 字符且必须原样摘自对应标题或句子。

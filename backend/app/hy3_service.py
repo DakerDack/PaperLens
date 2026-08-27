@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import logging
 from pathlib import Path
@@ -606,12 +607,35 @@ class Hy3Service:
 
     @staticmethod
     def _deep_audit_response_format() -> dict[str, Any]:
+        schema = DeepAuditResult.model_json_schema()
+        risk_findings_schema = schema["properties"]["risk_findings"]
+        risk_finding_schema = schema["$defs"]["RiskFinding"]
+        coverage_rules: list[dict[str, Any]] = []
+        for category in RiskCategory:
+            constrained_finding = deepcopy(risk_finding_schema)
+            constrained_finding["properties"]["category"] = {
+                "const": category.value,
+            }
+            coverage_rules.append(
+                {
+                    "contains": constrained_finding,
+                    "minContains": 1,
+                    "maxContains": 1,
+                }
+            )
+        risk_findings_schema.update(
+            {
+                "minItems": len(RiskCategory),
+                "maxItems": len(RiskCategory),
+                "allOf": coverage_rules,
+            }
+        )
         return {
             "type": "json_schema",
             "json_schema": {
                 "name": DEEP_AUDIT_SCHEMA_NAME,
                 "strict": True,
-                "schema": DeepAuditResult.model_json_schema(),
+                "schema": schema,
             },
         }
 
@@ -864,13 +888,56 @@ class Hy3Service:
                 item.get("loc", ()),
                 raw_error_type,
             )
-            message = _SAFE_VALIDATION_ERROR_MESSAGES.get(
+            message = Hy3Service._safe_validation_error_message(
                 raw_error_type,
-                _DEFAULT_SAFE_VALIDATION_ERROR_MESSAGE,
+                location,
             )
             summaries.append(f"{location} [{error_type}]: {message}")
         summary = "; ".join(summaries) or "$ [schema_invalid]"
         return summary[:800]
+
+    @staticmethod
+    def _safe_validation_error_message(
+        error_type: str,
+        location: str,
+    ) -> str:
+        location_segments = location.split(".")
+        if (
+            error_type == "extra_forbidden"
+            and len(location_segments) == 3
+            and location_segments[0] == "risk_findings"
+            and location_segments[2] == "<extra_field>"
+            and location_segments[1]
+            and all(
+                "0" <= character <= "9"
+                for character in location_segments[1]
+            )
+            and (
+                location_segments[1] == "0"
+                or not location_segments[1].startswith("0")
+            )
+        ):
+            return (
+                "RiskFinding objects may contain only category, status, "
+                "locations, reason, and remediation. RiskLocation objects "
+                "may contain only location_type, sentence_id, and "
+                "evidence_excerpt; evidence_excerpt must appear only inside "
+                "locations."
+            )
+        if error_type == "value_error" and location == "document":
+            return (
+                "Document must contain each required section exactly once "
+                "and use globally unique sentence identifiers."
+            )
+        if error_type == "value_error" and location.startswith("claims."):
+            return (
+                "Auditable claims require 1 to 3 candidate block identifiers, "
+                "and candidate quotes must be null or non-empty."
+            )
+        return _SAFE_VALIDATION_ERROR_MESSAGES.get(
+            error_type,
+            _DEFAULT_SAFE_VALIDATION_ERROR_MESSAGE,
+        )
 
     @staticmethod
     def _safe_validation_error_type(

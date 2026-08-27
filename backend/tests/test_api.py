@@ -819,7 +819,7 @@ def test_generate_provider_or_schema_failure_stays_failed_without_mock(
         assert b"SECRET-PROMPT" not in database_bytes
 
 
-def test_generation_success_and_failure_metadata_use_prompt_v3_without_prompt_text(
+def test_generation_success_and_failure_metadata_use_prompt_v4_without_prompt_text(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -841,7 +841,7 @@ def test_generation_success_and_failure_metadata_use_prompt_v3_without_prompt_te
         assert generate_project(client).status_code == 200
 
         assert len(success_metadata) == 1
-        assert success_metadata[0].prompt_version == "gen-v3"
+        assert success_metadata[0].prompt_version == "gen-v4"
         assert success_metadata[0].schema_version == "generated-bundle-v1"
         assert (
             "你是 PaperLens 的受约束学术内容处理模块。".encode("utf-8")
@@ -875,7 +875,7 @@ def test_generation_success_and_failure_metadata_use_prompt_v3_without_prompt_te
 
         assert response.status_code == 503
         assert len(failure_metadata) == 1
-        assert failure_metadata[0].prompt_version == "gen-v3"
+        assert failure_metadata[0].prompt_version == "gen-v4"
         assert failure_metadata[0].schema_version == "generated-bundle-v1"
         assert (
             "你是 PaperLens 的受约束学术内容处理模块。".encode("utf-8")
