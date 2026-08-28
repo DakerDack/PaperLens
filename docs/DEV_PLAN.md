@@ -1073,7 +1073,9 @@ python -m pytest backend/tests -q
 
 **阶段 4 收口状态（2026-08-25）**：`STAGE_4_FORMAL_GATE=PASS`。当前收口基线为后端 `267 passed, 1 skipped`，跳过项仅为需显式启用的真实 MinerU 集成测试；Mock 五路由命令行闭环、五表存储、Pydantic JSON 往返、失败恢复和稳定错误映射均已通过。阶段 4 的正式门槛不要求真实 Live 公共 API 全链路成功，因此允许在保持下述已知阻塞可见的前提下进入阶段 5。该结论不等于 `PRODUCTION_READY`，也不得把 Mock 结果描述为真实 Hy3 结果。
 
-**LIVE-BLOCKER-01：真实 risk-only 深审未闭环。** 已使用 `simple_2page.pdf` 完成一次受控真实公共 API 复验：真实 MinerU 上传解析返回 `201/parsed`（2 页、4 个 `SourceBlock`）；真实 Hy3 生成返回 `200/quick_checked/live`，但产生 `0 claims/0 evidence`；随后 risk-only 深审在三次真实 Hy3 响应（`retries=2`）后仍返回 `502/AUDIT_INCOMPLETE`，安全失败边界为 `HY3_RISK_CATEGORY_COVERAGE_INVALID`。项目保持 `failed/live`，PDF 读取仍为有效 `200`，确认没有 Mock fallback。现有代码已能让结构合法但风险类别缺失、重复或多余的响应进入有界重试，但真实供应商在空 `items` 场景仍未返回三个固定风险类别各一条；不得通过代码补齐、过滤或伪造风险结果来消除此失败。
+**LIVE-BLOCKER-01 历史失败记录（2026-08-25）。** 已使用 `simple_2page.pdf` 完成一次受控真实公共 API 复验：真实 MinerU 上传解析返回 `201/parsed`（2 页、4 个 `SourceBlock`）；真实 Hy3 生成返回 `200/quick_checked/live`，但产生 `0 claims/0 evidence`；随后 risk-only 深审在三次真实 Hy3 响应（`retries=2`）后仍返回 `502/AUDIT_INCOMPLETE`，安全失败边界为 `HY3_RISK_CATEGORY_COVERAGE_INVALID`。项目保持 `failed/live`，PDF 读取仍为有效 `200`，确认没有 Mock fallback。现有代码已能让结构合法但风险类别缺失、重复或多余的响应进入有界重试，但真实供应商在空 `items` 场景仍未返回三个固定风险类别各一条；不得通过代码补齐、过滤或伪造风险结果来消除此失败。
+
+**LIVE-BLOCKER-01 当前状态（2026-08-28）：CLOSED。** 在代码基线 `000385977b95b900d23f866f01a7e8aac0ba23a4` 上完成的独立最终 Live A/B 已同时通过，且当前代码树截至 `783824b07071c00ff680a1cb6d2fa4ef9eeb490f` 与该基线一致。脱敏结果、输入指纹、回归结果、隔离数据库说明和清理状态见[阶段 4 Live 收口证据](./paperlens_stage4_live_closeout.md)。本条关闭记录取代上方历史失败记录作为当前入口判定，但不删除或改写历史失败事实。
 
 阶段 5 可以使用冻结的阶段 4 API、Mock 夹具和稳定失败响应继续开发，但必须把以下状态作为正式界面与测试输入：
 
@@ -1131,6 +1133,16 @@ npx playwright test
 4. 受影响聚焦测试、后端全量、阶段 5 前端测试/构建/Playwright 和 `git diff --check` 全部通过。
 
 任一条件未满足时，`STAGE_6_ENTRY=HOLD`。不得通过删除空 claims 场景、降低三类风险完整性、将候选证据当作已验证证据或使用 Mock 演示来绕过该门槛。
+
+**阶段 6 入口状态（2026-08-28）：READY。** 上述四项额外硬门槛均已满足并完成持久化交接，判定依据见[阶段 4 Live 收口证据](./paperlens_stage4_live_closeout.md)。该状态只允许开始阶段 6 的独立原子任务，不代表阶段 6 已实现或项目已达到生产就绪。
+
+```ini
+STAGE_5_GATE=PASS
+STAGE_6_LIVE_GATE=PASS
+LIVE-BLOCKER-01=CLOSED
+STAGE_6_ENTRY=READY
+PRODUCTION_READY=NO
+```
 
 **允许修改**：`hy3_service.py`、`project_store.py`、`api.py`、`SidePanel.tsx`、相关测试。
 
