@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { AuditReport, EvidenceRecord, VersionSummary } from "../types";
+import type { AuditReport, EditPatch, EvidenceRecord, VersionSummary } from "../types";
 import { SidePanel } from "./SidePanel";
 
 
@@ -230,7 +230,136 @@ describe("SidePanel", () => {
 
     expect(screen.getByText("总分 100.0")).toBeTruthy();
     expect(screen.getByText("合格")).toBeTruthy();
-    expect(screen.getByText("阶段 6 尚未开放")).toBeTruthy();
+    expect(screen.getByText("修改意图")).toBeTruthy();
     expect(screen.getByText("版本 1")).toBeTruthy();
+  });
+
+  it("submits bounded sentence or document revision intent", () => {
+    const onCreateRevision = vi.fn();
+    render(
+      <SidePanel
+        selectedSentenceId="s-1"
+        selectedEvidence={evidence}
+        evidenceInsufficient={false}
+        quickReport={quickReport}
+        deepReport={null}
+        auditState="idle"
+        auditError={null}
+        versions={versions}
+        canAudit
+        onRunAudit={vi.fn()}
+        currentVersionId="v-1"
+        onCreateRevision={onCreateRevision}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("修改意图"), {
+      target: { value: "保持事实不变并简化表达。" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "生成补丁预览" }));
+    expect(onCreateRevision).toHaveBeenCalledWith({
+      scope: "sentence",
+      userInstruction: "保持事实不变并简化表达。",
+    });
+
+    fireEvent.change(screen.getByLabelText("修改范围"), {
+      target: { value: "document" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "生成补丁预览" }));
+    expect(onCreateRevision).toHaveBeenLastCalledWith({
+      scope: "document",
+      userInstruction: "保持事实不变并简化表达。",
+    });
+  });
+
+  it("shows the patch diff and requires explicit accept or reject", () => {
+    const patch: EditPatch = {
+      patch_id: "patch-1",
+      base_version: 1,
+      scope: "sentence",
+      target_sentence_ids: ["s-1"],
+      before_hash: "a".repeat(64),
+      before_text: "修改前句子。",
+      after_text: "修改后句子。",
+      reason: "简化表达。",
+      fact_changed: false,
+      evidence_changed: false,
+    };
+    const onAcceptRevision = vi.fn();
+    const onRejectRevision = vi.fn();
+    render(
+      <SidePanel
+        selectedSentenceId="s-1"
+        selectedEvidence={evidence}
+        evidenceInsufficient={false}
+        quickReport={quickReport}
+        deepReport={null}
+        auditState="idle"
+        auditError={null}
+        versions={versions}
+        canAudit
+        onRunAudit={vi.fn()}
+        currentVersionId="v-1"
+        pendingPatch={patch}
+        revisionState="preview_ready"
+        onAcceptRevision={onAcceptRevision}
+        onRejectRevision={onRejectRevision}
+      />,
+    );
+
+    const diff = screen.getByRole("region", { name: "修改前后差异" });
+    expect(within(diff).getByText("修改前句子。")).toBeTruthy();
+    expect(within(diff).getByText("修改后句子。")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "接受修改" }));
+    fireEvent.click(screen.getByRole("button", { name: "拒绝修改" }));
+    expect(onAcceptRevision).toHaveBeenCalledTimes(1);
+    expect(onRejectRevision).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores only historical versions and exposes failed-operation retry", () => {
+    const onRestoreVersion = vi.fn();
+    const onRetryRevision = vi.fn();
+    render(
+      <SidePanel
+        selectedSentenceId={null}
+        selectedEvidence={null}
+        evidenceInsufficient={false}
+        quickReport={quickReport}
+        deepReport={null}
+        auditState="idle"
+        auditError={null}
+        versions={[
+          versions[0],
+          {
+            version_id: "v-2",
+            version_no: 2,
+            parent_version_id: "v-1",
+            reason: "accepted_patch:patch-1",
+            created_at: "2026-08-25T08:05:00Z",
+          },
+        ]}
+        canAudit
+        onRunAudit={vi.fn()}
+        currentVersionId="v-2"
+        revisionState="failed"
+        revisionError={{
+          code: "TARGET_STALE",
+          message: "当前版本已经变化，请刷新后重试。",
+          retryable: true,
+        }}
+        onRestoreVersion={onRestoreVersion}
+        onRetryRevision={onRetryRevision}
+      />,
+    );
+
+    expect(
+      (screen.getByRole("button", { name: "回退到版本 2" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "回退到版本 1" }));
+    expect(onRestoreVersion).toHaveBeenCalledWith("v-1");
+    expect(screen.getByText("TARGET_STALE")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "重试修改操作" }));
+    expect(onRetryRevision).toHaveBeenCalledTimes(1);
   });
 });

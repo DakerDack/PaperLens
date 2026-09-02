@@ -5,15 +5,31 @@ import type {
   DeepAuditRequest,
   DimensionId,
   DisclosureStatus,
+  EditPatch,
   EvidenceRecord,
   GeneratedContentLabelApplicability,
   GeneratedContentLabelStatus,
+  PatchScope,
   RiskCategory,
   VersionSummary,
 } from "../types";
 
 
 export type AuditUiState = "idle" | "running" | "failed" | "complete";
+export type RevisionUiState =
+  | "idle"
+  | "previewing"
+  | "preview_ready"
+  | "accepting"
+  | "rejecting"
+  | "restoring"
+  | "refreshing"
+  | "write_uncertain"
+  | "reconciling"
+  | "reconcile_failed"
+  | "exporting"
+  | "refresh_failed"
+  | "failed";
 
 export interface AuditUiError {
   code: string;
@@ -32,6 +48,20 @@ interface SidePanelProps {
   versions: VersionSummary[];
   canAudit: boolean;
   onRunAudit: (request: DeepAuditRequest) => void;
+  currentVersionId?: string | null;
+  pendingPatch?: EditPatch | null;
+  revisionState?: RevisionUiState;
+  revisionError?: AuditUiError | null;
+  revisionRefreshReason?: "completed_write" | "target_stale" | null;
+  onCreateRevision?: (input: {
+    scope: PatchScope;
+    userInstruction: string;
+  }) => void;
+  onAcceptRevision?: () => void;
+  onRejectRevision?: () => void;
+  onRetryRevision?: () => void;
+  onRestoreVersion?: (versionId: string) => void;
+  onExportProject?: () => void;
 }
 
 
@@ -71,6 +101,17 @@ export function SidePanel({
   versions,
   canAudit,
   onRunAudit,
+  currentVersionId = null,
+  pendingPatch = null,
+  revisionState = "idle",
+  revisionError = null,
+  revisionRefreshReason = null,
+  onCreateRevision,
+  onAcceptRevision,
+  onRejectRevision,
+  onRetryRevision,
+  onRestoreVersion,
+  onExportProject,
 }: SidePanelProps) {
   const [sourceDisclosure, setSourceDisclosure] =
     useState<DisclosureStatus>("present");
@@ -79,6 +120,8 @@ export function SidePanel({
     useState<GeneratedContentLabelApplicability>("not_applicable");
   const [labelStatus, setLabelStatus] =
     useState<GeneratedContentLabelStatus>("not_applicable");
+  const [revisionScope, setRevisionScope] = useState<PatchScope>("sentence");
+  const [revisionInstruction, setRevisionInstruction] = useState("");
 
   const submitAudit = () => {
     onRunAudit({
@@ -99,6 +142,61 @@ export function SidePanel({
     auditState === "complete" && deepReport?.audit_status === "deep_complete"
       ? deepReport
       : null;
+  const revisionBusy = [
+    "previewing",
+    "accepting",
+    "rejecting",
+    "restoring",
+    "refreshing",
+    "reconciling",
+    "exporting",
+  ].includes(revisionState);
+  const auditBusy = auditState === "running";
+  const snapshotBlocked = [
+    "write_uncertain",
+    "reconciling",
+    "reconcile_failed",
+    "refresh_failed",
+  ].includes(revisionState);
+  const canPreviewRevision = Boolean(
+    currentVersionId &&
+      onCreateRevision &&
+      revisionInstruction.trim() &&
+      (revisionScope === "document" || selectedSentenceId) &&
+      !revisionBusy &&
+      !auditBusy &&
+      !snapshotBlocked &&
+      !pendingPatch,
+  );
+  const revisionProgressLabel = {
+    previewing: "正在生成补丁预览…",
+    accepting: "正在接受补丁并重新检查…",
+    rejecting: "正在拒绝补丁…",
+    restoring: "正在复制历史快照并回退…",
+    refreshing: "正在刷新当前版本…",
+    reconciling: "正在读取服务端当前版本…",
+    exporting: "正在导出当前版本…",
+  }[
+    revisionState as
+      | "previewing"
+      | "accepting"
+      | "rejecting"
+      | "restoring"
+      | "refreshing"
+      | "reconciling"
+      | "exporting"
+  ];
+
+  const displayPatchText = (text: string) => {
+    if (pendingPatch?.scope !== "document") {
+      return text;
+    }
+    try {
+      return JSON.stringify(JSON.parse(text), null, 2);
+    } catch {
+      return text;
+    }
+  };
 
   return (
     <aside className="pane side-panel" aria-label="证据与审计">
@@ -229,6 +327,7 @@ export function SidePanel({
               来源说明
               <select
                 value={sourceDisclosure}
+                disabled={auditBusy || revisionBusy || snapshotBlocked}
                 onChange={(event) =>
                   setSourceDisclosure(event.target.value as DisclosureStatus)
                 }
@@ -241,6 +340,7 @@ export function SidePanel({
               AI 辅助说明
               <select
                 value={aiDisclosure}
+                disabled={auditBusy || revisionBusy || snapshotBlocked}
                 onChange={(event) => setAiDisclosure(event.target.value as DisclosureStatus)}
               >
                 <option value="present">已提供</option>
@@ -251,6 +351,7 @@ export function SidePanel({
               生成内容标识
               <select
                 value={labelApplicability}
+                disabled={auditBusy || revisionBusy || snapshotBlocked}
                 onChange={(event) =>
                   changeApplicability(
                     event.target.value as GeneratedContentLabelApplicability,
@@ -266,6 +367,7 @@ export function SidePanel({
                 标识状态
                 <select
                   value={labelStatus}
+                  disabled={auditBusy || revisionBusy || snapshotBlocked}
                   onChange={(event) =>
                     setLabelStatus(event.target.value as GeneratedContentLabelStatus)
                   }
@@ -278,7 +380,7 @@ export function SidePanel({
             <button
               className="primary-button"
               type="button"
-              disabled={!canAudit || auditState === "running"}
+              disabled={!canAudit || auditBusy || revisionBusy || snapshotBlocked}
               onClick={submitAudit}
             >
               {auditState === "running"
@@ -294,11 +396,128 @@ export function SidePanel({
       <section className="side-section" aria-labelledby="revision-heading">
         <div className="section-heading-row">
           <h3 id="revision-heading">修改</h3>
-          <span className="muted-badge">阶段 6 尚未开放</span>
+          <span className="muted-badge">
+            {selectedSentenceId ? `已选 ${selectedSentenceId}` : "可修改全文"}
+          </span>
         </div>
-        <button type="button" className="secondary-button" disabled>
-          讨论并生成修改
-        </button>
+        <div className="audit-form">
+          <label>
+            修改范围
+            <select
+              value={revisionScope}
+              disabled={
+                revisionBusy || auditBusy || snapshotBlocked || Boolean(pendingPatch)
+              }
+              onChange={(event) => setRevisionScope(event.target.value as PatchScope)}
+            >
+              <option value="sentence" disabled={!selectedSentenceId}>
+                当前句子
+              </option>
+              <option value="document">全文五区</option>
+            </select>
+          </label>
+          <label>
+            修改意图
+            <textarea
+              value={revisionInstruction}
+              disabled={
+                revisionBusy || auditBusy || snapshotBlocked || Boolean(pendingPatch)
+              }
+              placeholder="例如：保持事实不变，缩短句子并突出限制条件"
+              onChange={(event) => setRevisionInstruction(event.target.value)}
+            />
+          </label>
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={!canPreviewRevision}
+            onClick={() =>
+              onCreateRevision?.({
+                scope: revisionScope,
+                userInstruction: revisionInstruction.trim(),
+              })
+            }
+          >
+            生成补丁预览
+          </button>
+        </div>
+
+        {revisionProgressLabel ? (
+          <div className="inline-state" role="status">
+            <strong>{revisionProgressLabel}</strong>
+            <p>
+              {revisionState === "refreshing"
+                ? revisionRefreshReason === "target_stale"
+                  ? "当前修订目标已过期，正在读取服务端当前版本。"
+                  : "写操作已完成，正在读取服务端当前版本。"
+                : revisionState === "reconciling"
+                  ? "写入结果尚未确认，需要读取服务端当前版本。"
+                : "当前稳定版本不会在操作完成前被覆盖。"}
+            </p>
+          </div>
+        ) : null}
+        {(revisionState === "failed" ||
+          revisionState === "refresh_failed" ||
+          revisionState === "write_uncertain" ||
+          revisionState === "reconcile_failed") &&
+        revisionError ? (
+          <div className="inline-state inline-state--error" role="alert">
+            <strong>
+              {revisionState === "refresh_failed"
+                ? "当前版本刷新失败"
+                : revisionState === "write_uncertain" ||
+                    revisionState === "reconcile_failed"
+                  ? "写入结果尚未确认"
+                  : "修改操作失败"}
+            </strong>
+            <span className="error-code">{revisionError.code}</span>
+            <p>{revisionError.message}</p>
+            {revisionError.retryable ? (
+              <button
+                type="button"
+                disabled={auditBusy || revisionBusy}
+                onClick={() => onRetryRevision?.()}
+              >
+                {revisionState === "write_uncertain" ||
+                revisionState === "reconcile_failed"
+                  ? "读取服务端当前版本"
+                  : "重试修改操作"}
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+        {pendingPatch ? (
+          <section className="audit-structure" aria-label="修改前后差异">
+            <h4>{pendingPatch.scope === "sentence" ? "句子补丁预览" : "全文补丁预览"}</h4>
+            <p>{pendingPatch.reason}</p>
+            <div className="inline-state">
+              <strong>修改前</strong>
+              <pre>{displayPatchText(pendingPatch.before_text)}</pre>
+            </div>
+            <div className="inline-state inline-state--warning">
+              <strong>修改后</strong>
+              <pre>{displayPatchText(pendingPatch.after_text)}</pre>
+            </div>
+            <div className="audit-form">
+              <button
+                type="button"
+                className="primary-button"
+                disabled={revisionBusy || auditBusy || snapshotBlocked}
+                onClick={() => onAcceptRevision?.()}
+              >
+                接受修改
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={revisionBusy || auditBusy || snapshotBlocked}
+                onClick={() => onRejectRevision?.()}
+              >
+                拒绝修改
+              </button>
+            </div>
+          </section>
+        ) : null}
       </section>
 
       <section className="side-section" aria-labelledby="version-heading">
@@ -314,8 +533,25 @@ export function SidePanel({
                   <strong>版本 {version.version_no}</strong>
                   <span>{version.reason}</span>
                 </div>
-                <button type="button" disabled title="阶段 6 才能恢复版本">
-                  恢复
+                <button
+                  type="button"
+                  aria-label={`回退到版本 ${version.version_no}`}
+                  disabled={
+                    !onRestoreVersion ||
+                    version.version_id === currentVersionId ||
+                    revisionBusy ||
+                    auditBusy ||
+                    snapshotBlocked ||
+                    Boolean(pendingPatch)
+                  }
+                  title={
+                    version.version_id === currentVersionId
+                      ? "当前版本"
+                      : "复制此历史快照为新的当前版本"
+                  }
+                  onClick={() => onRestoreVersion?.(version.version_id)}
+                >
+                  回退到版本 {version.version_no}
                 </button>
               </li>
             ))}
@@ -323,6 +559,20 @@ export function SidePanel({
         ) : (
           <p className="muted-text">生成首个版本后显示历史记录。</p>
         )}
+        <button
+          type="button"
+          className="secondary-button"
+          disabled={
+            !currentVersionId ||
+            !onExportProject ||
+            revisionBusy ||
+            auditBusy ||
+            snapshotBlocked
+          }
+          onClick={() => onExportProject?.()}
+        >
+          导出当前 Markdown
+        </button>
       </section>
     </aside>
   );

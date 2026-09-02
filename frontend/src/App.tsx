@@ -3,14 +3,19 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ApiClientError,
+  acceptRevision,
   auditProject,
   createProject,
   createRequestHandle,
+  createRevision,
+  exportProjectMarkdown,
   generateProject,
   getHealth,
   getProject,
   getProjectPdf,
   isRequestCancelled,
+  rejectRevision,
+  restoreProjectVersion,
   type RequestHandle,
 } from "./api";
 import { DocumentPane } from "./components/DocumentPane";
@@ -19,11 +24,14 @@ import {
   SidePanel,
   type AuditUiError,
   type AuditUiState,
+  type RevisionUiState,
 } from "./components/SidePanel";
 import type {
   AuditReport,
   DeepAuditRequest,
+  EditPatch,
   EvidenceRecord,
+  PatchScope,
   ProjectView,
 } from "./types";
 
@@ -31,6 +39,22 @@ import type {
 type ProjectOperation = "idle" | "parsing" | "generating";
 type RetryAction = "upload" | "generate";
 type MobilePanel = "pdf" | "document" | "evidence";
+type RevisionRefreshReason = "completed_write" | "target_stale";
+type RevisionRetry =
+  | {
+      action: "preview";
+      input: { scope: PatchScope; userInstruction: string };
+    }
+  | { action: "accept" }
+  | { action: "reject" }
+  | { action: "restore"; versionId: string }
+  | {
+      action: "reconcile";
+      mutation: RevisionMutation;
+      baseVersionId: string | null;
+    }
+  | { action: "refresh"; reason: RevisionRefreshReason }
+  | { action: "export" };
 
 interface WorkflowError extends AuditUiError {
   action: RetryAction;
@@ -48,6 +72,91 @@ function toUiError(error: unknown): Omit<WorkflowError, "action"> {
   return {
     code: "UNKNOWN_ERROR",
     message: "操作未完成，请检查本地服务后重试。",
+    retryable: true,
+  };
+}
+
+
+function toCompletedWriteRefreshError(error: unknown): AuditUiError {
+  if (isRequestCancelled(error)) {
+    return {
+      code: "NETWORK_ERROR",
+      message: "写操作已完成，但当前项目刷新失败。请重试读取当前版本。",
+      retryable: true,
+    };
+  }
+  const uiError = toUiError(error);
+  return {
+    ...uiError,
+    message: `写操作已完成，但当前项目刷新失败。${uiError.message}`,
+  };
+}
+
+
+function toTargetStaleRefreshError(error: unknown): AuditUiError {
+  const uiError = isRequestCancelled(error)
+    ? {
+        code: "NETWORK_ERROR",
+        message: "读取服务端当前版本被中断。",
+        retryable: true,
+      }
+    : toUiError(error);
+  return {
+    ...uiError,
+    message: `当前修订目标已过期，读取服务端当前版本失败。${uiError.message}`,
+  };
+}
+
+
+type RevisionMutation = "preview" | "accept" | "restore";
+
+
+const definiteWriteRejections: Readonly<
+  Record<RevisionMutation, Readonly<Record<number, ReadonlySet<string>>>>
+> = {
+  preview: {
+    404: new Set(["PROJECT_NOT_FOUND"]),
+    409: new Set(["PROJECT_NOT_READY"]),
+    422: new Set(["PATCH_INVALID"]),
+  },
+  accept: {
+    404: new Set(["PATCH_NOT_FOUND", "PROJECT_NOT_FOUND"]),
+    409: new Set(["TARGET_STALE", "PROJECT_NOT_READY"]),
+    422: new Set(["PATCH_INVALID"]),
+  },
+  restore: {
+    404: new Set(["VERSION_NOT_FOUND", "PROJECT_NOT_FOUND"]),
+    409: new Set(["PROJECT_NOT_READY", "IDEMPOTENCY_CONFLICT"]),
+    422: new Set(["IDEMPOTENCY_KEY_INVALID"]),
+  },
+};
+
+
+function isDefiniteWriteRejection(
+  mutation: RevisionMutation,
+  error: unknown,
+): error is ApiClientError {
+  return (
+    error instanceof ApiClientError &&
+    definiteWriteRejections[mutation][error.status]?.has(error.errorCode) === true
+  );
+}
+
+
+function toUncertainWriteError(
+  error: unknown,
+  reconciliationFailed = false,
+): AuditUiError {
+  const code = isRequestCancelled(error)
+    ? "NETWORK_ERROR"
+    : error instanceof ApiClientError
+      ? error.errorCode
+      : "UNKNOWN_ERROR";
+  return {
+    code,
+    message: reconciliationFailed
+      ? "写入结果仍未确认，读取服务端当前版本未完成。请再次读取。"
+      : "写入结果尚未确认，需要读取服务端当前版本。",
     retryable: true,
   };
 }
@@ -73,6 +182,10 @@ export function App() {
   const [selectedEvidence, setSelectedEvidence] = useState<EvidenceRecord | null>(null);
   const [pdfTarget, setPdfTarget] = useState<PdfTarget | null>(null);
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("document");
+  const [pendingPatch, setPendingPatch] = useState<EditPatch | null>(null);
+  const [revisionState, setRevisionState] = useState<RevisionUiState>("idle");
+  const [revisionError, setRevisionError] = useState<AuditUiError | null>(null);
+  const [revisionRetry, setRevisionRetry] = useState<RevisionRetry | null>(null);
 
   useEffect(() => {
     const request = createRequestHandle();
@@ -121,6 +234,38 @@ export function App() {
     setPdfUrl(nextUrl);
   }, []);
 
+  const resetSelection = useCallback(() => {
+    setSelectedSentenceId(null);
+    setSelectedEvidence(null);
+    setPdfTarget(null);
+  }, []);
+
+  const applyRefreshedProject = useCallback(
+    (nextProject: ProjectView) => {
+      setProject(nextProject);
+      setLastQuickReport(
+        nextProject.audit_report?.audit_status === "quick_complete"
+          ? nextProject.audit_report
+          : null,
+      );
+      setAuditState(
+        nextProject.audit_report?.audit_status === "deep_complete"
+          ? "complete"
+          : "idle",
+      );
+      setAuditError(null);
+      setPendingPatch(nextProject.pending_patch);
+      setRevisionState(
+        nextProject.stage === "patch_pending" ? "preview_ready" : "idle",
+      );
+      setRevisionError(null);
+      setRevisionRetry(null);
+      resetSelection();
+      setMobilePanel("document");
+    },
+    [resetSelection],
+  );
+
   const runUpload = useCallback(async () => {
     if (!file || !rightsConfirmed) {
       return;
@@ -134,6 +279,10 @@ export function App() {
     setSelectedEvidence(null);
     setPdfTarget(null);
     setLastQuickReport(null);
+    setPendingPatch(null);
+    setRevisionState("idle");
+    setRevisionError(null);
+    setRevisionRetry(null);
 
     try {
       const created = await createProject(file, request.signal);
@@ -141,7 +290,7 @@ export function App() {
         getProject(created.project_id, request.signal),
         getProjectPdf(created.project_id, request.signal),
       ]);
-      setProject(nextProject);
+      applyRefreshedProject(nextProject);
       replacePdfUrl(pdfBlob);
       setOperation("idle");
     } catch (error: unknown) {
@@ -153,7 +302,14 @@ export function App() {
     } finally {
       finishRequest(request);
     }
-  }, [beginRequest, file, finishRequest, replacePdfUrl, rightsConfirmed]);
+  }, [
+    applyRefreshedProject,
+    beginRequest,
+    file,
+    finishRequest,
+    replacePdfUrl,
+    rightsConfirmed,
+  ]);
 
   const runGeneration = useCallback(async () => {
     if (!project) {
@@ -173,9 +329,8 @@ export function App() {
       );
       setLastQuickReport(generated.quick_report ?? null);
       const nextProject = await getProject(project.project_id, request.signal);
-      setProject(nextProject);
+      applyRefreshedProject(nextProject);
       setOperation("idle");
-      setMobilePanel("document");
     } catch (error: unknown) {
       if (isRequestCancelled(error)) {
         return;
@@ -185,7 +340,7 @@ export function App() {
     } finally {
       finishRequest(request);
     }
-  }, [beginRequest, finishRequest, project]);
+  }, [applyRefreshedProject, beginRequest, finishRequest, project]);
 
   const runAudit = useCallback(
     async (input: DeepAuditRequest) => {
@@ -198,15 +353,15 @@ export function App() {
       setWorkflowError(null);
 
       try {
-        const audited = await auditProject(project.project_id, input, request.signal);
+        await auditProject(project.project_id, input, request.signal);
         const nextProject = await getProject(project.project_id, request.signal);
-        setProject(nextProject);
-        setAuditState("complete");
-        if (audited.audit_report.audit_status === "deep_complete") {
+        applyRefreshedProject(nextProject);
+        if (nextProject.audit_report?.audit_status === "deep_complete") {
           setMobilePanel("evidence");
         }
       } catch (error: unknown) {
         if (isRequestCancelled(error)) {
+          setAuditState("idle");
           return;
         }
         setAuditError(toUiError(error));
@@ -215,8 +370,329 @@ export function App() {
         finishRequest(request);
       }
     },
-    [beginRequest, finishRequest, project],
+    [applyRefreshedProject, beginRequest, finishRequest, project],
   );
+
+  const runRevisionPreview = useCallback(
+    async (input: { scope: PatchScope; userInstruction: string }) => {
+      if (!project?.current_version_id) {
+        return;
+      }
+      const targetSentenceId = input.scope === "sentence" ? selectedSentenceId : null;
+      if (input.scope === "sentence" && !targetSentenceId) {
+        return;
+      }
+      const request = beginRequest();
+      setRevisionState("previewing");
+      setRevisionError(null);
+      setRevisionRetry({ action: "preview", input });
+      try {
+        const patch = await createRevision(
+          project.project_id,
+          {
+            base_version_id: project.current_version_id,
+            scope: input.scope,
+            target_sentence_id: targetSentenceId,
+            user_instruction: input.userInstruction,
+          },
+          request.signal,
+        );
+        setPendingPatch(patch);
+        setProject((currentProject) =>
+          currentProject
+            ? {
+                ...currentProject,
+                stage: "patch_pending",
+                pending_patch: patch,
+              }
+            : currentProject,
+        );
+        setRevisionState("preview_ready");
+        setRevisionRetry(null);
+      } catch (error: unknown) {
+        if (
+          error instanceof ApiClientError &&
+          error.status === 409 &&
+          error.errorCode === "TARGET_STALE"
+        ) {
+          setPendingPatch(null);
+          setRevisionState("refreshing");
+          setRevisionError(null);
+          setRevisionRetry({ action: "refresh", reason: "target_stale" });
+          try {
+            const nextProject = await getProject(project.project_id, request.signal);
+            applyRefreshedProject(nextProject);
+          } catch (refreshError: unknown) {
+            setRevisionError(toTargetStaleRefreshError(refreshError));
+            setRevisionState("refresh_failed");
+            setRevisionRetry({ action: "refresh", reason: "target_stale" });
+          }
+          return;
+        }
+        if (!isDefiniteWriteRejection("preview", error)) {
+          setRevisionError(toUncertainWriteError(error));
+          setRevisionState("write_uncertain");
+          setRevisionRetry({
+            action: "reconcile",
+            mutation: "preview",
+            baseVersionId: project.current_version_id,
+          });
+          return;
+        }
+        setRevisionError(toUiError(error));
+        setRevisionState("failed");
+      } finally {
+        finishRequest(request);
+      }
+    },
+    [applyRefreshedProject, beginRequest, finishRequest, project, selectedSentenceId],
+  );
+
+  const runAcceptRevision = useCallback(async () => {
+    if (!project || !pendingPatch) {
+      return;
+    }
+    const request = beginRequest();
+    setRevisionState("accepting");
+    setRevisionError(null);
+    setRevisionRetry({ action: "accept" });
+    const baseVersionId = project.current_version_id;
+    let writeCompleted = false;
+    try {
+      await acceptRevision(
+        project.project_id,
+        pendingPatch.patch_id,
+        request.signal,
+      );
+      writeCompleted = true;
+      setPendingPatch(null);
+      setRevisionState("refreshing");
+      setRevisionRetry({ action: "refresh", reason: "completed_write" });
+      const nextProject = await getProject(project.project_id, request.signal);
+      applyRefreshedProject(nextProject);
+    } catch (error: unknown) {
+      if (writeCompleted) {
+        setRevisionError(toCompletedWriteRefreshError(error));
+        setRevisionState("refresh_failed");
+        setPendingPatch(null);
+        setRevisionRetry({ action: "refresh", reason: "completed_write" });
+        return;
+      }
+      if (!isDefiniteWriteRejection("accept", error)) {
+        setRevisionError(toUncertainWriteError(error));
+        setRevisionState("write_uncertain");
+        setRevisionRetry({
+          action: "reconcile",
+          mutation: "accept",
+          baseVersionId,
+        });
+        return;
+      }
+      setRevisionError(toUiError(error));
+      setRevisionState("failed");
+    } finally {
+      finishRequest(request);
+    }
+  }, [applyRefreshedProject, beginRequest, finishRequest, pendingPatch, project]);
+
+  const runRestoreVersion = useCallback(
+    async (versionId: string) => {
+      if (!project) {
+        return;
+      }
+      const idempotencyKey = crypto.randomUUID();
+      const request = beginRequest();
+      setRevisionState("restoring");
+      setRevisionError(null);
+      setRevisionRetry({ action: "restore", versionId });
+      const baseVersionId = project.current_version_id;
+      let writeCompleted = false;
+      try {
+        await restoreProjectVersion(
+          project.project_id,
+          versionId,
+          idempotencyKey,
+          request.signal,
+        );
+        writeCompleted = true;
+        setRevisionState("refreshing");
+        setRevisionRetry({ action: "refresh", reason: "completed_write" });
+        const nextProject = await getProject(project.project_id, request.signal);
+        applyRefreshedProject(nextProject);
+      } catch (error: unknown) {
+        if (writeCompleted) {
+          setRevisionError(toCompletedWriteRefreshError(error));
+          setRevisionState("refresh_failed");
+          setRevisionRetry({ action: "refresh", reason: "completed_write" });
+          return;
+        }
+        if (!isDefiniteWriteRejection("restore", error)) {
+          setRevisionError(toUncertainWriteError(error));
+          setRevisionState("write_uncertain");
+          setRevisionRetry({
+            action: "reconcile",
+            mutation: "restore",
+            baseVersionId,
+          });
+          return;
+        }
+        setRevisionError(toUiError(error));
+        setRevisionState("failed");
+      } finally {
+        finishRequest(request);
+      }
+    },
+    [applyRefreshedProject, beginRequest, finishRequest, project],
+  );
+
+  const runWriteReconciliation = useCallback(
+    async (
+      mutation: RevisionMutation,
+      baseVersionId: string | null,
+    ) => {
+      if (!project) {
+        return;
+      }
+      const request = beginRequest();
+      setRevisionState("reconciling");
+      setRevisionError(null);
+      setRevisionRetry({ action: "reconcile", mutation, baseVersionId });
+      try {
+        const nextProject = await getProject(project.project_id, request.signal);
+        applyRefreshedProject(nextProject);
+      } catch (error: unknown) {
+        setRevisionError(toUncertainWriteError(error, true));
+        setRevisionState("reconcile_failed");
+        setRevisionRetry({ action: "reconcile", mutation, baseVersionId });
+      } finally {
+        finishRequest(request);
+      }
+    },
+    [applyRefreshedProject, beginRequest, finishRequest, project],
+  );
+
+  const runRevisionRefresh = useCallback(
+    async (reason: RevisionRefreshReason) => {
+      if (!project) {
+        return;
+      }
+      const request = beginRequest();
+      setRevisionState("refreshing");
+      setRevisionError(null);
+      setRevisionRetry({ action: "refresh", reason });
+      try {
+        const nextProject = await getProject(project.project_id, request.signal);
+        applyRefreshedProject(nextProject);
+      } catch (error: unknown) {
+        setRevisionError(
+          reason === "target_stale"
+            ? toTargetStaleRefreshError(error)
+            : toCompletedWriteRefreshError(error),
+        );
+        setRevisionState("refresh_failed");
+        setRevisionRetry({ action: "refresh", reason });
+      } finally {
+        finishRequest(request);
+      }
+    },
+    [applyRefreshedProject, beginRequest, finishRequest, project],
+  );
+
+  const runExport = useCallback(async () => {
+    if (!project) {
+      return;
+    }
+    const request = beginRequest();
+    setRevisionState("exporting");
+    setRevisionError(null);
+    setRevisionRetry({ action: "export" });
+    try {
+      const markdown = await exportProjectMarkdown(project.project_id, request.signal);
+      const downloadUrl = URL.createObjectURL(markdown);
+      const link = document.createElement("a");
+      link.href = downloadUrl;
+      link.download = `paperlens-${project.project_id}.md`;
+      link.click();
+      URL.revokeObjectURL(downloadUrl);
+      setRevisionState("idle");
+      setRevisionRetry(null);
+    } catch (error: unknown) {
+      if (isRequestCancelled(error)) {
+        setRevisionState("idle");
+        setRevisionRetry(null);
+        return;
+      }
+      setRevisionError(toUiError(error));
+      setRevisionState("failed");
+    } finally {
+      finishRequest(request);
+    }
+  }, [beginRequest, finishRequest, project]);
+
+  const runRejectRevision = useCallback(async () => {
+    if (!project || !pendingPatch) {
+      return;
+    }
+    const request = beginRequest();
+    setRevisionState("rejecting");
+    setRevisionError(null);
+    setRevisionRetry({ action: "reject" });
+    let writeCompleted = false;
+    try {
+      await rejectRevision(project.project_id, pendingPatch.patch_id, request.signal);
+      writeCompleted = true;
+      setRevisionState("refreshing");
+      setRevisionRetry({ action: "refresh", reason: "completed_write" });
+      const nextProject = await getProject(project.project_id, request.signal);
+      applyRefreshedProject(nextProject);
+    } catch (error: unknown) {
+      if (writeCompleted) {
+        setRevisionError(toCompletedWriteRefreshError(error));
+        setRevisionState("refresh_failed");
+        setRevisionRetry({ action: "refresh", reason: "completed_write" });
+        return;
+      }
+      if (isRequestCancelled(error)) {
+        setRevisionState("preview_ready");
+        setRevisionRetry(null);
+        return;
+      }
+      setRevisionError(toUiError(error));
+      setRevisionState("failed");
+    } finally {
+      finishRequest(request);
+    }
+  }, [applyRefreshedProject, beginRequest, finishRequest, pendingPatch, project]);
+
+  const retryRevision = useCallback(() => {
+    if (revisionRetry?.action === "preview") {
+      void runRevisionPreview(revisionRetry.input);
+    } else if (revisionRetry?.action === "accept") {
+      void runAcceptRevision();
+    } else if (revisionRetry?.action === "reject") {
+      void runRejectRevision();
+    } else if (revisionRetry?.action === "restore") {
+      void runRestoreVersion(revisionRetry.versionId);
+    } else if (revisionRetry?.action === "reconcile") {
+      void runWriteReconciliation(
+        revisionRetry.mutation,
+        revisionRetry.baseVersionId,
+      );
+    } else if (revisionRetry?.action === "refresh") {
+      void runRevisionRefresh(revisionRetry.reason);
+    } else if (revisionRetry?.action === "export") {
+      void runExport();
+    }
+  }, [
+    revisionRetry,
+    runAcceptRevision,
+    runExport,
+    runRejectRevision,
+    runRevisionRefresh,
+    runRestoreVersion,
+    runWriteReconciliation,
+    runRevisionPreview,
+  ]);
 
   const retryWorkflow = () => {
     if (workflowError?.action === "upload") {
@@ -488,8 +964,21 @@ export function App() {
             auditState={deepReport ? "complete" : auditState}
             auditError={auditError}
             versions={project?.versions ?? []}
-            canAudit={Boolean(project && quickReport)}
+            canAudit={Boolean(project && quickReport && !pendingPatch)}
             onRunAudit={(request) => void runAudit(request)}
+            currentVersionId={project?.current_version_id ?? null}
+            pendingPatch={pendingPatch}
+            revisionState={revisionState}
+            revisionError={revisionError}
+            revisionRefreshReason={
+              revisionRetry?.action === "refresh" ? revisionRetry.reason : null
+            }
+            onCreateRevision={(input) => void runRevisionPreview(input)}
+            onAcceptRevision={() => void runAcceptRevision()}
+            onRejectRevision={() => void runRejectRevision()}
+            onRetryRevision={retryRevision}
+            onRestoreVersion={(versionId) => void runRestoreVersion(versionId)}
+            onExportProject={() => void runExport()}
           />
         </div>
       </section>

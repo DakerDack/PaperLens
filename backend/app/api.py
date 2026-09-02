@@ -1,12 +1,14 @@
 from dataclasses import asdict
 from datetime import datetime, timezone
 from hashlib import sha256
+from html import escape as escape_html
 from pathlib import Path
+import re
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, File, Form, Request, UploadFile
+from fastapi import APIRouter, FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import ValidationError
 
 from backend.app.audit_service import AuditServiceError
@@ -16,6 +18,7 @@ from backend.app.models import (
     ComplianceContext,
     DeepAuditRequest,
     DeepAuditResponse,
+    EditPatch,
     EvidenceSnapshot,
     ErrorResponse,
     GenerationRequest,
@@ -26,14 +29,18 @@ from backend.app.models import (
     ProjectCreateResponse,
     ProjectStage,
     ProjectView,
+    RevisionRequest,
     RunMetadata,
     UsageSnapshot,
+    VersionSummary,
 )
 from backend.app.prompts import (
     DEEP_AUDIT_PROMPT_VERSION,
     DEEP_AUDIT_SCHEMA_VERSION,
     GENERATION_PROMPT_VERSION,
     GENERATION_SCHEMA_VERSION,
+    REVISION_PROMPT_VERSION,
+    REVISION_SCHEMA_VERSION,
 )
 from backend.app.project_store import ProjectStore, StoreError
 from backend.app.settings import Settings
@@ -48,17 +55,38 @@ _ERROR_STATUS = {
     "PROJECT_NOT_FOUND": 404,
     "PDF_NOT_FOUND": 404,
     "VERSION_NOT_FOUND": 404,
+    "PATCH_NOT_FOUND": 404,
     "PROJECT_NOT_READY": 409,
     "EVIDENCE_NOT_READY": 409,
     "TARGET_STALE": 409,
+    "IDEMPOTENCY_CONFLICT": 409,
     "PARSE_QUALITY_LOW": 422,
     "PATCH_INVALID": 422,
+    "IDEMPOTENCY_KEY_INVALID": 422,
     "SCHEMA_INVALID": 502,
     "AUDIT_INCOMPLETE": 502,
     "PARSE_FAILED": 503,
     "HY3_CONFIG_MISSING": 503,
     "HY3_UNAVAILABLE": 503,
 }
+
+_IDEMPOTENCY_KEY = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+_MARKDOWN_CONTROL_WHITESPACE = re.compile(r"[\x09-\x0d\x1c-\x1f\x85]+")
+_MARKDOWN_INLINE_SPECIAL = re.compile(r"([\\`*_\[\]~|{}#>])")
+_MARKDOWN_LEADING_BULLET = re.compile(r"^([ ]{0,3})([-+])(?=[ ]|$|-)")
+_MARKDOWN_LEADING_ORDERED = re.compile(r"^([ ]{0,3}\d+)([.)])(?=[ ]|$)")
+
+
+def _escape_markdown_text(value: str) -> str:
+    normalized = _MARKDOWN_CONTROL_WHITESPACE.sub(" ", value)
+    escaped = escape_html(normalized, quote=False)
+    escaped = _MARKDOWN_INLINE_SPECIAL.sub(r"\\\1", escaped)
+    if len(escaped) - len(escaped.lstrip(" ")) >= 4:
+        escaped = "&#32;" + escaped[1:]
+    escaped = _MARKDOWN_LEADING_BULLET.sub(r"\1\\\2", escaped)
+    return _MARKDOWN_LEADING_ORDERED.sub(r"\1\\\2", escaped)
 
 
 class AppError(Exception):
@@ -136,6 +164,17 @@ def register_error_handlers(app: FastAPI) -> None:
             )
 
         route_path = getattr(route, "path", None)
+        if route_path == "/api/projects/{project_id}/revisions":
+            payload = ErrorResponse(
+                error_code="PATCH_INVALID",
+                message="The revision request is incomplete or invalid.",
+                retryable=False,
+                details=None,
+            )
+            return JSONResponse(
+                status_code=422,
+                content=payload.model_dump(mode="json"),
+            )
         message = (
             "The generation request is incomplete or invalid."
             if route_path == "/api/projects/{project_id}/generate"
@@ -562,6 +601,320 @@ def audit_project(
         started_at=audit_started,
         ended_at=audit_ended,
         mode=settings.paperlens_model_mode,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/revisions",
+    response_model=EditPatch,
+)
+def create_revision_preview(
+    project_id: str,
+    revision_request: RevisionRequest,
+    request: Request,
+) -> EditPatch:
+    settings = _settings(request)
+    store = _store(request)
+    hy3_service = request.app.state.hy3_service
+    service_settings = getattr(hy3_service, "settings", None)
+    revision_mode = getattr(
+        service_settings,
+        "paperlens_model_mode",
+        settings.paperlens_model_mode,
+    )
+    revision_model = getattr(service_settings, "hy3_model", settings.hy3_model)
+    revision_started = datetime.now(timezone.utc)
+    stable_stage: ProjectStage | None = None
+    try:
+        if revision_request.scope.value == "sentence":
+            sentence_id = revision_request.target_sentence_id
+            if sentence_id is None:
+                raise AppError(
+                    "PATCH_INVALID",
+                    "The sentence revision target is missing.",
+                    status_code=422,
+                    retryable=False,
+                )
+            base_version, current_text, evidence = (
+                store.get_sentence_revision_inputs(
+                    project_id,
+                    base_version_id=revision_request.base_version_id,
+                    sentence_id=sentence_id,
+                )
+            )
+            stable_stage = store.get_project_view(
+                project_id,
+                model_mode=settings.paperlens_model_mode,
+            ).stage
+            patch = hy3_service.revise_sentence(
+                base_version=base_version,
+                sentence_id=sentence_id,
+                current_text=current_text,
+                evidence_records=evidence,
+                user_instruction=revision_request.user_instruction,
+            )
+        else:
+            base_version, document = store.get_document_revision_inputs(
+                project_id,
+                base_version_id=revision_request.base_version_id,
+            )
+            stable_stage = store.get_project_view(
+                project_id,
+                model_mode=settings.paperlens_model_mode,
+            ).stage
+            patch = hy3_service.revise_document(
+                base_version=base_version,
+                document=document,
+                user_instruction=revision_request.user_instruction,
+            )
+    except Hy3ServiceError as error:
+        revision_ended = datetime.now(timezone.utc)
+        if stable_stage is None:
+            raise AppError(
+                error.error_code,
+                error.message,
+                status_code=_ERROR_STATUS.get(error.error_code, 502),
+                retryable=error.retryable,
+            ) from error
+        store.record_failure(
+            project_id=project_id,
+            version_id=None,
+            operation="revision",
+            mode=revision_mode,
+            error_code=error.error_code,
+            metadata=RunMetadata(
+                message=error.message,
+                retryable=error.retryable,
+                retryable_stage=stable_stage,
+                model=revision_model,
+                prompt_version=REVISION_PROMPT_VERSION,
+                schema_version=REVISION_SCHEMA_VERSION,
+            ),
+            usage=_usage_snapshot(error.usage),
+            started_at=revision_started,
+            ended_at=revision_ended,
+        )
+        raise AppError(
+            error.error_code,
+            error.message,
+            status_code=_ERROR_STATUS.get(error.error_code, 502),
+            retryable=error.retryable,
+        ) from error
+
+    revision_ended = datetime.now(timezone.utc)
+    return store.save_patch_preview(
+        project_id=project_id,
+        base_version_id=revision_request.base_version_id,
+        patch=patch,
+        mode=revision_mode,
+        metadata=RunMetadata(
+            message=None,
+            retryable=False,
+            retryable_stage=None,
+            model=revision_model,
+            prompt_version=REVISION_PROMPT_VERSION,
+            schema_version=REVISION_SCHEMA_VERSION,
+        ),
+        usage=_empty_usage(),
+        started_at=revision_started,
+        ended_at=revision_ended,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/revisions/{patch_id}/accept",
+    response_model=GenerationResponse,
+)
+def accept_revision_patch(
+    project_id: str,
+    patch_id: str,
+    request: Request,
+) -> GenerationResponse:
+    settings = _settings(request)
+    store = _store(request)
+    patch, bundle, source_blocks = store.get_patch_acceptance_inputs(
+        project_id,
+        patch_id=patch_id,
+    )
+    if (
+        patch.scope.value == "sentence"
+        and store.requires_sentence_claim_regeneration(patch)
+    ):
+        (
+            original_claims,
+            related_evidence,
+            allowed_block_ids,
+            reserved_claim_ids,
+        ) = store.get_sentence_claim_regeneration_inputs(
+            project_id,
+            patch_id=patch_id,
+        )
+        try:
+            regenerated = (
+                request.app.state.hy3_service.regenerate_sentence_claims(
+                    target_sentence_id=patch.target_sentence_ids[0],
+                    accepted_after_text=patch.after_text,
+                    original_claims=original_claims,
+                    evidence_records=related_evidence,
+                    allowed_block_ids=allowed_block_ids,
+                    reserved_claim_ids=reserved_claim_ids,
+                    user_instruction=(
+                        "Regenerate claims for the accepted target sentence."
+                    ),
+                )
+            )
+        except Hy3ServiceError as error:
+            raise AppError(
+                error.error_code,
+                error.message,
+                status_code=_ERROR_STATUS.get(error.error_code, 502),
+                retryable=error.retryable,
+            ) from error
+        bundle = store.build_sentence_revision_bundle(
+            patch=patch,
+            provisional_bundle=bundle,
+            regenerated_claims=regenerated.claims,
+        )
+    elif patch.scope.value == "document":
+        try:
+            bundle = request.app.state.hy3_service.regenerate_document_claims(
+                document=bundle.document,
+                source_blocks=source_blocks,
+            )
+        except Hy3ServiceError as error:
+            raise AppError(
+                error.error_code,
+                error.message,
+                status_code=_ERROR_STATUS.get(error.error_code, 502),
+                retryable=error.retryable,
+            ) from error
+    quick_started = datetime.now(timezone.utc)
+    try:
+        records, quick_report = request.app.state.audit_service.quick_check(
+            bundle,
+            source_blocks,
+        )
+        evidence = EvidenceSnapshot(evidence_records=records)
+    except (AuditServiceError, ValidationError) as error:
+        if isinstance(error, AuditServiceError):
+            error_code = error.error_code
+            message = error.message
+            retryable = error.retryable
+        else:
+            error_code = "AUDIT_INCOMPLETE"
+            message = "Quick check could not be completed."
+            retryable = False
+        raise AppError(
+            error_code,
+            message,
+            status_code=_ERROR_STATUS.get(error_code, 502),
+            retryable=retryable,
+        ) from error
+
+    quick_ended = datetime.now(timezone.utc)
+    version_id, _version_no = store.accept_patch(
+        project_id=project_id,
+        patch_id=patch_id,
+        bundle=bundle,
+        evidence=evidence,
+        report=quick_report,
+        metadata=_success_metadata(),
+        usage=_empty_usage(),
+        started_at=quick_started,
+        ended_at=quick_ended,
+    )
+    return GenerationResponse(
+        project_id=project_id,
+        version_id=version_id,
+        stage=ProjectStage.QUICK_CHECKED,
+        model_mode=settings.paperlens_model_mode,
+        document=bundle.document,
+        claims=bundle.claims,
+        evidence_records=evidence.evidence_records,
+        quick_report=quick_report,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/revisions/{patch_id}/reject",
+    status_code=204,
+    response_class=Response,
+)
+def reject_revision_patch(
+    project_id: str,
+    patch_id: str,
+    request: Request,
+) -> Response:
+    _store(request).reject_patch(project_id, patch_id=patch_id)
+    return Response(status_code=204)
+
+
+@router.post(
+    "/projects/{project_id}/versions/{version_id}/restore",
+    response_model=VersionSummary,
+)
+def restore_project_version(
+    project_id: str,
+    version_id: str,
+    request: Request,
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+) -> VersionSummary:
+    if idempotency_key is None or not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
+        raise AppError(
+            "IDEMPOTENCY_KEY_INVALID",
+            "A valid Idempotency-Key header is required.",
+            status_code=422,
+            retryable=False,
+        )
+    key_hash = sha256(idempotency_key.encode("ascii")).hexdigest()
+    return _store(request).restore_version(
+        project_id,
+        version_id=version_id,
+        key_hash=key_hash,
+    )
+
+
+@router.get("/projects/{project_id}/export", response_class=Response)
+def export_project_markdown(project_id: str, request: Request) -> Response:
+    (
+        document,
+        version_id,
+        version_no,
+        created_at,
+        pdf_sha256,
+        source_model,
+        source_mode,
+    ) = _store(request).get_export_inputs(project_id)
+    lines = [f"# {_escape_markdown_text(document.title)}", ""]
+    for section in document.sections:
+        lines.extend([f"## {_escape_markdown_text(section.heading)}", ""])
+        for sentence in section.sentences:
+            lines.extend([_escape_markdown_text(sentence.text), ""])
+    lines.extend(
+        [
+            "---",
+            "",
+            "## 生成说明",
+            "",
+            f"- 来源论文说明：内容基于用户已确认处理权限的上传论文；文件指纹为 `{pdf_sha256}`。",
+            "- AI 辅助说明：本文档由 PaperLens 在用户确认修改后辅助生成与检查，仍需人工复核。",
+            f"- 生成时间：{created_at.isoformat().replace('+00:00', 'Z')}。",
+            f"- 模型信息：{_escape_markdown_text(source_model)}（{source_mode}）。",
+            f"- 当前版本：{version_id}（v{version_no}）。",
+            "",
+        ]
+    )
+    return Response(
+        content="\n".join(lines),
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="paperlens-{project_id}.md"'
+            )
+        },
     )
 
 

@@ -1,12 +1,16 @@
 import type {
   DeepAuditRequest,
   DeepAuditResponse,
+  EditPatch,
   ErrorResponse,
   GenerationRequest,
   GenerationResponse,
   HealthResponse,
   ProjectCreateResponse,
   ProjectView,
+  RejectRevisionResponse,
+  RestoreVersionResponse,
+  RevisionRequest,
 } from "./types";
 
 
@@ -129,6 +133,23 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 
+async function requestNoContent(path: string, init?: RequestInit): Promise<void> {
+  const response = await request(path, init);
+
+  if (!response.ok) {
+    throw await readError(response);
+  }
+  if (response.status !== 204) {
+    throw clientError(
+      response.status,
+      "INVALID_RESPONSE",
+      "服务返回了非预期的补丁拒绝结果，请重试。",
+      false,
+    );
+  }
+}
+
+
 function projectPath(projectId: string, suffix = ""): string {
   return `/api/projects/${encodeURIComponent(projectId)}${suffix}`;
 }
@@ -210,4 +231,80 @@ export function auditProject(
     body: JSON.stringify(input),
     signal,
   });
+}
+
+
+export function createRevision(
+  projectId: string,
+  input: RevisionRequest,
+  signal?: AbortSignal,
+): Promise<EditPatch> {
+  return requestJson<EditPatch>(projectPath(projectId, "/revisions"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+    signal,
+  });
+}
+
+
+export function acceptRevision(
+  projectId: string,
+  patchId: string,
+  signal?: AbortSignal,
+): Promise<GenerationResponse> {
+  return requestJson<GenerationResponse>(
+    projectPath(
+      projectId,
+      `/revisions/${encodeURIComponent(patchId)}/accept`,
+    ),
+    { method: "POST", signal },
+  );
+}
+
+
+export function rejectRevision(
+  projectId: string,
+  patchId: string,
+  signal?: AbortSignal,
+): Promise<RejectRevisionResponse> {
+  return requestNoContent(
+    projectPath(
+      projectId,
+      `/revisions/${encodeURIComponent(patchId)}/reject`,
+    ),
+    { method: "POST", signal },
+  );
+}
+
+
+export function restoreProjectVersion(
+  projectId: string,
+  versionId: string,
+  idempotencyKey: string,
+  signal?: AbortSignal,
+): Promise<RestoreVersionResponse> {
+  return requestJson<RestoreVersionResponse>(
+    projectPath(
+      projectId,
+      `/versions/${encodeURIComponent(versionId)}/restore`,
+    ),
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      signal,
+    },
+  );
+}
+
+
+export async function exportProjectMarkdown(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  const response = await request(projectPath(projectId, "/export"), { signal });
+  if (!response.ok) {
+    throw await readError(response);
+  }
+  return response.blob();
 }

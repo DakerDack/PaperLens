@@ -229,7 +229,8 @@ created -> parsed -> generated -> quick_checked -> deep_audited
 | `POST /api/projects/{id}/audit` | 批量运行完整语义审计和评分 | 完整 `AuditReport` | `PROJECT_NOT_READY`、`EVIDENCE_NOT_READY`、`HY3_CONFIG_MISSING`、`SCHEMA_INVALID`、`AUDIT_INCOMPLETE`、`HY3_UNAVAILABLE` |
 | `POST /api/projects/{id}/revisions` | 生成补丁预览，不改当前版本 | `EditPatch` | `TARGET_STALE`、`PATCH_INVALID` |
 | `POST /api/projects/{id}/revisions/{patch_id}/accept` | 接受补丁并生成新版本 | 新版本和快速检查结果 | `TARGET_STALE`、`PATCH_INVALID` |
-| `POST /api/projects/{id}/versions/{version_id}/restore` | 复制历史版本为新当前版本 | 新版本 | `VERSION_NOT_FOUND` |
+| `POST /api/projects/{id}/revisions/{patch_id}/reject` | 拒绝待处理补丁；重复拒绝保持幂等 | 空响应（204） | `PATCH_NOT_FOUND`、`PATCH_INVALID` |
+| `POST /api/projects/{id}/versions/{version_id}/restore` | 使用必需 `Idempotency-Key` 复制历史版本为新当前版本；相同 key、项目和目标只创建一次 | `VersionSummary` | `VERSION_NOT_FOUND`、`IDEMPOTENCY_KEY_INVALID`、`IDEMPOTENCY_CONFLICT` |
 | `GET /api/projects/{id}/export` | 导出当前 Markdown 与来源说明 | `.md` 文件 | `PROJECT_NOT_READY` |
 
 不允许在开发过程中创建功能重复的路径。若确需改变 API，必须同时修改本节、`types.ts`、后端契约测试和前端 API 测试。
@@ -237,12 +238,12 @@ created -> parsed -> generated -> quick_checked -> deep_audited
 API 路径在本节一次冻结，但实现按阶段交付，禁止为了让路径提前存在而创建占位路由：
 
 - 阶段 4 只实现核心闭环所需的 `POST /api/projects`、`GET /api/projects/{id}`、`GET /api/projects/{id}/pdf`、`POST /api/projects/{id}/generate` 和 `POST /api/projects/{id}/audit`。
-- 阶段 6 实现 `POST /api/projects/{id}/revisions`、补丁接受、版本恢复和 Markdown 导出；这些路径在阶段 4 不得以固定错误、空对象或未实现响应占位。
+- 阶段 6 实现 `POST /api/projects/{id}/revisions`、补丁接受与拒绝、版本恢复和 Markdown 导出；这些路径在阶段 4 不得以固定错误、空对象或未实现响应占位。
 - 阶段 5 前端只能调用阶段 4 已真实实现的核心路径；修订、恢复和导出 UI 随阶段 6 一并启用。
 
 ### 4.3 SQLite 最小表结构
 
-数据库固定为五张表，不建立通用实体系统：
+数据库固定为六张表，不建立通用实体系统：
 
 | 表 | 必需字段 |
 |---|---|
@@ -251,6 +252,7 @@ API 路径在本节一次冻结，但实现按阶段交付，禁止为了让路�
 | `audits` | `id`、`project_id`、`version_id`、`status`、`evidence_json`、`report_json`、`created_at` |
 | `patches` | `id`、`project_id`、`base_version_id`、`status`、`patch_json`、`created_at` |
 | `runs` | `id`、`project_id`、`version_id`、`operation`、`mode`、`status`、`metadata_json`、`usage_json`、`error_code`、`started_at`、`ended_at` |
+| `restore_idempotency` | `key_hash`、`project_id`、`target_version_id`、`result_version_id`、`created_at` |
 
 所有 JSON 列在写入前必须经过 Pydantic 校验。`status/stage` 使用固定枚举；不允许在 SQL 中保存 Python pickle。删除项目时再清理其 PDF 和解析临时文件，普通重试不得删除上一个稳定版本。
 
@@ -261,6 +263,7 @@ API 路径在本节一次冻结，但实现按阶段交付，禁止为了让路�
 - `projects.parse_json` 保存严格的解析快照，包含 `SourceBlock[]` 与解析质量；`versions.content_json` 保存 `ContentDraft`，`versions.claims_json` 保存 `AtomicClaim[]`，`audits.report_json` 仍只保存同一份完整 `AuditReport`。
 - 可读错误消息、是否可重试和可重试阶段保存在最新失败 `runs.metadata_json`；不再向 `projects` 增加重复错误字段。项目即使处于 `failed`，最后一个稳定版本和审计快照仍可读取。
 - SQLite 文件固定为 `PAPERLENS_DATA_DIR/paperlens.db`；PDF 固定保存为 `PAPERLENS_DATA_DIR/projects/<project_id>/source.pdf`。客户端文件名不得参与存储路径，路径必须经解析后仍位于项目目录内。
+- `restore_idempotency.key_hash` 只保存 canonical lowercase UUID v4 原文的 SHA-256，使用 `TEXT PRIMARY KEY NOT NULL`，并以 CHECK 强制为 64 位小写十六进制；原始 key 只能存在于当前内存请求和 HTTP Header，不得进入日志、数据库、版本 reason、错误体或 run。`project_id` 外键到 `projects.id`，`target_version_id` 和 `result_version_id` 外键到 `versions.id`，`result_version_id` 必须 `UNIQUE`；事务内还必须验证目标与结果版本都属于记录中的项目。
 
 ## 5. 数据契约模板
 
@@ -753,6 +756,7 @@ DeepAuditResponse
 - `POST /api/projects/{id}/audit` 只接收 `DeepAuditRequest`。API 从 `projects.rights_confirmed` 构造 `ComplianceContext.rights_or_license_confirmed`，不得接受客户端覆盖；其余四个披露和标识字段来自请求。完整审计只读取当前版本已保存的 `ContentDraft`、`AtomicClaim[]` 和 `EvidenceRecord[]`。
 - `GET /api/projects/{id}` 返回 `ProjectView`，只从已通过 Pydantic 重新验证的数据库快照构造；不得暴露 `pdf_path`、SQL 行、Hy3 原始响应或供应商敏感自由文本。
 - `GET /api/projects/{id}/pdf` 只返回当前项目固定 `source.pdf`，并设置 `application/pdf`；数据库路径缺失、越界或文件不存在统一返回 `PDF_NOT_FOUND`。
+- `POST /api/projects/{id}/versions/{version_id}/restore` 不接收请求体，必须使用 `Idempotency-Key` Header。Header 由 FastAPI 以可选字符串接收后手工严格验证为 canonical lowercase UUID v4，缺失或非法稳定返回 HTTP 422 / `IDEMPOTENCY_KEY_INVALID`，不得依赖通用 `RequestValidationError`。每次用户明确 restore 意图只在 App 操作层生成一次 key，`api.ts` 只传递调用方 key；同一次投递或底层重投复用同一 key，新一次用户操作生成新 key。restore 在读取幂等记录前执行 `BEGIN IMMEDIATE`，版本、审计、当前版本和幂等记录必须在同一事务提交；相同 key、项目和目标返回首次 `VersionSummary` 且不增加第二个版本、审计或 run，同 key 配合不同项目或目标稳定返回 HTTP 409 / `IDEMPOTENCY_CONFLICT`。首次事务未提交时同 key 可安全重试，已提交但响应丢失时必须返回既有结果。首次 restore 的 run 行为由后续 Revision run 原子任务决定，本契约只禁止幂等重放产生额外 run。
 - Mock/Live 模式只来自后端 `Settings`，客户端不能切换。`model_mode` 必须进入生成响应和项目视图，使前端能够显示 `MOCK`。
 
 现有错误码的 HTTP 映射固定如下，不新增同义错误码：
@@ -762,9 +766,9 @@ DeepAuditResponse
 | 400 | `PDF_INVALID` |
 | 403 | `RIGHTS_NOT_CONFIRMED` |
 | 404 | `PROJECT_NOT_FOUND`、`PDF_NOT_FOUND`、`VERSION_NOT_FOUND` |
-| 409 | `PROJECT_NOT_READY`、`EVIDENCE_NOT_READY`、`TARGET_STALE` |
+| 409 | `PROJECT_NOT_READY`、`EVIDENCE_NOT_READY`、`TARGET_STALE`、`IDEMPOTENCY_CONFLICT` |
 | 413 | `PDF_INVALID`，并在安全 `details.reason` 中标记 `file_too_large` |
-| 422 | `PARSE_QUALITY_LOW`、`PATCH_INVALID` |
+| 422 | `PARSE_QUALITY_LOW`、`PATCH_INVALID`、`IDEMPOTENCY_KEY_INVALID` |
 | 502 | `SCHEMA_INVALID`、`AUDIT_INCOMPLETE` |
 | 503 | `PARSE_FAILED`、`HY3_CONFIG_MISSING`、`HY3_UNAVAILABLE` |
 
@@ -1153,7 +1157,7 @@ PRODUCTION_READY=NO
 3. 修改结果只生成补丁预览，不直接应用。
 4. 接受补丁前检查版本号、`before_hash` 和范围。
 5. 接受后创建不可变新版本并自动运行快速检查。
-6. 回退通过复制历史快照创建新版本，不移动或删除历史记录。
+6. 回退通过复制历史快照创建新版本，不移动或删除历史记录；每次用户明确回退只生成一个 canonical UUID v4 幂等键，相同 key、项目和目标最多创建一个结果版本。
 
 测试：
 
@@ -1171,6 +1175,7 @@ npx playwright test
 - 拒绝补丁不改变当前版本。
 - 接受补丁生成新版本并保留旧版本。
 - 回退后内容、主张和审计快照一致。
+- 串行或并发重复 restore 不增加第二个版本、审计或 run；同 key 跨项目或目标稳定冲突，缺失或非法 Header 稳定拒绝，原始 key 不进入数据库、日志、错误体或版本 reason。
 - 句子修改不改变未选择句子。
 - 全文修改后必须重新生成主张，旧深度审计标记为过期。
 

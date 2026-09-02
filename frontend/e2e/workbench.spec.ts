@@ -180,53 +180,81 @@ interface ApiPreset {
   emptyEvidence?: boolean;
   auditIncomplete?: boolean;
   mode?: "mock" | "live";
+  recoverPendingPatch?: boolean;
 }
 
 
 async function installApiPreset(page: Page, preset: ApiPreset = {}) {
-  let stage: "parsed" | "quick_checked" | "deep_audited" = "parsed";
+  let stage: "parsed" | "quick_checked" | "deep_audited" | "patch_pending" =
+    "parsed";
   let auditAttempts = 0;
+  let projectReads = 0;
+  let revisionAttempts = 0;
+  let acceptAttempts = 0;
+  let rejectAttempts = 0;
+  let restoreAttempts = 0;
+  let patchSequence = 0;
+  let versionNo = 0;
+  let currentVersionId: string | null = null;
+  let currentDocument = structuredClone(documentDraft);
+  let currentAudit: typeof quickReport | typeof deepReport = quickReport;
   const mode = preset.mode ?? "mock";
   const activeClaims = preset.emptyEvidence ? [] : claims;
   const activeEvidence = preset.emptyEvidence ? [] : evidenceRecords;
+  const versions: Array<{
+    version_id: string;
+    version_no: number;
+    parent_version_id: string | null;
+    reason: string;
+    created_at: string;
+  }> = [];
+  const snapshots = new Map<
+    string,
+    {
+      document: typeof documentDraft;
+      audit: typeof quickReport | typeof deepReport;
+    }
+  >();
+  const restoreKeys: string[] = [];
+  const patches = new Map<
+    string,
+    {
+      patch: Record<string, unknown>;
+      status: "pending" | "rejected" | "accepted";
+    }
+  >();
 
-  const projectView = () => ({
-    project_id: "p-e2e",
-    stage,
-    model_mode: mode,
-    parse_quality: {
-      page_count: 2,
-      block_count: 4,
-      empty_page_rate: 0,
-      abnormal_character_rate: 0,
-      page_number_completeness_rate: 1,
-      bbox_availability_rate: 1,
-    },
-    source_block_count: 4,
-    current_version_id: stage === "parsed" ? null : "v-e2e-1",
-    current_version_no: stage === "parsed" ? null : 1,
-    document: stage === "parsed" ? null : documentDraft,
-    claims: stage === "parsed" ? [] : activeClaims,
-    evidence_records: stage === "parsed" ? [] : activeEvidence,
-    audit_report:
-      stage === "parsed" ? null : stage === "deep_audited" ? deepReport : quickReport,
-    versions:
-      stage === "parsed"
-        ? []
-        : [
-            {
-              version_id: "v-e2e-1",
-              version_no: 1,
-              parent_version_id: null,
-              reason: "initial_generation",
-              created_at: "2026-08-25T08:01:00Z",
-            },
-          ],
-    error_code: null,
-    retryable_stage: null,
-    created_at: "2026-08-25T08:00:00Z",
-    updated_at: "2026-08-25T08:01:00Z",
-  });
+  const projectView = () => {
+    const pendingPatch = Array.from(patches.values()).find(
+      (storedPatch) => storedPatch.status === "pending",
+    )?.patch ?? null;
+    return {
+      project_id: "p-e2e",
+      stage,
+      model_mode: mode,
+      parse_quality: {
+        page_count: 2,
+        block_count: 4,
+        empty_page_rate: 0,
+        abnormal_character_rate: 0,
+        page_number_completeness_rate: 1,
+        bbox_availability_rate: 1,
+      },
+      source_block_count: 4,
+      current_version_id: stage === "parsed" ? null : currentVersionId,
+      current_version_no: stage === "parsed" ? null : versionNo,
+      document: stage === "parsed" ? null : currentDocument,
+      claims: stage === "parsed" ? [] : activeClaims,
+      evidence_records: stage === "parsed" ? [] : activeEvidence,
+      audit_report: stage === "parsed" ? null : currentAudit,
+      versions: stage === "parsed" ? [] : versions,
+      pending_patch: pendingPatch,
+      error_code: null,
+      retryable_stage: null,
+      created_at: "2026-08-25T08:00:00Z",
+      updated_at: "2026-08-25T08:01:00Z",
+    };
+  };
 
   await page.route("**/api/**", async (route) => {
     const request = route.request();
@@ -234,7 +262,7 @@ async function installApiPreset(page: Page, preset: ApiPreset = {}) {
     const corsHeaders = {
       "access-control-allow-origin": "*",
       "access-control-allow-methods": "GET,POST,OPTIONS",
-      "access-control-allow-headers": "content-type",
+      "access-control-allow-headers": "content-type,idempotency-key",
     };
     if (request.method() === "OPTIONS") {
       await route.fulfill({ status: 204, headers: corsHeaders });
@@ -250,6 +278,49 @@ async function installApiPreset(page: Page, preset: ApiPreset = {}) {
     }
     if (url.pathname === "/api/projects" && request.method() === "POST") {
       stage = "parsed";
+      versionNo = 0;
+      currentVersionId = null;
+      currentDocument = structuredClone(documentDraft);
+      currentAudit = quickReport;
+      versions.splice(0);
+      snapshots.clear();
+      patches.clear();
+      patchSequence = 0;
+      rejectAttempts = 0;
+      restoreKeys.splice(0);
+      if (preset.recoverPendingPatch) {
+        stage = "patch_pending";
+        versionNo = 1;
+        currentVersionId = "v-e2e-1";
+        versions.push({
+          version_id: currentVersionId,
+          version_no: versionNo,
+          parent_version_id: null,
+          reason: "initial_generation",
+          created_at: "2026-08-25T08:01:00Z",
+        });
+        snapshots.set(currentVersionId, {
+          document: structuredClone(currentDocument),
+          audit: currentAudit,
+        });
+        const recoveredPatch = {
+          patch_id: "patch-e2e-recovered",
+          base_version: 1,
+          scope: "sentence",
+          target_sentence_ids: ["s-003"],
+          before_hash: "a".repeat(64),
+          before_text: "The fixture identifies the second page as page two.",
+          after_text:
+            "The fixture identifies the second page as page two with recovered scope.",
+          reason: "Recovered server revision preview",
+          fact_changed: false,
+          evidence_changed: false,
+        };
+        patches.set(recoveredPatch.patch_id, {
+          patch: recoveredPatch,
+          status: "pending",
+        });
+      }
       await route.fulfill({
         status: 201,
         json: {
@@ -273,6 +344,7 @@ async function installApiPreset(page: Page, preset: ApiPreset = {}) {
       return;
     }
     if (url.pathname === "/api/projects/p-e2e" && request.method() === "GET") {
+      projectReads += 1;
       await route.fulfill({ status: 200, json: projectView(), headers: corsHeaders });
       return;
     }
@@ -281,14 +353,30 @@ async function installApiPreset(page: Page, preset: ApiPreset = {}) {
       request.method() === "POST"
     ) {
       stage = "quick_checked";
+      versionNo = 1;
+      currentVersionId = "v-e2e-1";
+      currentDocument = structuredClone(documentDraft);
+      currentAudit = quickReport;
+      versions.splice(0);
+      versions.push({
+        version_id: currentVersionId,
+        version_no: versionNo,
+        parent_version_id: null,
+        reason: "initial_generation",
+        created_at: "2026-08-25T08:01:00Z",
+      });
+      snapshots.set(currentVersionId, {
+        document: structuredClone(currentDocument),
+        audit: currentAudit,
+      });
       await route.fulfill({
         status: 200,
         json: {
           project_id: "p-e2e",
-          version_id: "v-e2e-1",
+          version_id: currentVersionId,
           stage: "quick_checked",
           model_mode: mode,
-          document: documentDraft,
+          document: currentDocument,
           claims: activeClaims,
           evidence_records: activeEvidence,
           quick_report: quickReport,
@@ -314,15 +402,268 @@ async function installApiPreset(page: Page, preset: ApiPreset = {}) {
         return;
       }
       stage = "deep_audited";
+      currentAudit = deepReport;
+      if (currentVersionId) {
+        snapshots.set(currentVersionId, {
+          document: structuredClone(currentDocument),
+          audit: currentAudit,
+        });
+      }
       await route.fulfill({
         status: 200,
         json: {
           project_id: "p-e2e",
-          version_id: "v-e2e-1",
+          version_id: currentVersionId,
           stage: "deep_audited",
           audit_report: deepReport,
         },
         headers: corsHeaders,
+      });
+      return;
+    }
+    if (
+      url.pathname === "/api/projects/p-e2e/revisions" &&
+      request.method() === "POST"
+    ) {
+      revisionAttempts += 1;
+      const body = request.postDataJSON() as {
+        base_version_id: string;
+        scope: "sentence" | "document";
+        target_sentence_id: string | null;
+      };
+      const patchId = `patch-e2e-${++patchSequence}`;
+      let beforeText: string;
+      let afterText: string;
+      let targetSentenceIds: string[];
+      if (body.scope === "sentence" && body.target_sentence_id) {
+        const sentence = currentDocument.sections
+          .flatMap((section) => section.sentences)
+          .find((item) => item.sentence_id === body.target_sentence_id);
+        beforeText = sentence?.text ?? "";
+        afterText = `${beforeText.replace(/\.$/, "")} with clarified scope.`;
+        targetSentenceIds = [body.target_sentence_id];
+      } else {
+        beforeText = JSON.stringify(currentDocument);
+        afterText = JSON.stringify({
+          ...currentDocument,
+          title: "PaperLens revised five-section explanation",
+        });
+        targetSentenceIds = [];
+      }
+      const patch = {
+        patch_id: patchId,
+        base_version: versionNo,
+        scope: body.scope,
+        target_sentence_ids: targetSentenceIds,
+        before_hash: "a".repeat(64),
+        before_text: beforeText,
+        after_text: afterText,
+        reason: "E2E revision preview",
+        fact_changed: false,
+        evidence_changed: false,
+      };
+      patches.set(patchId, { patch, status: "pending" });
+      stage = "patch_pending";
+      await route.fulfill({ status: 200, json: patch, headers: corsHeaders });
+      return;
+    }
+    const rejectMatch = url.pathname.match(
+      /^\/api\/projects\/p-e2e\/revisions\/([^/]+)\/reject$/,
+    );
+    if (rejectMatch && request.method() === "POST") {
+      const patchId = decodeURIComponent(rejectMatch[1]);
+      const storedPatch = patches.get(patchId);
+      if (!storedPatch) {
+        await route.fulfill({
+          status: 404,
+          json: {
+            error_code: "PATCH_NOT_FOUND",
+            message: "Patch not found",
+            retryable: false,
+            details: null,
+          },
+          headers: corsHeaders,
+        });
+        return;
+      }
+      if (storedPatch.status === "accepted") {
+        await route.fulfill({
+          status: 422,
+          json: {
+            error_code: "PATCH_INVALID",
+            message: "Only pending or rejected patches can be rejected",
+            retryable: false,
+            details: null,
+          },
+          headers: corsHeaders,
+        });
+        return;
+      }
+      rejectAttempts += 1;
+      storedPatch.status = "rejected";
+      stage =
+        currentAudit.audit_status === "deep_complete"
+          ? "deep_audited"
+          : "quick_checked";
+      await route.fulfill({ status: 204, headers: corsHeaders });
+      return;
+    }
+    const acceptMatch = url.pathname.match(
+      /^\/api\/projects\/p-e2e\/revisions\/([^/]+)\/accept$/,
+    );
+    if (acceptMatch && request.method() === "POST") {
+      acceptAttempts += 1;
+      const storedPatch = patches.get(decodeURIComponent(acceptMatch[1]));
+      const patch = storedPatch?.patch as
+        | {
+            patch_id: string;
+            scope: "sentence" | "document";
+            target_sentence_ids: string[];
+            after_text: string;
+          }
+        | undefined;
+      if (!patch) {
+        await route.fulfill({
+          status: 404,
+          json: {
+            error_code: "PATCH_NOT_FOUND",
+            message: "Patch not found",
+            retryable: false,
+            details: null,
+          },
+          headers: corsHeaders,
+        });
+        return;
+      }
+      if (storedPatch?.status !== "pending") {
+        await route.fulfill({
+          status: 422,
+          json: {
+            error_code: "PATCH_INVALID",
+            message: "Only pending patches can be accepted",
+            retryable: false,
+            details: null,
+          },
+          headers: corsHeaders,
+        });
+        return;
+      }
+      const parentVersionId = currentVersionId;
+      if (patch.scope === "sentence") {
+        const targetId = patch.target_sentence_ids[0];
+        currentDocument = {
+          ...currentDocument,
+          sections: currentDocument.sections.map((section) => ({
+            ...section,
+            sentences: section.sentences.map((sentence) =>
+              sentence.sentence_id === targetId
+                ? { ...sentence, text: patch.after_text }
+                : sentence,
+            ),
+          })),
+        };
+      } else {
+        currentDocument = JSON.parse(patch.after_text) as typeof documentDraft;
+      }
+      versionNo += 1;
+      currentVersionId = `v-e2e-${versionNo}`;
+      stage = "quick_checked";
+      currentAudit = quickReport;
+      versions.push({
+        version_id: currentVersionId,
+        version_no: versionNo,
+        parent_version_id: parentVersionId,
+        reason: `accepted_patch:${patch.patch_id}`,
+        created_at: `2026-08-25T08:${String(versionNo).padStart(2, "0")}:00Z`,
+      });
+      snapshots.set(currentVersionId, {
+        document: structuredClone(currentDocument),
+        audit: currentAudit,
+      });
+      storedPatch.status = "accepted";
+      await route.fulfill({
+        status: 200,
+        json: {
+          project_id: "p-e2e",
+          version_id: currentVersionId,
+          stage,
+          model_mode: mode,
+          document: currentDocument,
+          claims: activeClaims,
+          evidence_records: activeEvidence,
+          quick_report: quickReport,
+        },
+        headers: corsHeaders,
+      });
+      return;
+    }
+    const restoreMatch = url.pathname.match(
+      /^\/api\/projects\/p-e2e\/versions\/([^/]+)\/restore$/,
+    );
+    if (restoreMatch && request.method() === "POST") {
+      restoreAttempts += 1;
+      const targetVersionId = decodeURIComponent(restoreMatch[1]);
+      const idempotencyKey = await request.headerValue("idempotency-key");
+      if (
+        !idempotencyKey ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+          idempotencyKey,
+        )
+      ) {
+        await route.fulfill({
+          status: 422,
+          json: {
+            error_code: "IDEMPOTENCY_KEY_INVALID",
+            message: "The restore idempotency key is invalid.",
+            retryable: false,
+            details: null,
+          },
+          headers: corsHeaders,
+        });
+        return;
+      }
+      restoreKeys.push(idempotencyKey);
+      const snapshot = snapshots.get(targetVersionId);
+      if (!snapshot) {
+        await route.fulfill({ status: 404, headers: corsHeaders });
+        return;
+      }
+      const parentVersionId = currentVersionId;
+      versionNo += 1;
+      currentVersionId = `v-e2e-${versionNo}`;
+      currentDocument = structuredClone(snapshot.document);
+      currentAudit = snapshot.audit;
+      stage = currentAudit.audit_status === "deep_complete" ? "deep_audited" : "quick_checked";
+      versions.push({
+        version_id: currentVersionId,
+        version_no: versionNo,
+        parent_version_id: parentVersionId,
+        reason: `restore:${targetVersionId}`,
+        created_at: `2026-08-25T08:${String(versionNo).padStart(2, "0")}:00Z`,
+      });
+      snapshots.set(currentVersionId, {
+        document: structuredClone(currentDocument),
+        audit: currentAudit,
+      });
+      await route.fulfill({
+        status: 200,
+        json: versions.at(-1),
+        headers: corsHeaders,
+      });
+      return;
+    }
+    if (
+      url.pathname === "/api/projects/p-e2e/export" &&
+      request.method() === "GET"
+    ) {
+      await route.fulfill({
+        status: 200,
+        body: `# ${currentDocument.title}\n\n来源论文说明\nAI 辅助说明`,
+        contentType: "text/markdown; charset=utf-8",
+        headers: {
+          ...corsHeaders,
+          "content-disposition": 'attachment; filename="paperlens-p-e2e.md"',
+        },
       });
       return;
     }
@@ -338,7 +679,20 @@ async function installApiPreset(page: Page, preset: ApiPreset = {}) {
     });
   });
 
-  return { auditAttempts: () => auditAttempts };
+  return {
+    auditAttempts: () => auditAttempts,
+    projectReads: () => projectReads,
+    revisionAttempts: () => revisionAttempts,
+    acceptAttempts: () => acceptAttempts,
+    rejectAttempts: () => rejectAttempts,
+    restoreAttempts: () => restoreAttempts,
+    restoreKeys: () => [...restoreKeys],
+    patchRecords: () =>
+      Array.from(patches.entries()).map(([patchId, storedPatch]) => ({
+        patchId,
+        status: storedPatch.status,
+      })),
+  };
 }
 
 
@@ -585,4 +939,164 @@ test("preset 3: mobile empty evidence and AUDIT_INCOMPLETE remain retryable", as
     path: testInfo.outputPath("mobile-audit-incomplete.png"),
     fullPage: true,
   });
+});
+
+
+test("preset 4: sentence patch stays preview-only until explicit acceptance", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const apiState = await installApiPreset(page);
+  await uploadAndGenerate(page);
+  const sentence = page.getByRole("button", {
+    name: /The fixture identifies the second page as page two/,
+  });
+  await sentence.click();
+  await page.getByLabel("修改意图").fill("Keep the facts and clarify the scope.");
+
+  await page.getByRole("button", { name: "生成补丁预览" }).click();
+  const diff = page.getByRole("region", { name: "修改前后差异" });
+  await expect(diff).toBeVisible();
+  await expect(sentence).toContainText("The fixture identifies the second page as page two.");
+  await expect.poll(apiState.patchRecords).toEqual([
+    { patchId: "patch-e2e-1", status: "pending" },
+  ]);
+
+  await page.getByRole("button", { name: "拒绝修改" }).click();
+  await expect.poll(apiState.rejectAttempts).toBe(1);
+  await expect(diff).toHaveCount(0);
+  await expect.poll(apiState.patchRecords).toEqual([
+    { patchId: "patch-e2e-1", status: "rejected" },
+  ]);
+  const repeatedRejectStatus = await page.evaluate(async () => {
+    const response = await fetch(
+      "/api/projects/p-e2e/revisions/patch-e2e-1/reject",
+      { method: "POST" },
+    );
+    return response.status;
+  });
+  expect(repeatedRejectStatus).toBe(204);
+  const rejectedAccept = await page.evaluate(async () => {
+    const response = await fetch(
+      "/api/projects/p-e2e/revisions/patch-e2e-1/accept",
+      { method: "POST" },
+    );
+    return {
+      status: response.status,
+      errorCode: (await response.json()).error_code as string,
+    };
+  });
+  expect(rejectedAccept).toEqual({ status: 422, errorCode: "PATCH_INVALID" });
+  await expect(sentence).toContainText("The fixture identifies the second page as page two.");
+  await expect(page.locator(".version-list > li")).toHaveCount(1);
+  await expect(page.locator(".project-summary").getByText("版本 1")).toBeVisible();
+
+  await sentence.click();
+  await page.getByRole("button", { name: "生成补丁预览" }).click();
+  await expect(diff).toBeVisible();
+  await expect.poll(apiState.patchRecords).toEqual([
+    { patchId: "patch-e2e-1", status: "rejected" },
+    { patchId: "patch-e2e-2", status: "pending" },
+  ]);
+  await page.getByRole("button", { name: "接受修改" }).click();
+
+  await expect(
+    page.getByRole("button", {
+      name: /The fixture identifies the second page as page two with clarified scope/,
+    }),
+  ).toBeVisible();
+  await expect.poll(apiState.patchRecords).toEqual([
+    { patchId: "patch-e2e-1", status: "rejected" },
+    { patchId: "patch-e2e-2", status: "accepted" },
+  ]);
+  const acceptedReject = await page.evaluate(async () => {
+    const response = await fetch(
+      "/api/projects/p-e2e/revisions/patch-e2e-2/reject",
+      { method: "POST" },
+    );
+    return {
+      status: response.status,
+      errorCode: (await response.json()).error_code as string,
+    };
+  });
+  expect(acceptedReject).toEqual({ status: 422, errorCode: "PATCH_INVALID" });
+  await expect(page.locator(".version-list > li")).toHaveCount(2);
+  await expect(page.locator(".project-summary").getByText("版本 2")).toBeVisible();
+});
+
+
+test("preset 5: document patch, history restore, and Markdown export use current snapshots", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const apiState = await installApiPreset(page);
+  await uploadAndGenerate(page);
+  await page.getByLabel("修改范围").selectOption("document");
+  await page.getByLabel("修改意图").fill("Clarify the full five-section explanation.");
+
+  await page.getByRole("button", { name: "生成补丁预览" }).click();
+  await expect(page.getByRole("region", { name: "修改前后差异" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: documentDraft.title })).toBeVisible();
+  await page.getByRole("button", { name: "接受修改" }).click();
+
+  await expect(
+    page.getByRole("heading", { name: "PaperLens revised five-section explanation" }),
+  ).toBeVisible();
+  await expect(page.locator(".version-list > li")).toHaveCount(2);
+  await expect(page.locator(".project-summary").getByText("版本 2")).toBeVisible();
+  await page.getByRole("button", { name: "回退到版本 1" }).click();
+  await expect(page.getByRole("heading", { name: documentDraft.title })).toBeVisible();
+  await expect(page.locator(".version-list > li")).toHaveCount(3);
+  await expect(page.locator(".project-summary").getByText("版本 3")).toBeVisible();
+  await expect.poll(apiState.restoreKeys).toHaveLength(1);
+  expect(apiState.restoreKeys()[0]).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
+
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "导出当前 Markdown" }).click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe("paperlens-p-e2e.md");
+});
+
+
+test("preset 6: a server pending patch is recovered and rejected through one refresh", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const apiState = await installApiPreset(page, { recoverPendingPatch: true });
+  await page.goto("/");
+  await page.getByLabel("选择 PDF").setInputFiles(pdfPath);
+  await page.getByRole("checkbox", { name: /确认拥有处理权限/ }).check();
+  await page.getByRole("button", { name: "上传论文 PDF" }).click();
+
+  const diff = page.getByRole("region", { name: "修改前后差异" });
+  await expect(diff).toBeVisible();
+  await expect(diff).toContainText("Recovered server revision preview");
+  await expect(diff).toContainText(
+    "The fixture identifies the second page as page two with recovered scope.",
+  );
+  await expect(page.getByRole("button", { name: "接受修改" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "拒绝修改" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "运行完整审计" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "生成补丁预览" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "导出当前 Markdown" })).toBeEnabled();
+  expect(apiState.projectReads()).toBe(1);
+  expect(apiState.revisionAttempts()).toBe(0);
+  expect(apiState.acceptAttempts()).toBe(0);
+  expect(apiState.restoreAttempts()).toBe(0);
+
+  await page.getByRole("button", { name: "拒绝修改" }).click();
+
+  await expect(diff).toHaveCount(0);
+  await expect.poll(apiState.rejectAttempts).toBe(1);
+  await expect.poll(apiState.projectReads).toBe(2);
+  expect(apiState.revisionAttempts()).toBe(0);
+  expect(apiState.acceptAttempts()).toBe(0);
+  expect(apiState.restoreAttempts()).toBe(0);
+  await expect(page.getByRole("button", { name: "运行完整审计" })).toBeEnabled();
+  await expect(page.locator(".project-summary").getByText("版本 1")).toBeVisible();
+  await expect.poll(apiState.patchRecords).toEqual([
+    { patchId: "patch-e2e-recovered", status: "rejected" },
+  ]);
 });

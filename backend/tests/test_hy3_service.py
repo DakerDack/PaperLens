@@ -1,4 +1,5 @@
 import json
+from hashlib import sha256
 import logging
 import os
 from pathlib import Path
@@ -20,10 +21,12 @@ from backend.app.hy3_service import (
 )
 from backend.app.models import (
     AtomicClaim,
+    EditPatch,
     DeepAuditResult,
     EvidenceRecord,
     GeneratedBundle,
     SectionId,
+    SentenceClaimRegenerationResult,
     SourceBlock,
 )
 from backend.app.prompts import (
@@ -34,13 +37,18 @@ from backend.app.prompts import (
     GENERATION_PROMPT_VERSION,
     GENERATION_SCHEMA_NAME,
     GENERATION_SCHEMA_VERSION,
+    REVISION_PROMPT_VERSION,
+    SENTENCE_CLAIMS_PROMPT_VERSION,
     render_deep_audit_prompt,
     render_generation_prompt,
 )
+from backend.app.project_store import ProjectStore
 from backend.app.settings import Settings
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
+LOCAL_PATCH_ID = "123e4567-e89b-42d3-a456-426614174010"
+OTHER_PATCH_ID = "223e4567-e89b-42d3-a456-426614174011"
 
 
 def load_source_blocks() -> list[SourceBlock]:
@@ -136,6 +144,66 @@ def generation_json_with_claims(*, present: bool) -> str:
 
 def generated_bundle() -> GeneratedBundle:
     return GeneratedBundle.model_validate_json(valid_generation_json())
+
+
+def revision_patch_json(
+    *,
+    patch_id: str = LOCAL_PATCH_ID,
+    base_version: int,
+    scope: str,
+    target_sentence_ids: list[str],
+    before_text: str,
+    after_text: str,
+) -> str:
+    return json.dumps(
+        {
+            "patch_id": patch_id,
+            "base_version": base_version,
+            "scope": scope,
+            "target_sentence_ids": target_sentence_ids,
+            "before_hash": sha256(before_text.encode("utf-8")).hexdigest(),
+            "before_text": before_text,
+            "after_text": after_text,
+            "reason": "Apply the requested bounded revision.",
+            "fact_changed": False,
+            "evidence_changed": False,
+        },
+        ensure_ascii=False,
+    )
+
+
+def sentence_claim_regeneration_json(
+    claims: list[dict[str, object]],
+) -> str:
+    return json.dumps({"claims": claims}, ensure_ascii=False)
+
+
+def regenerated_sentence_claim(
+    *,
+    claim_id: str = "c-revised-001",
+    sentence_id: str = "s-001",
+    auditability: str = "auditable",
+    candidate_block_ids: list[str] | None = None,
+) -> dict[str, object]:
+    block_ids = (
+        ["p01-b001"]
+        if candidate_block_ids is None
+        else candidate_block_ids
+    )
+    return {
+        "claim_id": claim_id,
+        "sentence_id": sentence_id,
+        "text": "The revised sentence preserves the supported result.",
+        "claim_type": "result",
+        "importance": "critical",
+        "qualifiers": [],
+        "numeric_entities": [],
+        "auditability": auditability,
+        "candidate_block_ids": block_ids,
+        "candidate_quote": (
+            "PaperLens fixture - page one" if block_ids else None
+        ),
+    }
 
 
 def verified_claim_evidence_pairs() -> list[tuple[AtomicClaim, EvidenceRecord]]:
@@ -331,6 +399,518 @@ def assert_closed_objects(node: object) -> None:
     elif isinstance(node, list):
         for value in node:
             assert_closed_objects(value)
+
+
+def test_live_sentence_revision_sends_only_target_sentence_and_related_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "backend.app.hy3_service.uuid4",
+        lambda: LOCAL_PATCH_ID,
+        raising=False,
+    )
+    bundle = generated_bundle()
+    target = bundle.document.sections[0].sentences[0]
+    unrelated_text = bundle.document.sections[1].sentences[0].text
+    evidence = verified_claim_evidence_pairs()[0][1]
+    unrelated_quote = verified_claim_evidence_pairs()[1][1].quote
+    after_text = f"{target.text}（按用户意图调整表达）"
+    supplier_output = revision_patch_json(
+        base_version=3,
+        scope="sentence",
+        target_sentence_ids=[target.sentence_id],
+        before_text=target.text,
+        after_text=after_text,
+    )
+    client = FakeClient([supplier_output])
+    service = Hy3Service(settings=live_settings(), client=client)
+
+    patch = service.revise_sentence(
+        base_version=3,
+        sentence_id=target.sentence_id,
+        current_text=target.text,
+        evidence_records=[evidence],
+        user_instruction="保持事实不变并简化表达。",
+    )
+
+    assert isinstance(patch, EditPatch)
+    assert patch == EditPatch.model_validate_json(supplier_output)
+    assert patch.patch_id == LOCAL_PATCH_ID
+    assert patch.after_text == after_text
+    assert len(client.completions.calls) == 1
+    request = client.completions.calls[0]
+    prompt = request["messages"][1]["content"]
+    assert target.sentence_id in prompt
+    assert target.text in prompt
+    assert evidence.quote in prompt
+    assert "保持事实不变并简化表达。" in prompt
+    assert unrelated_text not in prompt
+    assert unrelated_quote not in prompt
+    assert "history" not in prompt.casefold()
+    assert LOCAL_PATCH_ID in prompt
+    response_schema = request["response_format"]["json_schema"]["schema"]
+    assert response_schema["properties"]["patch_id"]["const"] == LOCAL_PATCH_ID
+    assert "const" not in EditPatch.model_json_schema()["properties"]["patch_id"]
+    assert REVISION_PROMPT_VERSION == "revision-v2"
+
+
+def test_live_document_revision_sends_current_five_sections_without_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "backend.app.hy3_service.uuid4",
+        lambda: LOCAL_PATCH_ID,
+        raising=False,
+    )
+    document = generated_bundle().document
+    before_text = document.model_dump_json()
+    revised = document.model_copy(update={"title": "修订后的本科生论文解读"})
+    after_text = revised.model_dump_json()
+    client = FakeClient(
+        [
+            revision_patch_json(
+                base_version=4,
+                scope="document",
+                target_sentence_ids=[],
+                before_text=before_text,
+                after_text=after_text,
+            )
+        ]
+    )
+    service = Hy3Service(settings=live_settings(), client=client)
+
+    patch = service.revise_document(
+        base_version=4,
+        document=document,
+        user_instruction="统一五区表达并保留全部限制。",
+    )
+
+    assert patch.scope.value == "document"
+    assert patch.after_text == after_text
+    prompt = client.completions.calls[0]["messages"][1]["content"]
+    for section in document.sections:
+        assert section.section_id.value in prompt
+    assert "统一五区表达并保留全部限制。" in prompt
+    assert "HISTORICAL_VERSION_SENTINEL" not in prompt
+    assert "verified_evidence" not in prompt
+    assert "source_blocks" not in prompt
+    assert LOCAL_PATCH_ID in prompt
+
+
+def test_live_revision_retries_schema_errors_with_one_local_patch_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uuid_calls = 0
+
+    def assign_patch_id() -> str:
+        nonlocal uuid_calls
+        uuid_calls += 1
+        return LOCAL_PATCH_ID
+
+    monkeypatch.setattr(
+        "backend.app.hy3_service.uuid4",
+        assign_patch_id,
+        raising=False,
+    )
+    current_text = "当前目标句。"
+    accepted_supplier_output = revision_patch_json(
+        base_version=2,
+        scope="sentence",
+        target_sentence_ids=["s-target"],
+        before_text=current_text,
+        after_text="第三次返回的合法目标句。",
+    )
+    wrong_id_output = revision_patch_json(
+        patch_id=OTHER_PATCH_ID,
+        base_version=2,
+        scope="sentence",
+        target_sentence_ids=["s-target"],
+        before_text=current_text,
+        after_text="第二次返回但 ID 错误的目标句。",
+    )
+    client = FakeClient(
+        [
+            json.dumps({"patch_id": LOCAL_PATCH_ID}),
+            wrong_id_output,
+            accepted_supplier_output,
+        ]
+    )
+    service = Hy3Service(settings=live_settings(), client=client)
+
+    patch = service.revise_sentence(
+        base_version=2,
+        sentence_id="s-target",
+        current_text=current_text,
+        evidence_records=[],
+        user_instruction="只修改这一句。",
+    )
+
+    assert patch.model_dump(mode="json") == json.loads(accepted_supplier_output)
+    assert uuid_calls == 1
+    assert len(client.completions.calls) == 3
+    for request in client.completions.calls:
+        prompt = request["messages"][1]["content"]
+        response_schema = request["response_format"]["json_schema"]["schema"]
+        assert LOCAL_PATCH_ID in prompt
+        assert response_schema["properties"]["patch_id"]["const"] == LOCAL_PATCH_ID
+
+
+def test_mock_sentence_revision_returns_bounded_preview_without_provider() -> None:
+    target = generated_bundle().document.sections[0].sentences[0]
+    service = Hy3Service(settings=mock_settings())
+
+    patch = service.revise_sentence(
+        base_version=5,
+        sentence_id=target.sentence_id,
+        current_text=target.text,
+        evidence_records=[],
+        user_instruction="保持事实不变并简化表达。",
+    )
+
+    assert patch.base_version == 5
+    assert patch.scope.value == "sentence"
+    assert patch.target_sentence_ids == [target.sentence_id]
+    assert patch.before_text == target.text
+    assert patch.before_hash == sha256(target.text.encode("utf-8")).hexdigest()
+    assert patch.after_text != target.text
+    assert "\n" not in patch.after_text
+    assert patch.fact_changed is False
+    assert patch.evidence_changed is False
+
+
+def test_mock_nontrivial_sentence_revision_is_not_a_punctuation_append() -> None:
+    target = generated_bundle().document.sections[0].sentences[0]
+    instruction = "USER_INSTRUCTION_MUST_NOT_BE_REPLAYED"
+    service = Hy3Service(settings=mock_settings())
+
+    patch = service.revise_sentence(
+        base_version=5,
+        sentence_id=target.sentence_id,
+        current_text=target.text,
+        evidence_records=[],
+        user_instruction=instruction,
+    )
+
+    assert patch.after_text != f"{target.text}!"
+    assert patch.after_text != f"{target.text}！"
+    assert patch.after_text.strip()
+    assert "\n" not in patch.after_text
+    assert "\r" not in patch.after_text
+    assert instruction not in patch.after_text
+    assert "Mock" in patch.after_text or "Mock" in patch.reason
+    assert ProjectStore.requires_sentence_claim_regeneration(patch) is True
+
+
+def test_mock_sentence_claim_regeneration_uses_only_confirmed_context() -> None:
+    bundle = generated_bundle()
+    target_claim = bundle.claims[0]
+    evidence = verified_claim_evidence_pairs()[0][1]
+    accepted_after_text = (
+        "The accepted target sentence now states the supported result clearly."
+    )
+    kwargs = {
+        "target_sentence_id": target_claim.sentence_id,
+        "accepted_after_text": accepted_after_text,
+        "original_claims": [target_claim],
+        "evidence_records": [evidence],
+        "allowed_block_ids": {"p01-b001"},
+        "reserved_claim_ids": {"c-unmodified"},
+        "user_instruction": "USER_INSTRUCTION_MUST_NOT_BE_REPLAYED",
+    }
+    service = Hy3Service(settings=mock_settings())
+
+    first = service.regenerate_sentence_claims(**kwargs)
+    second = service.regenerate_sentence_claims(**kwargs)
+
+    assert first == second
+    assert first.claims
+    claim_ids = [claim.claim_id for claim in first.claims]
+    assert len(claim_ids) == len(set(claim_ids))
+    assert set(claim_ids).isdisjoint(kwargs["reserved_claim_ids"])
+    assert all(
+        claim.sentence_id == target_claim.sentence_id
+        for claim in first.claims
+    )
+    assert all(claim.text == accepted_after_text for claim in first.claims)
+    assert all(
+        set(claim.candidate_block_ids) <= kwargs["allowed_block_ids"]
+        for claim in first.claims
+    )
+    assert any(claim.auditability.value == "auditable" for claim in first.claims)
+    assert all(
+        claim.candidate_quote in {None, evidence.quote}
+        for claim in first.claims
+    )
+
+
+def test_mock_sentence_claim_regeneration_drops_stale_semantic_fields() -> None:
+    original_claim = generated_bundle().claims[0].model_copy(
+        update={
+            "text": "The previous threshold was 10 units.",
+            "qualifiers": ["under the previous condition"],
+            "numeric_entities": ["10"],
+        }
+    )
+    accepted_after_text = "The accepted threshold is 20 units."
+
+    regenerated = Hy3Service(
+        settings=mock_settings()
+    ).regenerate_sentence_claims(
+        target_sentence_id=original_claim.sentence_id,
+        accepted_after_text=accepted_after_text,
+        original_claims=[original_claim],
+        evidence_records=[],
+        allowed_block_ids=set(original_claim.candidate_block_ids),
+        reserved_claim_ids=set(),
+        user_instruction="Replace the previous threshold with the accepted one.",
+    )
+
+    assert len(regenerated.claims) == 1
+    rebuilt_claim = regenerated.claims[0]
+    assert rebuilt_claim.text == accepted_after_text
+    assert rebuilt_claim.claim_id != original_claim.claim_id
+    assert rebuilt_claim.qualifiers == []
+    assert rebuilt_claim.numeric_entities == []
+
+
+def test_mock_document_claim_regeneration_uses_exact_current_document() -> None:
+    original = generated_bundle().document.model_dump(mode="json")
+    original["title"] = "Custom accepted document"
+    for index, section in enumerate(original["sections"], start=1):
+        sentence = section["sentences"][0]
+        sentence["sentence_id"] = f"custom-s-{index:03d}"
+        sentence["text"] = f"Custom accepted sentence {index}."
+    document = type(generated_bundle().document).model_validate(original)
+    blocks = load_source_blocks()[:2]
+
+    regenerated = Hy3Service(
+        settings=mock_settings()
+    ).regenerate_document_claims(
+        document=document,
+        source_blocks=blocks,
+    )
+
+    sentence_text = {
+        sentence.sentence_id: sentence.text
+        for section in document.sections
+        for sentence in section.sentences
+    }
+    allowed_blocks = {block.block_id for block in blocks}
+    assert regenerated.document == document
+    assert regenerated.claims
+    assert len({claim.claim_id for claim in regenerated.claims}) == len(
+        regenerated.claims
+    )
+    assert all(claim.sentence_id in sentence_text for claim in regenerated.claims)
+    assert all(
+        claim.text == sentence_text[claim.sentence_id]
+        for claim in regenerated.claims
+    )
+    assert all(
+        set(claim.candidate_block_ids) <= allowed_blocks
+        for claim in regenerated.claims
+    )
+    assert all(claim.candidate_quote is None for claim in regenerated.claims)
+    assert all(
+        {"page_index", "bbox", "quote_verified"}.isdisjoint(
+            claim.model_dump(mode="json")
+        )
+        for claim in regenerated.claims
+    )
+
+
+def test_mock_same_sentence_revision_input_gets_a_new_patch_id_each_time() -> None:
+    target = generated_bundle().document.sections[0].sentences[0]
+    service = Hy3Service(settings=mock_settings())
+
+    first = service.revise_sentence(
+        base_version=5,
+        sentence_id=target.sentence_id,
+        current_text=target.text,
+        evidence_records=[],
+        user_instruction="保持事实不变并简化表达。",
+    )
+    second = service.revise_sentence(
+        base_version=5,
+        sentence_id=target.sentence_id,
+        current_text=target.text,
+        evidence_records=[],
+        user_instruction="保持事实不变并简化表达。",
+    )
+
+    assert first.patch_id != second.patch_id
+
+
+def test_mock_document_revision_returns_valid_preview_without_provider() -> None:
+    document = generated_bundle().document
+    before_text = document.model_dump_json()
+    service = Hy3Service(settings=mock_settings())
+
+    patch = service.revise_document(
+        base_version=6,
+        document=document,
+        user_instruction="统一五区表达并保留全部限制。",
+    )
+
+    revised = type(document).model_validate_json(patch.after_text)
+    assert patch.base_version == 6
+    assert patch.scope.value == "document"
+    assert patch.target_sentence_ids == []
+    assert patch.before_text == before_text
+    assert patch.before_hash == sha256(before_text.encode("utf-8")).hexdigest()
+    assert revised != document
+    assert [section.section_id for section in revised.sections] == list(SectionId)
+    assert document.model_dump_json() == before_text
+
+
+@pytest.mark.parametrize(
+    ("before_hash", "after_text"),
+    [
+        ("0" * 64, "合法的单句改写。"),
+        (None, "合法的单句改写。\n越界修改另一句。"),
+    ],
+    ids=["wrong-before-hash", "out-of-scope-newline"],
+)
+def test_live_sentence_revision_rejects_stale_or_out_of_scope_patch(
+    monkeypatch: pytest.MonkeyPatch,
+    before_hash: str | None,
+    after_text: str,
+) -> None:
+    monkeypatch.setattr(
+        "backend.app.hy3_service.uuid4",
+        lambda: LOCAL_PATCH_ID,
+        raising=False,
+    )
+    current_text = "当前目标句。"
+    payload = json.loads(
+        revision_patch_json(
+            base_version=2,
+            scope="sentence",
+            target_sentence_ids=["s-target"],
+            before_text=current_text,
+            after_text=after_text,
+        )
+    )
+    if before_hash is not None:
+        payload["before_hash"] = before_hash
+    client = FakeClient([json.dumps(payload, ensure_ascii=False)])
+    service = Hy3Service(settings=live_settings(), client=client)
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        service.revise_sentence(
+            base_version=2,
+            sentence_id="s-target",
+            current_text=current_text,
+            evidence_records=[],
+            user_instruction="只修改这一句。",
+        )
+
+    assert exc_info.value.error_code == "PATCH_INVALID"
+    assert exc_info.value.retryable is False
+    assert len(client.completions.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "supplier_patch_id",
+    [OTHER_PATCH_ID, None],
+    ids=["wrong-id", "missing-id"],
+)
+def test_live_revision_rejects_missing_or_mismatched_local_patch_id(
+    monkeypatch: pytest.MonkeyPatch,
+    supplier_patch_id: str | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(
+        "backend.app.hy3_service.uuid4",
+        lambda: LOCAL_PATCH_ID,
+        raising=False,
+    )
+    current_text = "当前目标句。"
+    payload = json.loads(
+        revision_patch_json(
+            patch_id=OTHER_PATCH_ID,
+            base_version=2,
+            scope="sentence",
+            target_sentence_ids=["s-target"],
+            before_text=current_text,
+            after_text="按用户意图调整后的目标句。",
+        )
+    )
+    if supplier_patch_id is None:
+        payload.pop("patch_id")
+    else:
+        payload["patch_id"] = supplier_patch_id
+    supplier_output = json.dumps(payload, ensure_ascii=False)
+    client = FakeClient([supplier_output, supplier_output, supplier_output])
+    service = Hy3Service(settings=live_settings(), client=client)
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            service.revise_sentence(
+                base_version=2,
+                sentence_id="s-target",
+                current_text=current_text,
+                evidence_records=[],
+                user_instruction="USER_INSTRUCTION_SENTINEL",
+            )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.retries == 2
+    assert exc_info.value.usage == (303, 159, 462)
+    assert len(client.completions.calls) == 3
+    assert client.completions.responses == []
+    for secret in {
+        "USER_INSTRUCTION_SENTINEL",
+        supplier_output,
+        "unit-test-key",
+    }:
+        assert secret not in str(exc_info.value)
+        assert secret not in caplog.text
+
+
+def test_live_revision_provider_failure_is_not_retried_or_mocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "backend.app.hy3_service.uuid4",
+        lambda: LOCAL_PATCH_ID,
+        raising=False,
+    )
+    client = FakeClient(
+        [
+            OpenAIError("RAW_PROVIDER_RESPONSE_SENTINEL"),
+            revision_patch_json(
+                base_version=2,
+                scope="sentence",
+                target_sentence_ids=["s-target"],
+                before_text="当前目标句。",
+                after_text="不应被读取的第二次响应。",
+            ),
+        ]
+    )
+    service = Hy3Service(settings=live_settings(), client=client)
+    monkeypatch.setattr(
+        service,
+        "_build_mock_revision_patch",
+        lambda **_kwargs: pytest.fail("Live failure must not use Mock revision"),
+    )
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        service.revise_sentence(
+            base_version=2,
+            sentence_id="s-target",
+            current_text="当前目标句。",
+            evidence_records=[],
+            user_instruction="只修改这一句。",
+        )
+
+    assert exc_info.value.error_code == "HY3_UNAVAILABLE"
+    assert exc_info.value.retryable is True
+    assert exc_info.value.retries == 0
+    assert exc_info.value.usage == (None, None, None)
+    assert len(client.completions.calls) == 1
+    assert len(client.completions.responses) == 1
 
 
 def test_generation_prompt_centralizes_stage_two_contract() -> None:
@@ -2981,3 +3561,359 @@ def test_openai_client_is_built_from_backend_settings(
         "timeout": 30,
         "max_retries": 0,
     }
+
+
+def test_document_claim_regeneration_sends_current_document_and_sources_without_history() -> None:
+    bundle = generated_bundle()
+    client = FakeClient([valid_generation_json()])
+
+    regenerated = Hy3Service(
+        settings=live_settings(),
+        client=client,
+    ).regenerate_document_claims(
+        document=bundle.document,
+        source_blocks=load_source_blocks()[:2],
+    )
+
+    assert regenerated == bundle
+    assert len(client.completions.calls) == 1
+    prompt = client.completions.calls[0]["messages"][1]["content"]
+    assert bundle.document.model_dump_json() in prompt
+    assert "source_blocks" in prompt
+    assert "history" not in prompt.casefold()
+    assert "versions" not in prompt.casefold()
+
+
+def test_document_claim_regeneration_rejects_provider_document_rewrite() -> None:
+    bundle = generated_bundle()
+    rewritten = json.loads(valid_generation_json())
+    rewritten["document"]["title"] = "Provider rewrote the accepted document"
+    client = FakeClient([json.dumps(rewritten, ensure_ascii=False)])
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        Hy3Service(
+            settings=live_settings(),
+            client=client,
+        ).regenerate_document_claims(
+            document=bundle.document,
+            source_blocks=load_source_blocks()[:2],
+        )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retryable is False
+
+
+def test_sentence_claim_regeneration_sends_only_minimal_target_context() -> None:
+    bundle = generated_bundle()
+    target_claim = bundle.claims[0]
+    evidence = verified_claim_evidence_pairs()[0][1]
+    response_payload = {
+        "claims": [
+            regenerated_sentence_claim(
+                claim_id="c-revised-002",
+                sentence_id=target_claim.sentence_id,
+            ),
+            regenerated_sentence_claim(
+                claim_id="c-revised-001",
+                sentence_id=target_claim.sentence_id,
+            ),
+        ]
+    }
+    client = FakeClient(
+        [json.dumps(response_payload, ensure_ascii=False)]
+    )
+    service = Hy3Service(settings=live_settings(), client=client)
+    revised_text = "The revised target sentence keeps its supported fact."
+
+    result = service.regenerate_sentence_claims(
+        target_sentence_id=target_claim.sentence_id,
+        accepted_after_text=revised_text,
+        original_claims=[target_claim],
+        evidence_records=[evidence],
+        allowed_block_ids={"p01-b001"},
+        reserved_claim_ids={"UNMODIFIED_CLAIM_ID_SENTINEL"},
+        user_instruction="USER_INTENT_SENTINEL",
+    )
+
+    assert isinstance(result, SentenceClaimRegenerationResult)
+    assert result.model_dump(mode="json") == response_payload
+    assert [claim.claim_id for claim in result.claims] == [
+        "c-revised-002",
+        "c-revised-001",
+    ]
+    assert len(client.completions.calls) == 1
+    request = client.completions.calls[0]
+    prompt = request["messages"][1]["content"]
+    assert target_claim.sentence_id in prompt
+    assert revised_text in prompt
+    assert target_claim.text in prompt
+    assert evidence.quote in prompt
+    assert "p01-b001" in prompt
+    assert "USER_INTENT_SENTINEL" not in prompt
+    assert bundle.document.title not in prompt
+    assert bundle.document.sections[1].sentences[0].text not in prompt
+    assert "UNMODIFIED_CLAIM_ID_SENTINEL" not in prompt
+    assert '"page_index":' not in prompt
+    assert '"bbox":' not in prompt
+    assert '"quote_verified":' not in prompt
+    assert '"match_method":' not in prompt
+    assert "history" not in prompt.casefold()
+    assert SENTENCE_CLAIMS_PROMPT_VERSION == "sentence-claims-v2"
+    response_format = request["response_format"]["json_schema"]
+    assert response_format["name"] == "paperlens_sentence_claims_v1"
+    assert response_format["strict"] is True
+    assert response_format["schema"] == (
+        SentenceClaimRegenerationResult.model_json_schema()
+    )
+    assert request["temperature"] == 0
+    assert request["max_completion_tokens"] == 4096
+    assert request["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+@pytest.mark.parametrize(
+    "source_of_auditable_requirement",
+    ["original_auditable_claim", "verified_evidence"],
+)
+def test_sentence_claim_regeneration_requires_auditable_continuity(
+    source_of_auditable_requirement: str,
+) -> None:
+    if source_of_auditable_requirement == "original_auditable_claim":
+        original_claim = generated_bundle().claims[0]
+        evidence_records: list[EvidenceRecord] = []
+    else:
+        original_claim = generated_bundle().claims[2]
+        evidence_records = [verified_claim_evidence_pairs()[2][1]]
+    target_sentence_id = original_claim.sentence_id
+    non_auditable = sentence_claim_regeneration_json(
+        [
+            regenerated_sentence_claim(
+                sentence_id=target_sentence_id,
+                auditability="non_auditable",
+                candidate_block_ids=[],
+            )
+        ]
+    )
+    client = FakeClient([non_auditable, non_auditable, non_auditable])
+    service = Hy3Service(settings=live_settings(), client=client)
+    allowed_block_ids = set(original_claim.candidate_block_ids)
+    allowed_block_ids.update(
+        record.block_id
+        for record in evidence_records
+        if record.block_id is not None
+    )
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        service.regenerate_sentence_claims(
+            target_sentence_id=target_sentence_id,
+            accepted_after_text="A revised sentence requiring auditable coverage.",
+            original_claims=[original_claim],
+            evidence_records=evidence_records,
+            allowed_block_ids=allowed_block_ids,
+            reserved_claim_ids=set(),
+            user_instruction="Revise the target sentence.",
+        )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.retries == 2
+    assert len(client.completions.calls) == 3
+
+
+def test_sentence_claim_regeneration_rejects_any_wrong_sentence_id() -> None:
+    payload = sentence_claim_regeneration_json(
+        [
+            regenerated_sentence_claim(claim_id="c-valid"),
+            regenerated_sentence_claim(
+                claim_id="c-wrong-target",
+                sentence_id="s-other",
+            ),
+        ]
+    )
+    client = FakeClient([payload, payload, payload])
+    service = Hy3Service(settings=live_settings(), client=client)
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        service.regenerate_sentence_claims(
+            target_sentence_id="s-001",
+            accepted_after_text="The revised target sentence.",
+            original_claims=[],
+            evidence_records=[],
+            allowed_block_ids={"p01-b001"},
+            reserved_claim_ids=set(),
+            user_instruction="Revise only the target.",
+        )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retries == 2
+    assert len(client.completions.calls) == 3
+
+
+def test_sentence_claim_regeneration_rejects_whole_output_for_forbidden_block() -> None:
+    payload = sentence_claim_regeneration_json(
+        [
+            regenerated_sentence_claim(claim_id="c-valid"),
+            regenerated_sentence_claim(
+                claim_id="c-forbidden-block",
+                candidate_block_ids=["FORBIDDEN_BLOCK_SENTINEL"],
+            ),
+        ]
+    )
+    client = FakeClient([payload, payload, payload])
+    service = Hy3Service(settings=live_settings(), client=client)
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        service.regenerate_sentence_claims(
+            target_sentence_id="s-001",
+            accepted_after_text="The revised target sentence.",
+            original_claims=[],
+            evidence_records=[],
+            allowed_block_ids={"p01-b001"},
+            reserved_claim_ids=set(),
+            user_instruction="Revise only the target.",
+        )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retries == 2
+    assert len(client.completions.calls) == 3
+
+
+def test_sentence_claim_regeneration_retries_reserved_claim_id_collision() -> None:
+    payload = sentence_claim_regeneration_json(
+        [regenerated_sentence_claim(claim_id="c-unmodified")]
+    )
+    client = FakeClient([payload, payload, payload])
+    service = Hy3Service(settings=live_settings(), client=client)
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        service.regenerate_sentence_claims(
+            target_sentence_id="s-001",
+            accepted_after_text="The revised target sentence.",
+            original_claims=[],
+            evidence_records=[],
+            allowed_block_ids={"p01-b001"},
+            reserved_claim_ids={"c-unmodified"},
+            user_instruction="Revise only the target.",
+        )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retries == 2
+    assert len(client.completions.calls) == 3
+    assert all(
+        "c-unmodified" not in request["messages"][1]["content"]
+        for request in client.completions.calls
+    )
+
+
+def test_sentence_claim_regeneration_retries_invalid_then_returns_unchanged() -> None:
+    invalid = sentence_claim_regeneration_json(
+        [regenerated_sentence_claim(sentence_id="s-other")]
+    )
+    valid_payload = {
+        "claims": [
+            regenerated_sentence_claim(claim_id="c-second"),
+            regenerated_sentence_claim(claim_id="c-first"),
+        ]
+    }
+    client = FakeClient(
+        [invalid, json.dumps(valid_payload, ensure_ascii=False)]
+    )
+    service = Hy3Service(settings=live_settings(), client=client)
+
+    result = service.regenerate_sentence_claims(
+        target_sentence_id="s-001",
+        accepted_after_text="The revised target sentence.",
+        original_claims=[],
+        evidence_records=[],
+        allowed_block_ids={"p01-b001"},
+        reserved_claim_ids=set(),
+        user_instruction="Revise only the target.",
+    )
+
+    assert result.model_dump(mode="json") == valid_payload
+    assert [claim.claim_id for claim in result.claims] == [
+        "c-second",
+        "c-first",
+    ]
+    assert len(client.completions.calls) == 2
+
+
+def test_sentence_claim_regeneration_diagnostics_are_bounded_and_safe(
+    caplog: Any,
+) -> None:
+    original_claim = generated_bundle().claims[0].model_copy(
+        update={"text": "ORIGINAL_CLAIM_TEXT_SENTINEL"}
+    )
+    evidence = verified_claim_evidence_pairs()[0][1].model_copy(
+        update={"quote": "VERIFIED_EVIDENCE_SENTINEL"}
+    )
+    raw_response = "RAW_PROVIDER_RESPONSE_SENTINEL"
+    client = FakeClient([raw_response, raw_response, raw_response])
+    service = Hy3Service(settings=live_settings(), client=client)
+    secrets = {
+        "TARGET_SENTENCE_TEXT_SENTINEL",
+        "ORIGINAL_CLAIM_TEXT_SENTINEL",
+        "VERIFIED_EVIDENCE_SENTINEL",
+        "USER_INSTRUCTION_SENTINEL",
+        "RAW_PROVIDER_RESPONSE_SENTINEL",
+        "unit-test-key",
+    }
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with pytest.raises(Hy3ServiceError) as exc_info:
+            service.regenerate_sentence_claims(
+                target_sentence_id="s-001",
+                accepted_after_text="TARGET_SENTENCE_TEXT_SENTINEL",
+                original_claims=[original_claim],
+                evidence_records=[evidence],
+                allowed_block_ids={"p01-b001"},
+                reserved_claim_ids=set(),
+                user_instruction="USER_INSTRUCTION_SENTINEL",
+            )
+
+    assert exc_info.value.error_code == "SCHEMA_INVALID"
+    assert exc_info.value.retries == 2
+    attempt_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("hy3_sentence_claims_attempt ")
+    ]
+    assert len(attempt_logs) == 3
+    for message in attempt_logs:
+        assert_safe_attempt_log_fields(
+            message,
+            operation="sentence_claims",
+            boundary="json_invalid",
+            error_code="SCHEMA_INVALID",
+        )
+    assert all(secret not in caplog.text for secret in secrets)
+    for request in client.completions.calls[1:]:
+        prompt = request["messages"][1]["content"]
+        retry_summary = prompt.split("\n\n字段错误摘要：", 1)[1]
+        assert all(secret not in retry_summary for secret in secrets)
+
+
+def test_sentence_claim_regeneration_live_failure_never_loads_mock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient([OpenAIError("RAW_PROVIDER_FAILURE_SENTINEL")])
+    service = Hy3Service(settings=live_settings(), client=client)
+    monkeypatch.setattr(
+        service,
+        "_load_mock_response",
+        lambda: pytest.fail("Live failure must not load Mock data"),
+    )
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        service.regenerate_sentence_claims(
+            target_sentence_id="s-001",
+            accepted_after_text="The revised target sentence.",
+            original_claims=[],
+            evidence_records=[],
+            allowed_block_ids={"p01-b001"},
+            reserved_claim_ids=set(),
+            user_instruction="Revise only the target.",
+        )
+
+    assert exc_info.value.error_code == "HY3_UNAVAILABLE"
+    assert exc_info.value.retryable is True
+    assert len(client.completions.calls) == 1

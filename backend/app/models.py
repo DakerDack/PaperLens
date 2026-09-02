@@ -173,6 +173,12 @@ class PatchScope(str, Enum):
     DOCUMENT = "document"
 
 
+class PatchStatus(str, Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+
 class ProjectStage(str, Enum):
     CREATED = "created"
     PARSED = "parsed"
@@ -188,6 +194,7 @@ class RunOperation(str, Enum):
     GENERATE = "generate"
     QUICK_CHECK = "quick_check"
     DEEP_AUDIT = "deep_audit"
+    REVISION = "revision"
 
 
 class RunMode(str, Enum):
@@ -272,6 +279,17 @@ class AtomicClaim(StrictModel):
             raise ValueError("auditable claims require at least one candidate block")
         if self.candidate_quote == "":
             raise ValueError("candidate_quote must be null or non-empty")
+        return self
+
+
+class SentenceClaimRegenerationResult(StrictModel):
+    claims: list[AtomicClaim] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_claim_ids(self) -> SentenceClaimRegenerationResult:
+        claim_ids = [claim.claim_id for claim in self.claims]
+        if len(claim_ids) != len(set(claim_ids)):
+            raise ValueError("claim_id values must be unique")
         return self
 
 
@@ -774,6 +792,7 @@ class ProjectView(StrictModel):
     evidence_records: list[EvidenceRecord]
     audit_report: AuditReport | None
     versions: list[VersionSummary]
+    pending_patch: EditPatch | None
     error_code: str | None
     retryable_stage: ProjectStage | None
     created_at: UtcDatetime
@@ -803,6 +822,10 @@ class ProjectView(StrictModel):
             for version in self.versions
         ):
             raise ValueError("current version must be present in version summaries")
+        if (self.stage == ProjectStage.PATCH_PENDING) != (
+            self.pending_patch is not None
+        ):
+            raise ValueError("patch_pending stage must match pending_patch")
         return self
 
 
@@ -858,6 +881,21 @@ class DeepAuditResponse(StrictModel):
     def validate_deep_report(self) -> DeepAuditResponse:
         if self.audit_report.audit_status != AuditStatus.DEEP_COMPLETE:
             raise ValueError("deep audit response requires a deep audit report")
+        return self
+
+
+class RevisionRequest(StrictModel):
+    base_version_id: Identifier
+    scope: PatchScope
+    target_sentence_id: Identifier | None
+    user_instruction: str = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_target(self) -> RevisionRequest:
+        if self.scope == PatchScope.SENTENCE and self.target_sentence_id is None:
+            raise ValueError("sentence revision requests require a target sentence")
+        if self.scope == PatchScope.DOCUMENT and self.target_sentence_id is not None:
+            raise ValueError("document revision requests cannot target a sentence")
         return self
 
 

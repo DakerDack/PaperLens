@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from backend.app import models
 from backend.app.models import (
     AuditReport,
     ClaimsSnapshot,
@@ -26,10 +27,12 @@ from backend.app.models import (
     RiskAssessment,
     RiskFinding,
     RiskLocation,
+    RevisionRequest,
     RunMetadata,
     RunMode,
     RunOperation,
     RunStatus,
+    SentenceClaimRegenerationResult,
     SourceBlock,
     UsageSnapshot,
     VersionSummary,
@@ -148,6 +151,79 @@ def test_generated_bundle_rejects_duplicate_sentence_ids() -> None:
         GeneratedBundle.model_validate(payload)
 
 
+def _sentence_claim_regeneration_claim(
+    *,
+    claim_id: str = "c-revised-001",
+) -> dict[str, object]:
+    return {
+        "claim_id": claim_id,
+        "sentence_id": "s-001",
+        "text": "The revised sentence states the supported result.",
+        "claim_type": "result",
+        "importance": "critical",
+        "qualifiers": [],
+        "numeric_entities": [],
+        "auditability": "auditable",
+        "candidate_block_ids": ["p01-b001"],
+        "candidate_quote": "supported result",
+    }
+
+
+def test_sentence_claim_regeneration_result_accepts_valid_claims() -> None:
+    result = SentenceClaimRegenerationResult.model_validate(
+        {"claims": [_sentence_claim_regeneration_claim()]}
+    )
+
+    assert [claim.claim_id for claim in result.claims] == ["c-revised-001"]
+    schema = SentenceClaimRegenerationResult.model_json_schema()
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["claims"]["minItems"] == 1
+    assert schema["$defs"]["AtomicClaim"]["additionalProperties"] is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"claims": []},
+        {"claims": [_sentence_claim_regeneration_claim()], "history": []},
+        {
+            "claims": [
+                {
+                    **_sentence_claim_regeneration_claim(),
+                    "page_index": 1,
+                }
+            ]
+        },
+        {
+            "claims": [
+                {
+                    **_sentence_claim_regeneration_claim(),
+                    "candidate_block_ids": [],
+                }
+            ]
+        },
+    ],
+)
+def test_sentence_claim_regeneration_result_rejects_invalid_payloads(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        SentenceClaimRegenerationResult.model_validate(payload)
+
+
+def test_sentence_claim_regeneration_result_rejects_duplicate_claim_ids() -> None:
+    with pytest.raises(ValidationError, match="claim_id values must be unique"):
+        SentenceClaimRegenerationResult.model_validate(
+            {
+                "claims": [
+                    _sentence_claim_regeneration_claim(),
+                    _sentence_claim_regeneration_claim(),
+                ]
+            }
+        )
+
+
 def test_generated_bundle_rejects_unknown_sentence_reference() -> None:
     payload = load_json("generation_valid.json")
     payload["claims"][0]["sentence_id"] = "s-404"
@@ -188,6 +264,61 @@ def test_sentence_patch_requires_one_target() -> None:
 
     with pytest.raises(ValidationError, match="exactly one"):
         EditPatch.model_validate(payload)
+
+
+def test_revision_request_accepts_only_scope_specific_target_shape() -> None:
+    sentence_request = RevisionRequest.model_validate({
+        "base_version_id": "version-001",
+        "scope": "sentence",
+        "target_sentence_id": "s-001",
+        "user_instruction": "保持事实不变并简化表达。",
+    })
+    document_request = RevisionRequest.model_validate({
+        "base_version_id": "version-001",
+        "scope": "document",
+        "target_sentence_id": None,
+        "user_instruction": "统一五区表达。",
+    })
+
+    assert sentence_request.target_sentence_id == "s-001"
+    assert document_request.target_sentence_id is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "base_version_id": "version-001",
+            "scope": "sentence",
+            "target_sentence_id": None,
+            "user_instruction": "修改目标句。",
+        },
+        {
+            "base_version_id": "version-001",
+            "scope": "document",
+            "target_sentence_id": "s-001",
+            "user_instruction": "修改全文。",
+        },
+        {
+            "base_version_id": "version-001",
+            "scope": "sentence",
+            "target_sentence_id": "s-001",
+            "user_instruction": "   ",
+        },
+        {
+            "base_version_id": "version-001",
+            "scope": "sentence",
+            "target_sentence_id": "s-001",
+            "user_instruction": "修改目标句。",
+            "history": ["version-000"],
+        },
+    ],
+)
+def test_revision_request_rejects_missing_target_history_and_invalid_scope(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        RevisionRequest.model_validate(payload)
 
 
 def test_deep_audit_and_patch_fixtures_are_valid() -> None:
@@ -733,6 +864,113 @@ def valid_parse_quality_payload() -> dict[str, object]:
     }
 
 
+def valid_project_view_payload(
+    *,
+    stage: str,
+    pending_patch: dict[str, object] | None,
+) -> dict[str, object]:
+    bundle = GeneratedBundle.model_validate(load_json("generation_valid.json"))
+    return {
+        "project_id": "project-001",
+        "stage": stage,
+        "model_mode": "mock",
+        "parse_quality": valid_parse_quality_payload(),
+        "source_block_count": 4,
+        "current_version_id": "version-001",
+        "current_version_no": 1,
+        "document": bundle.document.model_dump(mode="json"),
+        "claims": [claim.model_dump(mode="json") for claim in bundle.claims],
+        "evidence_records": [],
+        "audit_report": None,
+        "versions": [
+            {
+                "version_id": "version-001",
+                "version_no": 1,
+                "parent_version_id": None,
+                "reason": "initial_generation",
+                "created_at": "2026-08-24T01:02:03Z",
+            }
+        ],
+        "pending_patch": pending_patch,
+        "error_code": None,
+        "retryable_stage": None,
+        "created_at": "2026-08-24T01:02:03Z",
+        "updated_at": "2026-08-24T01:02:03Z",
+    }
+
+
+def test_patch_status_public_enum_has_only_fixed_values() -> None:
+    patch_status = getattr(models, "PatchStatus")
+
+    assert [member.value for member in patch_status] == [
+        "pending",
+        "accepted",
+        "rejected",
+    ]
+
+
+@pytest.mark.parametrize("stage", ["quick_checked", "deep_audited"])
+def test_project_view_stable_stage_requires_explicit_null_pending_patch(
+    stage: str,
+) -> None:
+    view = ProjectView.model_validate(
+        valid_project_view_payload(stage=stage, pending_patch=None)
+    )
+
+    assert view.pending_patch is None
+
+
+def test_project_view_patch_pending_requires_complete_edit_patch() -> None:
+    patch_payload = load_json("patch_sentence_valid.json")
+
+    view = ProjectView.model_validate(
+        valid_project_view_payload(
+            stage="patch_pending",
+            pending_patch=patch_payload,
+        )
+    )
+
+    assert view.pending_patch == EditPatch.model_validate(patch_payload)
+
+
+@pytest.mark.parametrize(
+    ("stage", "pending_patch"),
+    [
+        ("patch_pending", None),
+        ("quick_checked", load_json("patch_sentence_valid.json")),
+        ("deep_audited", load_json("patch_sentence_valid.json")),
+    ],
+)
+def test_project_view_rejects_inconsistent_pending_patch_state(
+    stage: str,
+    pending_patch: dict[str, object] | None,
+) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        ProjectView.model_validate(
+            valid_project_view_payload(
+                stage=stage,
+                pending_patch=pending_patch,
+            )
+        )
+
+    assert "extra_forbidden" not in {
+        error["type"] for error in exc_info.value.errors()
+    }
+
+
+def test_project_view_pending_patch_is_a_required_public_schema_field() -> None:
+    schema = ProjectView.model_json_schema()
+    payload = valid_project_view_payload(
+        stage="quick_checked",
+        pending_patch=None,
+    )
+    payload.pop("pending_patch")
+
+    assert "pending_patch" in schema["required"]
+    with pytest.raises(ValidationError, match="pending_patch"):
+        ProjectView.model_validate(payload)
+
+
 def test_stage_four_snapshot_contracts_round_trip_strictly() -> None:
     bundle = GeneratedBundle.model_validate(load_json("generation_valid.json"))
     blocks = [SourceBlock.model_validate(item) for item in load_json("source_blocks.json")]
@@ -772,7 +1010,14 @@ def test_stage_four_snapshot_contracts_round_trip_strictly() -> None:
     assert EvidenceSnapshot.model_validate_json(evidence_snapshot.model_dump_json()) == evidence_snapshot
     assert UsageSnapshot.model_validate_json(usage_snapshot.model_dump_json()) == usage_snapshot
     assert RunMetadata.model_validate_json(metadata.model_dump_json()) == metadata
-    assert set(RunOperation) == {"parse", "generate", "quick_check", "deep_audit"}
+    assert set(RunOperation) == {
+        "parse",
+        "generate",
+        "quick_check",
+        "deep_audit",
+        "revision",
+    }
+    assert RunOperation.REVISION.value == "revision"
     assert set(RunMode) == {"local", "mock", "live"}
     assert set(RunStatus) == {"succeeded", "failed"}
 
@@ -870,6 +1115,7 @@ def test_stage_four_core_api_models_enforce_fixed_contracts() -> None:
         evidence_records=[evidence],
         audit_report=quick_report,
         versions=[version],
+        pending_patch=None,
         error_code=None,
         retryable_stage=None,
         created_at=now,

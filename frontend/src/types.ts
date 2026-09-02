@@ -180,6 +180,8 @@ export interface EditPatch {
   evidence_changed: boolean;
 }
 
+export type RejectRevisionResponse = void;
+
 export interface ErrorResponse {
   error_code: string;
   message: string;
@@ -218,6 +220,8 @@ export interface VersionSummary {
   created_at: string;
 }
 
+export type RestoreVersionResponse = VersionSummary;
+
 export interface ProjectView {
   project_id: string;
   stage: ProjectStage;
@@ -231,6 +235,7 @@ export interface ProjectView {
   evidence_records: EvidenceRecord[];
   audit_report: AuditReport | null;
   versions: VersionSummary[];
+  pending_patch: EditPatch | null;
   error_code: string | null;
   retryable_stage: ProjectStage | null;
   created_at: string;
@@ -250,6 +255,13 @@ export interface GenerationResponse {
 
 export interface GenerationRequest {
   claim_policy: ClaimPolicy;
+}
+
+export interface RevisionRequest {
+  base_version_id: string;
+  scope: PatchScope;
+  target_sentence_id: string | null;
+  user_instruction: string;
 }
 
 export interface DeepAuditRequest {
