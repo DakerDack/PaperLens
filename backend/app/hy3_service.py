@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
 from hashlib import sha256
 import json
 import logging
@@ -225,6 +226,17 @@ class Hy3ServiceError(RuntimeError):
         self.validation_location = validation_location
 
 
+@dataclass(frozen=True)
+class Hy3RunObservation:
+    operation: Literal["deep_audit", "revision", "sentence_claims"]
+    provider_calls: int
+    retries: int
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    error_code: str
+
+
 class Hy3Service:
     def __init__(
         self,
@@ -233,6 +245,30 @@ class Hy3Service:
     ) -> None:
         self.settings = settings or app_settings
         self._client = client
+        self._last_run_observation: Hy3RunObservation | None = None
+
+    @property
+    def last_run_observation(self) -> Hy3RunObservation | None:
+        return self._last_run_observation
+
+    def _record_run_observation(
+        self,
+        *,
+        operation: Literal["deep_audit", "revision", "sentence_claims"],
+        provider_calls: int,
+        retries: int,
+        usage: UsageTuple,
+        error_code: str,
+    ) -> None:
+        self._last_run_observation = Hy3RunObservation(
+            operation=operation,
+            provider_calls=provider_calls,
+            retries=retries,
+            prompt_tokens=usage[0],
+            completion_tokens=usage[1],
+            total_tokens=usage[2],
+            error_code=error_code,
+        )
 
     def generate(
         self,
@@ -287,6 +323,7 @@ class Hy3Service:
         started_at = time.perf_counter()
         usage: UsageTuple = (None, None, None)
         retries = 0
+        provider_started = False
         try:
             expected_pairs = self._validate_deep_audit_input(
                 claim_evidence_pairs
@@ -298,6 +335,7 @@ class Hy3Service:
                 )
             else:
                 self._require_live_config()
+                provider_started = True
                 prompt = self._build_deep_audit_prompt(
                     document,
                     claim_evidence_pairs,
@@ -307,6 +345,13 @@ class Hy3Service:
                     expected_pairs,
                 )
         except Hy3ServiceError as exc:
+            self._record_run_observation(
+                operation="deep_audit",
+                provider_calls=(exc.retries + 1 if provider_started else 0),
+                retries=exc.retries,
+                usage=exc.usage,
+                error_code=exc.error_code,
+            )
             self._log_run(
                 started_at=started_at,
                 retries=exc.retries,
@@ -320,6 +365,13 @@ class Hy3Service:
             )
             raise
 
+        self._record_run_observation(
+            operation="deep_audit",
+            provider_calls=(retries + 1 if provider_started else 0),
+            retries=retries,
+            usage=usage,
+            error_code="NONE",
+        )
         self._log_run(
             started_at=started_at,
             retries=retries,
@@ -349,6 +401,13 @@ class Hy3Service:
             or not user_instruction.strip()
             or any(not record.quote_verified for record in evidence_records)
         ):
+            self._record_run_observation(
+                operation="revision",
+                provider_calls=0,
+                retries=0,
+                usage=(None, None, None),
+                error_code="PATCH_INVALID",
+            )
             raise Hy3ServiceError(
                 "PATCH_INVALID",
                 "The sentence revision target is invalid.",
@@ -374,6 +433,13 @@ class Hy3Service:
                 before_text=current_text,
                 after_text=after_text,
                 patch_id=patch_id,
+            )
+            self._record_run_observation(
+                operation="revision",
+                provider_calls=0,
+                retries=0,
+                usage=(None, None, None),
+                error_code="NONE",
             )
         else:
             prompt = render_sentence_revision_prompt(
@@ -415,6 +481,7 @@ class Hy3Service:
         started_at = time.perf_counter()
         usage: UsageTuple = (None, None, None)
         retries = 0
+        provider_started = False
         try:
             auditable_claim_required = (
                 self._validate_sentence_claim_regeneration_input(
@@ -445,6 +512,7 @@ class Hy3Service:
                 )
             else:
                 self._require_live_config()
+                provider_started = True
                 prompt = render_sentence_claim_regeneration_prompt(
                     target_sentence_id_json=json.dumps(
                         target_sentence_id,
@@ -491,6 +559,13 @@ class Hy3Service:
                     auditable_claim_required=auditable_claim_required,
                 )
         except Hy3ServiceError as exc:
+            self._record_run_observation(
+                operation="sentence_claims",
+                provider_calls=(exc.retries + 1 if provider_started else 0),
+                retries=exc.retries,
+                usage=exc.usage,
+                error_code=exc.error_code,
+            )
             self._log_run(
                 started_at=started_at,
                 retries=exc.retries,
@@ -506,6 +581,13 @@ class Hy3Service:
             )
             raise
 
+        self._record_run_observation(
+            operation="sentence_claims",
+            provider_calls=(retries + 1 if provider_started else 0),
+            retries=retries,
+            usage=usage,
+            error_code="NONE",
+        )
         self._log_run(
             started_at=started_at,
             retries=retries,
@@ -527,6 +609,13 @@ class Hy3Service:
         user_instruction: str,
     ) -> EditPatch:
         if base_version < 1 or not user_instruction.strip():
+            self._record_run_observation(
+                operation="revision",
+                provider_calls=0,
+                retries=0,
+                usage=(None, None, None),
+                error_code="PATCH_INVALID",
+            )
             raise Hy3ServiceError(
                 "PATCH_INVALID",
                 "The document revision target is invalid.",
@@ -549,6 +638,13 @@ class Hy3Service:
                 before_text=before_text,
                 after_text=after_text,
                 patch_id=patch_id,
+            )
+            self._record_run_observation(
+                operation="revision",
+                provider_calls=0,
+                retries=0,
+                usage=(None, None, None),
+                error_code="NONE",
             )
         else:
             prompt = render_document_revision_prompt(
@@ -1039,12 +1135,29 @@ class Hy3Service:
         expected_patch_id: str,
     ) -> EditPatch:
         if self.settings.paperlens_model_mode == "mock":
+            self._record_run_observation(
+                operation="revision",
+                provider_calls=0,
+                retries=0,
+                usage=(None, None, None),
+                error_code="SCHEMA_INVALID",
+            )
             raise Hy3ServiceError(
                 "SCHEMA_INVALID",
                 "A matching Mock revision response is not configured.",
                 retryable=False,
             )
-        self._require_live_config()
+        try:
+            self._require_live_config()
+        except Hy3ServiceError as exc:
+            self._record_run_observation(
+                operation="revision",
+                provider_calls=0,
+                retries=exc.retries,
+                usage=exc.usage,
+                error_code=exc.error_code,
+            )
+            raise
         cumulative_usage: UsageTuple | None = None
         for attempt in range(self.settings.hy3_max_retries + 1):
             try:
@@ -1063,7 +1176,7 @@ class Hy3Service:
                     stream=False,
                 )
             except OpenAIError:
-                raise Hy3ServiceError(
+                error = Hy3ServiceError(
                     "HY3_UNAVAILABLE",
                     "The Hy3 revision provider is unavailable.",
                     retryable=True,
@@ -1073,7 +1186,15 @@ class Hy3Service:
                         if cumulative_usage is not None
                         else (None, None, None)
                     ),
-                ) from None
+                )
+                self._record_run_observation(
+                    operation="revision",
+                    provider_calls=attempt + 1,
+                    retries=attempt,
+                    usage=error.usage,
+                    error_code=error.error_code,
+                )
+                raise error from None
 
             attempt_usage = self._extract_usage(response)
             cumulative_usage = self._accumulate_usage(
@@ -1110,8 +1231,30 @@ class Hy3Service:
                 schema_error.retries = attempt
                 schema_error.usage = cumulative_usage
                 if attempt >= self.settings.hy3_max_retries:
+                    self._record_run_observation(
+                        operation="revision",
+                        provider_calls=attempt + 1,
+                        retries=attempt,
+                        usage=(
+                            cumulative_usage
+                            if cumulative_usage is not None
+                            else (None, None, None)
+                        ),
+                        error_code=schema_error.error_code,
+                    )
                     raise schema_error from None
                 continue
+            self._record_run_observation(
+                operation="revision",
+                provider_calls=attempt + 1,
+                retries=attempt,
+                usage=(
+                    cumulative_usage
+                    if cumulative_usage is not None
+                    else (None, None, None)
+                ),
+                error_code="NONE",
+            )
             return patch
 
         raise AssertionError("unreachable revision schema retry state")

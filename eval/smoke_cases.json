@@ -1,0 +1,297 @@
+{
+  "manifest_version": "paperlens-smoke-manifest-v1",
+  "data_version": "paperlens-smoke-synthetic-v1",
+  "material": {
+    "paper_id": "paperlens-synthetic-fixture",
+    "title": "PaperLens synthetic two-page fixture",
+    "source_kind": "project_authored_synthetic",
+    "license_name": "project-owned test material",
+    "license_url": null,
+    "rights_confirmed": true,
+    "contains_private_text": false
+  },
+  "base": {
+    "source_blocks_path": "backend/tests/fixtures/source_blocks.json",
+    "bundle_path": "backend/tests/fixtures/generation_valid.json",
+    "deep_audit_path": "backend/tests/fixtures/deep_audit_valid.json"
+  },
+  "variants": {
+    "good": {
+      "source_ops": [],
+      "bundle_ops": [],
+      "deep_audit_ops": []
+    },
+    "medium": {
+      "source_ops": [],
+      "bundle_ops": [],
+      "deep_audit_ops": [
+        {
+          "op": "replace",
+          "path": "/semantic_judgments/2/relation",
+          "value": "insufficient"
+        },
+        {
+          "op": "replace",
+          "path": "/semantic_judgments/2/severity",
+          "value": "minor"
+        },
+        {
+          "op": "replace",
+          "path": "/semantic_judgments/3/terminology_status",
+          "value": "misused"
+        },
+        {
+          "op": "replace",
+          "path": "/semantic_judgments/3/severity",
+          "value": "minor"
+        }
+      ]
+    },
+    "bad": {
+      "source_ops": [],
+      "bundle_ops": [
+        {
+          "op": "replace",
+          "path": "/document/sections/1/sentences/0/text",
+          "value": "The first page states that its text contains private paper content."
+        },
+        {
+          "op": "replace",
+          "path": "/claims/1/text",
+          "value": "The first page states that its text contains private paper content."
+        }
+      ],
+      "deep_audit_ops": [
+        {
+          "op": "replace",
+          "path": "/semantic_judgments/1/relation",
+          "value": "contradicts"
+        },
+        {
+          "op": "replace",
+          "path": "/semantic_judgments/1/severity",
+          "value": "critical"
+        },
+        {
+          "op": "replace",
+          "path": "/semantic_judgments/3/scope_status",
+          "value": "expanded"
+        },
+        {
+          "op": "replace",
+          "path": "/semantic_judgments/3/severity",
+          "value": "major"
+        }
+      ]
+    },
+    "numeric_clean": {
+      "source_ops": [
+        {
+          "op": "replace",
+          "path": "/1/text",
+          "value": "The synthetic study enrolled 120 participants."
+        }
+      ],
+      "bundle_ops": [
+        {
+          "op": "replace",
+          "path": "/document/sections/1/sentences/0/text",
+          "value": "The synthetic study enrolled 120 participants."
+        },
+        {
+          "op": "replace",
+          "path": "/claims/1/text",
+          "value": "The synthetic study enrolled 120 participants."
+        },
+        {
+          "op": "replace",
+          "path": "/claims/1/qualifiers",
+          "value": ["synthetic study"]
+        },
+        {
+          "op": "replace",
+          "path": "/claims/1/numeric_entities",
+          "value": ["120"]
+        },
+        {
+          "op": "replace",
+          "path": "/claims/1/candidate_quote",
+          "value": "The synthetic study enrolled 120 participants."
+        }
+      ],
+      "deep_audit_ops": []
+    },
+    "numeric_attack": {
+      "source_ops": [
+        {
+          "op": "replace",
+          "path": "/1/text",
+          "value": "The synthetic study enrolled 120 participants."
+        }
+      ],
+      "bundle_ops": [
+        {
+          "op": "replace",
+          "path": "/document/sections/1/sentences/0/text",
+          "value": "The synthetic study enrolled 170 participants."
+        },
+        {
+          "op": "replace",
+          "path": "/claims/1/text",
+          "value": "The synthetic study enrolled 170 participants."
+        },
+        {
+          "op": "replace",
+          "path": "/claims/1/qualifiers",
+          "value": ["synthetic study"]
+        },
+        {
+          "op": "replace",
+          "path": "/claims/1/numeric_entities",
+          "value": ["170"]
+        },
+        {
+          "op": "replace",
+          "path": "/claims/1/candidate_quote",
+          "value": "The synthetic study enrolled 120 participants."
+        }
+      ],
+      "deep_audit_ops": [
+        {
+          "op": "replace",
+          "path": "/semantic_judgments/1/relation",
+          "value": "contradicts"
+        },
+        {
+          "op": "replace",
+          "path": "/semantic_judgments/1/severity",
+          "value": "critical"
+        }
+      ]
+    },
+    "fake_citation_clean": {
+      "source_ops": [],
+      "bundle_ops": [],
+      "deep_audit_ops": []
+    },
+    "fake_citation_attack": {
+      "source_ops": [],
+      "bundle_ops": [
+        {
+          "op": "replace",
+          "path": "/document/sections/0/sentences/0/text",
+          "value": "A fabricated quantum engine processed 999 galaxies."
+        },
+        {
+          "op": "replace",
+          "path": "/claims/0/text",
+          "value": "A fabricated quantum engine processed 999 galaxies."
+        },
+        {
+          "op": "replace",
+          "path": "/claims/0/numeric_entities",
+          "value": ["999"]
+        },
+        {
+          "op": "replace",
+          "path": "/claims/0/candidate_block_ids",
+          "value": ["missing-block"]
+        },
+        {
+          "op": "replace",
+          "path": "/claims/0/candidate_quote",
+          "value": "Fabricated page 99 quotation."
+        }
+      ],
+      "deep_audit_ops": [
+        {
+          "op": "remove",
+          "path": "/semantic_judgments/0"
+        }
+      ]
+    }
+  },
+  "cases": [
+    {
+      "case_id": "smoke-quality-good",
+      "run_index": 0,
+      "variant_id": "good",
+      "case_group": "quality",
+      "quality_label": "good"
+    },
+    {
+      "case_id": "smoke-quality-medium",
+      "run_index": 0,
+      "variant_id": "medium",
+      "case_group": "quality",
+      "quality_label": "medium"
+    },
+    {
+      "case_id": "smoke-quality-bad",
+      "run_index": 0,
+      "variant_id": "bad",
+      "case_group": "quality",
+      "quality_label": "bad"
+    },
+    {
+      "case_id": "smoke-attack-numeric-clean",
+      "run_index": 0,
+      "variant_id": "numeric_clean",
+      "case_group": "attack",
+      "attack_type": "numeric_tampering",
+      "pair_role": "clean"
+    },
+    {
+      "case_id": "smoke-attack-numeric",
+      "run_index": 0,
+      "variant_id": "numeric_attack",
+      "case_group": "attack",
+      "attack_type": "numeric_tampering",
+      "pair_role": "attack"
+    },
+    {
+      "case_id": "smoke-attack-fake-citation-clean",
+      "run_index": 0,
+      "variant_id": "fake_citation_clean",
+      "case_group": "attack",
+      "attack_type": "fake_citation",
+      "pair_role": "clean"
+    },
+    {
+      "case_id": "smoke-attack-fake-citation",
+      "run_index": 0,
+      "variant_id": "fake_citation_attack",
+      "case_group": "attack",
+      "attack_type": "fake_citation",
+      "pair_role": "attack"
+    },
+    {
+      "case_id": "smoke-stability-fixed-good",
+      "run_index": 0,
+      "variant_id": "good",
+      "case_group": "stability",
+      "stability_output_id": "fixed-good"
+    },
+    {
+      "case_id": "smoke-stability-fixed-good",
+      "run_index": 1,
+      "variant_id": "good",
+      "case_group": "stability",
+      "stability_output_id": "fixed-good"
+    },
+    {
+      "case_id": "smoke-stability-fixed-numeric-attack",
+      "run_index": 0,
+      "variant_id": "numeric_attack",
+      "case_group": "stability",
+      "stability_output_id": "fixed-numeric-attack"
+    },
+    {
+      "case_id": "smoke-stability-fixed-numeric-attack",
+      "run_index": 1,
+      "variant_id": "numeric_attack",
+      "case_group": "stability",
+      "stability_output_id": "fixed-numeric-attack"
+    }
+  ]
+}

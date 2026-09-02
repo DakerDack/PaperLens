@@ -1108,6 +1108,100 @@ def test_live_deep_audit_uses_one_strict_batch_request() -> None:
     assert "overall_score" not in user_prompt
 
 
+def test_deep_audit_read_only_observation_counts_retries_and_usage() -> None:
+    client = FakeClient(["INVALID_PRIVATE_RESPONSE", valid_deep_audit_json()])
+    service = Hy3Service(settings=live_settings(), client=client)
+
+    service.deep_audit(
+        document=generated_bundle().document,
+        claim_evidence_pairs=verified_claim_evidence_pairs(),
+    )
+
+    observation = service.last_run_observation
+    assert observation is not None
+    assert observation.operation == "deep_audit"
+    assert observation.provider_calls == 2
+    assert observation.retries == 1
+    assert observation.prompt_tokens == 202
+    assert observation.completion_tokens == 106
+    assert observation.total_tokens == 308
+    assert observation.error_code == "NONE"
+
+
+def test_deep_audit_observation_records_pre_provider_config_failure() -> None:
+    service = Hy3Service(
+        settings=live_settings(hy3_api_key=""),
+        client=FakeClient([valid_deep_audit_json()]),
+    )
+
+    with pytest.raises(Hy3ServiceError) as exc_info:
+        service.deep_audit(
+            document=generated_bundle().document,
+            claim_evidence_pairs=verified_claim_evidence_pairs(),
+        )
+
+    assert exc_info.value.error_code == "HY3_CONFIG_MISSING"
+    observation = service.last_run_observation
+    assert observation is not None
+    assert observation.operation == "deep_audit"
+    assert observation.provider_calls == 0
+    assert observation.retries == 0
+    assert observation.prompt_tokens is None
+    assert observation.completion_tokens is None
+    assert observation.total_tokens is None
+    assert observation.error_code == "HY3_CONFIG_MISSING"
+
+
+def test_sentence_revision_read_only_observation_has_no_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "backend.app.hy3_service.uuid4",
+        lambda: LOCAL_PATCH_ID,
+        raising=False,
+    )
+    bundle = generated_bundle()
+    target = bundle.document.sections[0].sentences[0]
+    supplier_output = revision_patch_json(
+        base_version=3,
+        scope="sentence",
+        target_sentence_ids=[target.sentence_id],
+        before_text=target.text,
+        after_text=f"{target.text} revised",
+    )
+    service = Hy3Service(
+        settings=live_settings(),
+        client=FakeClient([supplier_output]),
+    )
+
+    service.revise_sentence(
+        base_version=3,
+        sentence_id=target.sentence_id,
+        current_text=target.text,
+        evidence_records=[verified_claim_evidence_pairs()[0][1]],
+        user_instruction="Revise only this sentence.",
+    )
+
+    observation = service.last_run_observation
+    assert observation is not None
+    assert observation.operation == "revision"
+    assert observation.provider_calls == 1
+    assert observation.retries == 0
+    assert observation.prompt_tokens == 101
+    assert observation.completion_tokens == 53
+    assert observation.total_tokens == 154
+    assert observation.error_code == "NONE"
+    assert set(observation.__dict__) == {
+        "operation",
+        "provider_calls",
+        "retries",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "error_code",
+    }
+
+
 def test_deep_audit_response_format_requires_each_risk_category_exactly_once() -> None:
     response_format = Hy3Service._deep_audit_response_format()
     schema = response_format["json_schema"]["schema"]
@@ -3668,6 +3762,15 @@ def test_sentence_claim_regeneration_sends_only_minimal_target_context() -> None
     assert request["temperature"] == 0
     assert request["max_completion_tokens"] == 4096
     assert request["extra_body"] == {"thinking": {"type": "disabled"}}
+    observation = service.last_run_observation
+    assert observation is not None
+    assert observation.operation == "sentence_claims"
+    assert observation.provider_calls == 1
+    assert observation.retries == 0
+    assert observation.prompt_tokens == 101
+    assert observation.completion_tokens == 53
+    assert observation.total_tokens == 154
+    assert observation.error_code == "NONE"
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,1178 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import statistics
+import sys
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from eval.run_eval import (
+    DEFAULT_FREEZE_PATH,
+    FREEZE_VERSION,
+    RESULT_VERSION,
+    STAGE7_ACCEPTANCE_TARGETS,
+)
+
+
+_REQUIRED_FIELDS = (
+    "result_version",
+    "case_id",
+    "run_index",
+    "mode",
+    "status",
+    "error_code",
+    "model",
+    "prompt_version",
+    "schema_version",
+    "data_version",
+    "code_version",
+    "provider_calls",
+    "usage",
+    "metrics",
+)
+_INPUT_CNY_PER_MILLION_TOKENS = 1.0
+_OUTPUT_CNY_PER_MILLION_TOKENS = 4.0
+DEFAULT_REPORT_INPUT = _PROJECT_ROOT / "reports" / "smoke_results.jsonl"
+
+
+def load_results(input_path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    keys: set[tuple[str, int]] = set()
+    with input_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                raise ValueError(f"blank JSONL record at line {line_number}")
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSONL record at line {line_number}") from exc
+            if not isinstance(record, dict):
+                raise ValueError(f"JSONL record must be an object at line {line_number}")
+            missing = [field for field in _REQUIRED_FIELDS if field not in record]
+            if missing:
+                raise ValueError(f"missing result fields at line {line_number}")
+            if record["result_version"] != RESULT_VERSION:
+                raise ValueError(f"unsupported result_version at line {line_number}")
+            case_id = record["case_id"]
+            run_index = record["run_index"]
+            if not isinstance(case_id, str) or not case_id:
+                raise ValueError(f"invalid case_id at line {line_number}")
+            if (
+                not isinstance(run_index, int)
+                or isinstance(run_index, bool)
+                or run_index < 0
+            ):
+                raise ValueError(f"invalid run_index at line {line_number}")
+            key = (case_id, run_index)
+            if key in keys:
+                raise ValueError(f"duplicate result key at line {line_number}")
+            keys.add(key)
+            records.append(record)
+    return records
+
+
+def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
+    status_counts = dict(sorted(Counter(record["status"] for record in records).items()))
+    mode_counts = dict(sorted(Counter(record["mode"] for record in records).items()))
+    known_calls = [
+        record["provider_calls"]
+        for record in records
+        if isinstance(record["provider_calls"], int)
+        and not isinstance(record["provider_calls"], bool)
+    ]
+    usage_fields = ("prompt_tokens", "completion_tokens", "total_tokens")
+    usage = {
+        field: sum(
+            record["usage"][field]
+            for record in records
+            if isinstance(record.get("usage"), dict)
+            and isinstance(record["usage"].get(field), int)
+            and not isinstance(record["usage"].get(field), bool)
+        )
+        for field in usage_fields
+    }
+    usage_unknown_records = {
+        field: sum(
+            1
+            for record in records
+            if not isinstance(record.get("usage"), dict)
+            or record["usage"].get(field) is None
+        )
+        for field in usage_fields
+    }
+    cost_is_known = all(
+        usage_unknown_records[field] == 0
+        for field in ("prompt_tokens", "completion_tokens")
+    )
+    estimated_cost_cny = (
+        round(
+            (
+                usage["prompt_tokens"] * _INPUT_CNY_PER_MILLION_TOKENS
+                + usage["completion_tokens"] * _OUTPUT_CNY_PER_MILLION_TOKENS
+            )
+            / 1_000_000,
+            6,
+        )
+        if cost_is_known
+        else None
+    )
+    quality = _summarize_quality(records)
+    attacks = _summarize_attacks(records)
+    stability = _summarize_stability(records)
+    revisions = _summarize_revisions(records)
+    citation = _summarize_citation(records)
+    freeze = _load_freeze_state(records)
+    return {
+        "attempted": len(records),
+        "status_counts": status_counts,
+        "mode_counts": mode_counts,
+        "provider_calls_known": sum(known_calls),
+        "provider_calls_unknown_records": len(records) - len(known_calls),
+        "usage": usage,
+        "usage_unknown_records": usage_unknown_records,
+        "estimated_cost_cny": estimated_cost_cny,
+        "modes": sorted({record["mode"] for record in records}),
+        "models": sorted({record["model"] for record in records}),
+        "prompt_versions": sorted(
+            {record["prompt_version"] for record in records}
+        ),
+        "schema_versions": sorted(
+            {record["schema_version"] for record in records}
+        ),
+        "data_versions": sorted({record["data_version"] for record in records}),
+        "code_versions": sorted({record["code_version"] for record in records}),
+        "sample_scale": _summarize_sample_scale(records),
+        "sample_selection": _load_sample_selection(records),
+        "quality": quality,
+        "citation": citation,
+        "attacks": attacks,
+        "stability": stability,
+        "revisions": revisions,
+        "freeze": freeze,
+        "acceptance_gates": _summarize_acceptance_gates(
+            quality=quality,
+            citation=citation,
+            attacks=attacks,
+            stability=stability,
+            revisions=revisions,
+            freeze=freeze,
+        ),
+    }
+
+
+def _summarize_sample_scale(records: list[dict[str, Any]]) -> dict[str, Any]:
+    counts: Counter[str] = Counter()
+    ids: dict[str, set[str]] = {
+        "quality": set(),
+        "attack": set(),
+        "revision": set(),
+        "stability": set(),
+    }
+    for record in records:
+        metrics = record.get("metrics")
+        group = metrics.get("case_group") if isinstance(metrics, dict) else None
+        if not isinstance(group, str):
+            group = record["case_id"].split(":", 1)[0]
+        if group not in ids:
+            continue
+        counts[group] += 1
+        if group == "quality":
+            ids[group].add(
+                metrics.get("paper_id")
+                if isinstance(metrics, dict) and isinstance(metrics.get("paper_id"), str)
+                else record["case_id"].rsplit(":", 1)[0]
+            )
+        elif group == "attack":
+            ids[group].add(
+                metrics.get("attack_id")
+                if isinstance(metrics, dict) and isinstance(metrics.get("attack_id"), str)
+                else record["case_id"]
+            )
+        elif group == "revision":
+            ids[group].add(record["case_id"])
+        else:
+            ids[group].add(record["case_id"])
+    return {
+        "quality_records": counts["quality"],
+        "quality_paper_count": len(ids["quality"]),
+        "attack_records": counts["attack"],
+        "attack_pair_id_count": len(ids["attack"]),
+        "revision_records": counts["revision"],
+        "stability_records": counts["stability"],
+        "stability_output_count": len(ids["stability"]),
+    }
+
+
+def _load_sample_selection(records: list[dict[str, Any]]) -> dict[str, Any]:
+    if "paperlens-plos-abstracts-v1" not in {
+        record["data_version"] for record in records
+    }:
+        return {"status": "not_live_data"}
+    manifest_path = _PROJECT_ROOT / "eval" / "live_cases.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"status": "unavailable"}
+    papers = manifest.get("papers")
+    if not isinstance(papers, list):
+        return {"status": "invalid"}
+    selected = []
+    for paper in papers:
+        if not isinstance(paper, dict):
+            return {"status": "invalid"}
+        selected.append(
+            {
+                "paper_id": paper.get("paper_id"),
+                "split": paper.get("split"),
+                "doi": paper.get("doi"),
+                "license_name": paper.get("license_name"),
+                "source_url": paper.get("source_url"),
+                "license_evidence_url": paper.get("license_evidence_url"),
+            }
+        )
+    return {
+        "status": "present",
+        "paper_count": len(selected),
+        "development_count": sum(item["split"] == "development" for item in selected),
+        "holdout_count": sum(item["split"] == "holdout" for item in selected),
+        "license_names": sorted({item["license_name"] for item in selected}),
+        "papers": selected,
+    }
+
+
+def _summarize_quality(records: list[dict[str, Any]]) -> dict[str, Any]:
+    groups: dict[str, dict[str, float]] = {}
+    for record in records:
+        metrics = _succeeded_metrics(record)
+        if metrics is None or metrics.get("case_group") != "quality":
+            continue
+        paper_id = _metric_string(metrics, "paper_id")
+        quality_label = _metric_string(metrics, "quality_label")
+        if quality_label not in {"good", "medium", "bad"}:
+            raise ValueError("quality_label must be good, medium, or bad")
+        score = _metric_number(metrics, "overall_score")
+        paper_scores = groups.setdefault(paper_id, {})
+        if quality_label in paper_scores:
+            raise ValueError("duplicate quality label within a paper group")
+        paper_scores[quality_label] = score
+
+    complete_groups = 0
+    strict_order_correct = 0
+    pairwise_correct = 0
+    pairwise_total = 0
+    expected_ranks: list[float] = []
+    observed_scores: list[float] = []
+    for scores in groups.values():
+        if set(scores) != {"good", "medium", "bad"}:
+            continue
+        complete_groups += 1
+        good = scores["good"]
+        medium = scores["medium"]
+        bad = scores["bad"]
+        if good > medium > bad:
+            strict_order_correct += 1
+        pairwise_correct += sum((good > medium, good > bad, medium > bad))
+        pairwise_total += 3
+        expected_ranks.extend((3.0, 2.0, 1.0))
+        observed_scores.extend((good, medium, bad))
+    return {
+        "complete_groups": complete_groups,
+        "strict_order_correct": strict_order_correct,
+        "pairwise_correct": pairwise_correct,
+        "pairwise_total": pairwise_total,
+        "spearman_rank_correlation": _spearman_rank_correlation(
+            expected_ranks,
+            observed_scores,
+        ),
+    }
+
+
+def _spearman_rank_correlation(
+    expected: list[float],
+    observed: list[float],
+) -> float | None:
+    if len(expected) != len(observed) or len(expected) < 2:
+        return None
+
+    def ranks(values: list[float]) -> list[float]:
+        ordered = sorted(enumerate(values), key=lambda item: item[1])
+        result = [0.0] * len(values)
+        index = 0
+        while index < len(ordered):
+            end = index + 1
+            while end < len(ordered) and ordered[end][1] == ordered[index][1]:
+                end += 1
+            rank = (index + 1 + end) / 2.0
+            for position in range(index, end):
+                result[ordered[position][0]] = rank
+            index = end
+        return result
+
+    expected_rank = ranks(expected)
+    observed_rank = ranks(observed)
+    expected_mean = statistics.fmean(expected_rank)
+    observed_mean = statistics.fmean(observed_rank)
+    numerator = sum(
+        (left - expected_mean) * (right - observed_mean)
+        for left, right in zip(expected_rank, observed_rank)
+    )
+    expected_variance = sum((value - expected_mean) ** 2 for value in expected_rank)
+    observed_variance = sum((value - observed_mean) ** 2 for value in observed_rank)
+    denominator = math.sqrt(expected_variance * observed_variance)
+    if denominator == 0:
+        return None
+    return round(numerator / denominator, 4)
+
+
+def _summarize_citation(records: list[dict[str, Any]]) -> dict[str, Any]:
+    quality_records = 0
+    records_with_metrics = 0
+    accuracy_numerator = 0
+    accuracy_denominator = 0
+    completeness_numerator = 0
+    completeness_denominator = 0
+    key_claim_count = 0
+    for record in records:
+        metrics = _succeeded_metrics(record)
+        if metrics is None or metrics.get("case_group") != "quality":
+            continue
+        quality_records += 1
+        fields = (
+            "key_claim_count",
+            "key_claim_citation_accuracy_numerator",
+            "key_claim_citation_accuracy_denominator",
+            "key_claim_citation_completeness_numerator",
+            "key_claim_citation_completeness_denominator",
+        )
+        if not all(field in metrics for field in fields):
+            continue
+        values = [metrics[field] for field in fields]
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in values
+        ):
+            raise ValueError("citation count metrics must be non-negative integers")
+        records_with_metrics += 1
+        key_claim_count += metrics["key_claim_count"]
+        accuracy_numerator += metrics["key_claim_citation_accuracy_numerator"]
+        accuracy_denominator += metrics["key_claim_citation_accuracy_denominator"]
+        completeness_numerator += metrics[
+            "key_claim_citation_completeness_numerator"
+        ]
+        completeness_denominator += metrics[
+            "key_claim_citation_completeness_denominator"
+        ]
+    return {
+        "quality_records": quality_records,
+        "records_with_metrics": records_with_metrics,
+        "key_claim_count": key_claim_count,
+        "accuracy_numerator": accuracy_numerator,
+        "accuracy_denominator": accuracy_denominator,
+        "accuracy_rate": (
+            round(accuracy_numerator / accuracy_denominator, 4)
+            if accuracy_denominator
+            else None
+        ),
+        "completeness_numerator": completeness_numerator,
+        "completeness_denominator": completeness_denominator,
+        "completeness_rate": (
+            round(completeness_numerator / completeness_denominator, 4)
+            if completeness_denominator
+            else None
+        ),
+    }
+
+
+def _summarize_attacks(records: list[dict[str, Any]]) -> dict[str, Any]:
+    attack_total = 0
+    attacks_detected = 0
+    clean_total = 0
+    clean_false_positives = 0
+    by_type: dict[str, dict[str, int]] = {}
+    pair_records: dict[str, dict[str, dict[str, Any]]] = {}
+    for record in records:
+        metrics = _succeeded_metrics(record)
+        if metrics is None or metrics.get("case_group") != "attack":
+            continue
+        attack_type = _metric_string(metrics, "attack_type")
+        pair_role = _metric_string(metrics, "pair_role")
+        detected = metrics.get("attack_detected")
+        if not isinstance(detected, bool):
+            raise ValueError("attack_detected must be boolean")
+        attack_id = metrics.get("attack_id")
+        if not isinstance(attack_id, str) or not attack_id:
+            attack_id = record["case_id"]
+        type_summary = by_type.setdefault(
+            attack_type,
+            {
+                "attacks_detected": 0,
+                "attack_total": 0,
+                "clean_false_positives": 0,
+                "clean_total": 0,
+            },
+        )
+        if pair_role == "attack":
+            attack_total += 1
+            attacks_detected += int(detected)
+            type_summary["attack_total"] += 1
+            type_summary["attacks_detected"] += int(detected)
+            pair_records.setdefault(attack_id, {})["attack"] = metrics
+        elif pair_role == "clean":
+            clean_total += 1
+            clean_false_positives += int(detected)
+            type_summary["clean_total"] += 1
+            type_summary["clean_false_positives"] += int(detected)
+            pair_records.setdefault(attack_id, {})["clean"] = metrics
+        else:
+            raise ValueError("pair_role must be attack or clean")
+    pair_score_deltas: dict[str, float] = {}
+    pair_dimension_deltas: dict[str, dict[str, int]] = {}
+    score_deltas_by_type: dict[str, list[float]] = {}
+    for attack_id, pair in pair_records.items():
+        attack_metrics = pair.get("attack")
+        clean_metrics = pair.get("clean")
+        if attack_metrics is None or clean_metrics is None:
+            continue
+        if "overall_score" in attack_metrics and "overall_score" in clean_metrics:
+            attack_score = _metric_number(attack_metrics, "overall_score")
+            clean_score = _metric_number(clean_metrics, "overall_score")
+            delta = round(attack_score - clean_score, 4)
+            pair_score_deltas[attack_id] = delta
+            attack_type = _metric_string(attack_metrics, "attack_type")
+            score_deltas_by_type.setdefault(attack_type, []).append(delta)
+        attack_points = attack_metrics.get("dimension_points")
+        clean_points = clean_metrics.get("dimension_points")
+        if isinstance(attack_points, dict) and isinstance(clean_points, dict):
+            shared_dimensions = set(attack_points) & set(clean_points)
+            if shared_dimensions:
+                deltas: dict[str, int] = {}
+                for dimension_id in sorted(shared_dimensions):
+                    attack_point = attack_points[dimension_id]
+                    clean_point = clean_points[dimension_id]
+                    if (
+                        isinstance(attack_point, int)
+                        and not isinstance(attack_point, bool)
+                        and isinstance(clean_point, int)
+                        and not isinstance(clean_point, bool)
+                    ):
+                        deltas[dimension_id] = attack_point - clean_point
+                if deltas:
+                    pair_dimension_deltas[attack_id] = deltas
+    mean_score_delta_by_type = {
+        attack_type: round(statistics.fmean(deltas), 4)
+        for attack_type, deltas in sorted(score_deltas_by_type.items())
+    }
+    return {
+        "attacks_detected": attacks_detected,
+        "attack_total": attack_total,
+        "clean_false_positives": clean_false_positives,
+        "clean_total": clean_total,
+        "by_type": dict(sorted(by_type.items())),
+        "pair_score_deltas": dict(sorted(pair_score_deltas.items())),
+        "pair_dimension_deltas": dict(sorted(pair_dimension_deltas.items())),
+        "mean_score_delta_by_type": mean_score_delta_by_type,
+    }
+
+
+def _summarize_stability(records: list[dict[str, Any]]) -> dict[str, Any]:
+    groups: dict[str, list[tuple[float, dict[str, int]]]] = {}
+    for record in records:
+        metrics = _succeeded_metrics(record)
+        if metrics is None or metrics.get("case_group") != "stability":
+            continue
+        output_id = _metric_string(metrics, "stability_output_id")
+        score = _metric_number(metrics, "overall_score")
+        raw_points = metrics.get("dimension_points")
+        if not isinstance(raw_points, dict) or not raw_points:
+            raise ValueError("stability dimension_points must be a non-empty object")
+        points: dict[str, int] = {}
+        for dimension_id, value in raw_points.items():
+            if (
+                not isinstance(dimension_id, str)
+                or not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 0 <= value <= 4
+            ):
+                raise ValueError("invalid stability dimension point")
+            points[dimension_id] = value
+        groups.setdefault(output_id, []).append((score, points))
+
+    if not groups:
+        return {
+            "output_count": 0,
+            "run_count": 0,
+            "mean_score_standard_deviation": None,
+            "maximum_score_range": None,
+            "dimension_level_consistency_rate": None,
+        }
+    standard_deviations: list[float] = []
+    score_ranges: list[float] = []
+    consistent_dimensions = 0
+    compared_dimensions = 0
+    run_count = 0
+    for runs in groups.values():
+        scores = [score for score, _ in runs]
+        run_count += len(runs)
+        standard_deviations.append(statistics.pstdev(scores))
+        score_ranges.append(max(scores) - min(scores))
+        dimension_ids = set(runs[0][1])
+        if any(set(points) != dimension_ids for _, points in runs):
+            raise ValueError("stability runs have different dimension sets")
+        for dimension_id in dimension_ids:
+            compared_dimensions += 1
+            if len({points[dimension_id] for _, points in runs}) == 1:
+                consistent_dimensions += 1
+    return {
+        "output_count": len(groups),
+        "run_count": run_count,
+        "mean_score_standard_deviation": round(
+            statistics.fmean(standard_deviations),
+            4,
+        ),
+        "maximum_score_range": round(max(score_ranges), 4),
+        "dimension_level_consistency_rate": round(
+            consistent_dimensions / compared_dimensions,
+            4,
+        ),
+    }
+
+
+def _summarize_revisions(records: list[dict[str, Any]]) -> dict[str, Any]:
+    completed = 0
+    known_issue_total = 0
+    resolved_issue_total = 0
+    new_severe_error_total = 0
+    irrelevant_change_count = 0
+    for record in records:
+        metrics = _succeeded_metrics(record)
+        if metrics is None or metrics.get("case_group") != "revision":
+            continue
+        completed += 1
+        known = metrics.get("known_issue_count")
+        resolved = metrics.get("resolved_issue_count")
+        new_severe = metrics.get("new_severe_error_count")
+        irrelevant = metrics.get("irrelevant_change")
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (known, resolved, new_severe)
+        ):
+            raise ValueError("revision count metrics must be non-negative integers")
+        if not isinstance(irrelevant, bool):
+            raise ValueError("irrelevant_change must be boolean")
+        if resolved > known:
+            raise ValueError("resolved issues cannot exceed known issues")
+        known_issue_total += known
+        resolved_issue_total += resolved
+        new_severe_error_total += new_severe
+        irrelevant_change_count += int(irrelevant)
+    return {
+        "completed": completed,
+        "known_issue_total": known_issue_total,
+        "resolved_issue_total": resolved_issue_total,
+        "error_resolution_rate": (
+            round(resolved_issue_total / known_issue_total, 4)
+            if known_issue_total
+            else None
+        ),
+        "new_severe_error_total": new_severe_error_total,
+        "irrelevant_change_count": irrelevant_change_count,
+        "irrelevant_change_rate": (
+            round(irrelevant_change_count / completed, 4)
+            if completed
+            else None
+        ),
+    }
+
+
+def _summarize_acceptance_gates(
+    *,
+    quality: dict[str, Any],
+    citation: dict[str, Any],
+    attacks: dict[str, Any],
+    stability: dict[str, Any],
+    revisions: dict[str, Any],
+    freeze: dict[str, Any],
+) -> dict[str, Any]:
+    if freeze.get("status") == "invalid":
+        return {
+            "status": "invalid_freeze",
+            "target_source": "invalid",
+            "targets": {},
+            "gates": {},
+        }
+    if freeze.get("status") == "present":
+        frozen_targets = freeze.get("acceptance_targets")
+        if (
+            freeze.get("freeze_version") != FREEZE_VERSION
+            or freeze.get("matches_result_code_version") is not True
+            or frozen_targets != STAGE7_ACCEPTANCE_TARGETS
+        ):
+            return {
+                "status": "invalid_freeze",
+                "target_source": "invalid",
+                "targets": {},
+                "gates": {},
+            }
+        targets = frozen_targets
+        target_source = "frozen"
+    else:
+        targets = STAGE7_ACCEPTANCE_TARGETS
+        target_source = "proposal_targets_not_frozen"
+
+    gates = {
+        "quality_strict_order": _acceptance_gate(
+            observed=quality["strict_order_correct"],
+            target=targets["quality_strict_order_min"],
+            available=quality["complete_groups"] >= 5,
+            denominator=5,
+            operator=">=",
+        ),
+        "quality_pairwise": _acceptance_gate(
+            observed=quality["pairwise_correct"],
+            target=targets["quality_pairwise_min"],
+            available=quality["pairwise_total"] >= 15,
+            denominator=15,
+            operator=">=",
+        ),
+        "key_citation_accuracy": _acceptance_gate(
+            observed=citation["accuracy_rate"],
+            target=targets["key_citation_accuracy_min"],
+            available=(
+                citation["records_with_metrics"] >= 15
+                and citation["accuracy_rate"] is not None
+            ),
+            denominator=citation["accuracy_denominator"],
+            operator=">=",
+        ),
+        "key_citation_completeness": _acceptance_gate(
+            observed=citation["completeness_rate"],
+            target=targets["key_citation_completeness_min"],
+            available=(
+                citation["records_with_metrics"] >= 15
+                and citation["completeness_rate"] is not None
+            ),
+            denominator=citation["completeness_denominator"],
+            operator=">=",
+        ),
+        "stability_mean_score_sd": _acceptance_gate(
+            observed=stability["mean_score_standard_deviation"],
+            target=targets["stability_mean_score_sd_max"],
+            available=stability["output_count"] >= 12 and stability["run_count"] >= 36,
+            denominator=36,
+            operator="<=",
+        ),
+        "stability_dimension_consistency": _acceptance_gate(
+            observed=stability["dimension_level_consistency_rate"],
+            target=targets["stability_dimension_consistency_min"],
+            available=stability["output_count"] >= 12 and stability["run_count"] >= 36,
+            denominator=36,
+            operator=">=",
+        ),
+        "attack_detection": _acceptance_gate(
+            observed=attacks["attacks_detected"],
+            target=targets["attack_detection_min"],
+            available=attacks["attack_total"] >= 16,
+            denominator=16,
+            operator=">=",
+        ),
+        "clean_false_positives": _acceptance_gate(
+            observed=attacks["clean_false_positives"],
+            target=targets["clean_false_positives_max"],
+            available=attacks["clean_total"] >= 16,
+            denominator=16,
+            operator="<=",
+        ),
+        "revision_error_resolution": _acceptance_gate(
+            observed=revisions["error_resolution_rate"],
+            target=targets["revision_error_resolution_min"],
+            available=revisions["completed"] >= 5
+            and revisions["error_resolution_rate"] is not None,
+            denominator=revisions["known_issue_total"],
+            operator=">=",
+        ),
+        "revision_new_severe_errors": _acceptance_gate(
+            observed=revisions["new_severe_error_total"],
+            target=targets["revision_new_severe_errors_max"],
+            available=revisions["completed"] >= 5,
+            denominator=revisions["completed"],
+            operator="<=",
+        ),
+        "revision_irrelevant_change_rate": _acceptance_gate(
+            observed=revisions["irrelevant_change_rate"],
+            target=targets["revision_irrelevant_change_rate_max"],
+            available=revisions["completed"] >= 5
+            and revisions["irrelevant_change_rate"] is not None,
+            denominator=revisions["completed"],
+            operator="<=",
+        ),
+    }
+    statuses = [gate["status"] for gate in gates.values()]
+    if all(status == "passed" for status in statuses):
+        overall_status = "passed"
+    elif any(status == "failed" for status in statuses):
+        overall_status = "failed"
+    elif all(status == "not_available" for status in statuses):
+        overall_status = "not_available"
+    else:
+        overall_status = "incomplete"
+    return {
+        "status": overall_status,
+        "target_source": target_source,
+        "targets": dict(targets),
+        "gates": gates,
+    }
+
+
+def _acceptance_gate(
+    *,
+    observed: Any,
+    target: int | float,
+    available: bool,
+    denominator: int | None,
+    operator: str,
+) -> dict[str, Any]:
+    if not available:
+        status = "not_available"
+        safe_observed = None
+    elif operator == ">=":
+        status = "passed" if observed >= target else "failed"
+        safe_observed = observed
+    elif operator == "<=":
+        status = "passed" if observed <= target else "failed"
+        safe_observed = observed
+    else:
+        raise ValueError("unsupported acceptance gate operator")
+    return {
+        "status": status,
+        "observed": safe_observed,
+        "target": target,
+        "denominator": denominator,
+        "operator": operator,
+    }
+
+
+def _load_freeze_state(records: list[dict[str, Any]]) -> dict[str, Any]:
+    code_versions = sorted({record["code_version"] for record in records})
+    candidate_paths = {DEFAULT_FREEZE_PATH}
+    # JSONL is the source of all result numbers. A sidecar is optional metadata
+    # used only to state whether the immutable configuration was present.
+    for candidate in list(candidate_paths):
+        if not candidate or not candidate.is_file():
+            continue
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"status": "invalid"}
+        if not isinstance(payload, dict):
+            return {"status": "invalid"}
+        return {
+            "status": "present",
+            "freeze_version": payload.get("freeze_version"),
+            "code_version": payload.get("code_version"),
+            "matches_result_code_version": (
+                len(code_versions) == 1
+                and isinstance(payload.get("code_version"), str)
+                and bool(payload.get("code_version"))
+                and isinstance(code_versions[0], str)
+                and bool(code_versions[0])
+                and payload.get("code_version") == code_versions[0]
+            ),
+            "acceptance_targets": payload.get("acceptance_targets"),
+        }
+    if not code_versions:
+        return {"status": "not_available"}
+    return {"status": "not_available"}
+
+
+def _succeeded_metrics(record: dict[str, Any]) -> dict[str, Any] | None:
+    if record.get("status") != "succeeded":
+        return None
+    metrics = record.get("metrics")
+    if not isinstance(metrics, dict):
+        raise ValueError("succeeded result metrics must be an object")
+    return metrics
+
+
+def _metric_string(metrics: dict[str, Any], field: str) -> str:
+    value = metrics.get(field)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be a non-empty metric string")
+    return value
+
+
+def _metric_number(metrics: dict[str, Any], field: str) -> float:
+    value = metrics.get(field)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{field} must be a numeric metric")
+    return float(value)
+
+
+def build_report(*, input_path: Path, output_path: Path) -> dict[str, Any]:
+    records = load_results(input_path)
+    summary = summarize_results(records)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        _render_markdown(summary=summary, records=records),
+        encoding="utf-8",
+        newline="\n",
+    )
+    return summary
+
+
+def _render_markdown(
+    *,
+    summary: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> str:
+    lines = [
+        "# PaperLens Evaluation Report",
+        "",
+        "This report is rebuilt exclusively from the input JSONL records.",
+        "",
+        "## Run summary",
+        "",
+        f"- Attempted: {summary['attempted']}",
+        f"- Known provider calls: {summary['provider_calls_known']}",
+        (
+            "- Records with unknown provider calls: "
+            f"{summary['provider_calls_unknown_records']}"
+        ),
+    ]
+    for status, count in summary["status_counts"].items():
+        lines.append(f"- Status `{status}`: {count}")
+    lines.append(
+        "- Mode counts: "
+        + ", ".join(
+            f"`{mode}`={count}"
+            for mode, count in summary["mode_counts"].items()
+        )
+    )
+    lines.extend(
+        [
+            "",
+            "## Token usage",
+            "",
+            f"- Prompt tokens (known subtotal): {summary['usage']['prompt_tokens']}",
+            (
+                "- Completion tokens (known subtotal): "
+                f"{summary['usage']['completion_tokens']}"
+            ),
+            f"- Total tokens (known subtotal): {summary['usage']['total_tokens']}",
+            (
+                "- Estimated cost from recorded usage (CNY): "
+                f"{summary['estimated_cost_cny']}"
+                if summary["estimated_cost_cny"] is not None
+                else "- Estimated cost from recorded usage (CNY): unknown usage present"
+            ),
+            (
+                "- Usage pricing basis: input 1 CNY/million tokens, "
+                "output 4 CNY/million tokens."
+            ),
+            "",
+            "## Frozen run metadata",
+            "",
+            f"- Modes: {', '.join(summary['modes'])}",
+            f"- Models: {', '.join(summary['models'])}",
+            f"- Prompt versions: {', '.join(summary['prompt_versions'])}",
+            f"- Schema versions: {', '.join(summary['schema_versions'])}",
+            f"- Data versions: {', '.join(summary['data_versions'])}",
+            f"- Code versions: {', '.join(summary['code_versions'])}",
+            "",
+            "## Sample selection and licenses",
+            "",
+        ]
+    )
+    selection = summary["sample_selection"]
+    if selection["status"] == "present":
+        lines.extend(
+            [
+                f"- Papers: {selection['paper_count']} "
+                f"(development {selection['development_count']}, "
+                f"holdout {selection['holdout_count']})",
+                f"- License names: {', '.join(selection['license_names'])}",
+                "",
+                "| paper_id | split | DOI | license | source | license evidence |",
+                "|---|---|---|---|---|---|",
+            ]
+        )
+        for paper in selection["papers"]:
+            source_url = paper.get("source_url")
+            license_url = paper.get("license_evidence_url")
+            source_cell = f"[official source]({source_url})" if source_url else "-"
+            license_cell = (
+                f"[license policy]({license_url})" if license_url else "-"
+            )
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _markdown_cell(paper.get("paper_id")),
+                        _markdown_cell(paper.get("split")),
+                        _markdown_cell(paper.get("doi")),
+                        _markdown_cell(paper.get("license_name")),
+                        source_cell,
+                        license_cell,
+                    ]
+                )
+                + " |"
+            )
+    else:
+        lines.append(f"- Sample selection metadata: `{selection['status']}`")
+    lines.extend(
+        [
+            "",
+            "## Sample scale rebuilt from JSONL",
+            "",
+            f"- Quality records/papers: {summary['sample_scale']['quality_records']}/"
+            f"{summary['sample_scale']['quality_paper_count']}",
+            f"- Attack pair records/attack IDs: {summary['sample_scale']['attack_records']}/"
+            f"{summary['sample_scale']['attack_pair_id_count']}",
+            f"- Revision records: {summary['sample_scale']['revision_records']}",
+            f"- Stability records/outputs: {summary['sample_scale']['stability_records']}/"
+            f"{summary['sample_scale']['stability_output_count']}",
+            "",
+            "## Acceptance gates",
+            "",
+        ]
+    )
+    acceptance = summary["acceptance_gates"]
+    lines.extend(
+        [
+            f"- Overall status: `{acceptance['status']}`",
+            f"- Target source: `{acceptance['target_source']}`",
+        ]
+    )
+    for gate_name, gate in acceptance["gates"].items():
+        observed = gate["observed"]
+        observed_text = "not available" if observed is None else str(observed)
+        denominator = (
+            f" (denominator {gate['denominator']})"
+            if gate["denominator"] is not None
+            else ""
+        )
+        lines.append(
+            f"- `{gate_name}`: `{gate['status']}`, observed {observed_text} "
+            f"{gate['operator']} {gate['target']}{denominator}"
+        )
+    lines.extend(
+        [
+            "",
+            "## Quality ordering",
+            "",
+        ]
+    )
+    quality = summary["quality"]
+    if quality["complete_groups"]:
+        lines.extend(
+            [
+                "- Strict quality ordering: "
+                f"{quality['strict_order_correct']}/{quality['complete_groups']}",
+                "- Correct pairwise orderings: "
+                f"{quality['pairwise_correct']}/{quality['pairwise_total']}",
+                "- Spearman rank correlation (descriptive): "
+                f"{quality['spearman_rank_correlation']}",
+            ]
+        )
+    else:
+        lines.append("- Not available in these JSONL records.")
+    citation = summary["citation"]
+    lines.extend(
+        [
+            "",
+            "## Key-claim citation coverage",
+            "",
+        ]
+    )
+    if citation["records_with_metrics"]:
+        lines.extend(
+            [
+                f"- Records with citation metrics: {citation['records_with_metrics']}/"
+                f"{citation['quality_records']}",
+                "- Key-claim citation accuracy: "
+                f"{citation['accuracy_numerator']}/"
+                f"{citation['accuracy_denominator']} "
+                f"({citation['accuracy_rate']})",
+                "- Key-claim citation completeness: "
+                f"{citation['completeness_numerator']}/"
+                f"{citation['completeness_denominator']} "
+                f"({citation['completeness_rate']})",
+            ]
+        )
+    else:
+        lines.append("- Not available in these JSONL records.")
+    lines.extend(
+        [
+            "",
+            "## Adversarial pairs",
+            "",
+        ]
+    )
+    attacks = summary["attacks"]
+    if attacks["attack_total"] or attacks["clean_total"]:
+        lines.extend(
+            [
+                "- Attack detection: "
+                f"{attacks['attacks_detected']}/{attacks['attack_total']}",
+                "- Clean false positives: "
+                f"{attacks['clean_false_positives']}/{attacks['clean_total']}",
+            ]
+        )
+        for attack_type, values in attacks["by_type"].items():
+            lines.append(
+                f"- `{attack_type}`: detected "
+                f"{values['attacks_detected']}/{values['attack_total']}; "
+                "clean false positives "
+                f"{values['clean_false_positives']}/{values['clean_total']}"
+            )
+        if attacks["mean_score_delta_by_type"]:
+            lines.append("- Mean attack-minus-clean score delta by type:")
+            for attack_type, delta in attacks["mean_score_delta_by_type"].items():
+                lines.append(f"  - `{attack_type}`: {delta}")
+        if attacks["pair_dimension_deltas"]:
+            lines.append(
+                "- Pair dimension deltas are available in the JSONL-derived summary."
+            )
+    else:
+        lines.append("- Not available in these JSONL records.")
+    lines.extend(
+        [
+            "",
+            "## Stability",
+            "",
+        ]
+    )
+    stability = summary["stability"]
+    if stability["output_count"]:
+        lines.extend(
+            [
+                f"- Stability fixed outputs: {stability['output_count']}",
+                f"- Stability runs: {stability['run_count']}",
+                "- Mean score standard deviation: "
+                f"{stability['mean_score_standard_deviation']}",
+                f"- Maximum score range: {stability['maximum_score_range']}",
+                "- Dimension-level consistency rate: "
+                f"{stability['dimension_level_consistency_rate']}",
+            ]
+        )
+    else:
+        lines.append("- Not available in these JSONL records.")
+    lines.extend(
+        [
+            "",
+            "## Revision effectiveness",
+            "",
+        ]
+    )
+    revisions = summary["revisions"]
+    if revisions["completed"]:
+        lines.extend(
+            [
+                f"- Completed revision cases: {revisions['completed']}",
+                "- Error resolution rate: "
+                f"{revisions['resolved_issue_total']}/"
+                f"{revisions['known_issue_total']} "
+                f"({revisions['error_resolution_rate']})",
+                f"- New severe errors: {revisions['new_severe_error_total']}",
+                "- Irrelevant content changes: "
+                f"{revisions['irrelevant_change_count']}/"
+                f"{revisions['completed']} "
+                f"({revisions['irrelevant_change_rate']})",
+            ]
+        )
+    else:
+        lines.append("- Not available in these JSONL records.")
+    freeze = summary["freeze"]
+    lines.extend(
+        [
+            "",
+            "## Configuration freeze",
+            "",
+            f"- Status: `{freeze['status']}`",
+        ]
+    )
+    if freeze["status"] == "present":
+        lines.extend(
+            [
+                f"- Freeze version: `{freeze['freeze_version']}`",
+                f"- Frozen code matches result code: `{freeze['matches_result_code_version']}`",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## Failed, timed out, unsupported, or interrupted cases",
+            "",
+            "| case_id | run_index | status | error_code |",
+            "|---|---:|---|---|",
+        ]
+    )
+    failures = [record for record in records if record["status"] != "succeeded"]
+    if failures:
+        for record in failures:
+            lines.append(
+                f"| {record['case_id']} | {record['run_index']} | "
+                f"{record['status']} | {record['error_code']} |"
+            )
+    else:
+        lines.append("| none | - | - | - |")
+    lines.extend(
+        [
+            "",
+            "## Limitations",
+            "",
+            "- Labels are fixed reference answers created by one project author; "
+            "no inter-annotator agreement is claimed.",
+            "- Repeated model runs measure observed repeatability for this fixed "
+            "configuration, not universal model reliability.",
+            "- Correlation or ordering on this small set is descriptive evidence, "
+            "not absolute validity proof.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _markdown_cell(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return "-"
+    return value.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
+def _default_output_path(input_path: Path) -> Path:
+    stem = input_path.stem
+    if stem.endswith("_results"):
+        stem = stem[: -len("_results")]
+    return input_path.with_name(f"{stem}_report.md")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Rebuild a PaperLens evaluation report from raw JSONL.",
+    )
+    parser.add_argument("--input", type=Path, default=DEFAULT_REPORT_INPUT)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    output_path = args.output or _default_output_path(args.input)
+    try:
+        summary = build_report(input_path=args.input, output_path=output_path)
+    except FileNotFoundError:
+        print("REPORT_INPUT_NOT_FOUND", file=sys.stderr)
+        return 2
+    print(
+        "REPORT_BUILT=True "
+        f"ATTEMPTED={summary['attempted']} "
+        f"OUTPUT={output_path}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
