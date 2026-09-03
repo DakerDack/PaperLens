@@ -12,7 +12,7 @@
     "stability_dimension_consistency_min": 0.8,
     "stability_mean_score_sd_max": 5.0
   },
-  "code_version": "workspace-content-bb432232c7e928b507efcf7568ca909e10e044b018fbf75e2ee52c5844fa3b55",
+  "code_version": "workspace-content-0c39da793cf3006d5148f00af5e7ba7ed3cf050207e947af052d03884ad11342",
   "core_dimension_gates": {
     "citation_completeness": 3,
     "citation_correctness": 3,
@@ -23,7 +23,7 @@
     "risk_compliance": 3,
     "terminology": 2
   },
-  "created_at": "2026-09-02T11:05:51.563627+00:00",
+  "created_at": "2026-09-03T00:40:59.599651+00:00",
   "data_version": "paperlens-plos-abstracts-v1",
   "dimension_weights": {
     "citation_completeness": 0.15,
@@ -36,7 +36,7 @@
     "terminology": 0.07
   },
   "freeze_version": "paperlens-stage7-freeze-v1",
-  "manifest_sha256": "f360b6645c47904dc006de1b975295e21665969ba767f1f860fdd9032af1dffc",
+  "manifest_sha256": "4e3bc322a3381338e27419086abfed9f75548b00f14fea7c74b6cb54e929f0c9",
   "manifest_version": "paperlens-live-manifest-v1",
   "model": "hy3",
   "overall_score_threshold": 75,

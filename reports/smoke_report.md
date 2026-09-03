@@ -25,7 +25,7 @@ This report is rebuilt exclusively from the input JSONL records.
 - Prompt versions: audit-v2
 - Schema versions: deep-audit-result-v2
 - Data versions: paperlens-smoke-synthetic-v1
-- Code versions: workspace-content-bb432232c7e928b507efcf7568ca909e10e044b018fbf75e2ee52c5844fa3b55
+- Code versions: workspace-content-0c39da793cf3006d5148f00af5e7ba7ed3cf050207e947af052d03884ad11342
 
 ## Sample selection and licenses
 
