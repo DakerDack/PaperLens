@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 import sys
 from collections import Counter
@@ -125,6 +126,9 @@ def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
         else None
     )
     quality = _summarize_quality(records)
+    quality_calibration_diagnostics = _summarize_quality_calibration_diagnostics(
+        records
+    )
     attacks = _summarize_attacks(records)
     stability = _summarize_stability(records)
     revisions = _summarize_revisions(records)
@@ -152,6 +156,7 @@ def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
         "sample_scale": _summarize_sample_scale(records),
         "sample_selection": _load_sample_selection(records),
         "quality": quality,
+        "quality_calibration_diagnostics": quality_calibration_diagnostics,
         "citation": citation,
         "attacks": attacks,
         "stability": stability,
@@ -293,6 +298,223 @@ def _summarize_quality(records: list[dict[str, Any]]) -> dict[str, Any]:
             observed_scores,
         ),
     }
+
+
+_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "claim_id",
+        "block_id",
+        "relation",
+        "scope_status",
+        "terminology_status",
+        "severity",
+        "deterministic_issue_codes",
+    }
+)
+_DIAGNOSTIC_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$")
+_DIAGNOSTIC_RELATIONS = frozenset({"supports", "contradicts", "insufficient"})
+_DIAGNOSTIC_SCOPE_STATUSES = frozenset({"preserved", "expanded", "unclear"})
+_DIAGNOSTIC_TERMINOLOGY_STATUSES = frozenset({"correct", "misused", "unclear"})
+_DIAGNOSTIC_SEVERITIES = frozenset({"none", "minor", "major", "critical"})
+_DIAGNOSTIC_CODES = frozenset(
+    {
+        "CANDIDATE_BLOCK_NOT_FOUND",
+        "CANDIDATE_QUOTE_MISSING",
+        "CANDIDATE_QUOTE_NOT_FOUND",
+        "NUMBER_MISMATCH",
+        "UNIT_MISMATCH",
+        "NEGATION_MISMATCH",
+        "COMPARISON_DIRECTION_MISMATCH",
+        "INSUFFICIENT_EVIDENCE",
+        "NON_AUDITABLE",
+    }
+)
+_MISSING = object()
+
+
+def _invalid_key_claim_diagnostics() -> None:
+    raise ValueError("invalid key_claim_diagnostics")
+
+
+def _validated_key_claim_diagnostics(
+    metrics: dict[str, Any],
+) -> list[dict[str, Any]] | None:
+    value = metrics.get("key_claim_diagnostics", _MISSING)
+    if value is _MISSING:
+        return None
+    key_claim_count = metrics.get("key_claim_count", _MISSING)
+    accuracy_denominator = metrics.get(
+        "key_claim_citation_accuracy_denominator",
+        _MISSING,
+    )
+    completeness_denominator = metrics.get(
+        "key_claim_citation_completeness_denominator",
+        _MISSING,
+    )
+    counts = (key_claim_count, accuracy_denominator, completeness_denominator)
+    if any(
+        not isinstance(count, int) or isinstance(count, bool) or count < 0
+        for count in counts
+    ):
+        _invalid_key_claim_diagnostics()
+    if completeness_denominator != key_claim_count:
+        _invalid_key_claim_diagnostics()
+    if not isinstance(value, list) or len(value) > 256:
+        _invalid_key_claim_diagnostics()
+    if len(value) != accuracy_denominator:
+        _invalid_key_claim_diagnostics()
+    if key_claim_count == 0 and value:
+        _invalid_key_claim_diagnostics()
+    normalized: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    seen_claim_ids: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != _DIAGNOSTIC_FIELDS:
+            _invalid_key_claim_diagnostics()
+        claim_id = item.get("claim_id")
+        block_id = item.get("block_id")
+        if (
+            not isinstance(claim_id, str)
+            or not _DIAGNOSTIC_IDENTIFIER.fullmatch(claim_id)
+            or (
+                block_id is not None
+                and (
+                    not isinstance(block_id, str)
+                    or not _DIAGNOSTIC_IDENTIFIER.fullmatch(block_id)
+                )
+            )
+        ):
+            _invalid_key_claim_diagnostics()
+        seen_claim_ids.add(claim_id)
+        relation = item.get("relation")
+        scope_status = item.get("scope_status")
+        terminology_status = item.get("terminology_status")
+        severity = item.get("severity")
+        if relation is not None and (
+            not isinstance(relation, str) or relation not in _DIAGNOSTIC_RELATIONS
+        ):
+            _invalid_key_claim_diagnostics()
+        if scope_status is not None and (
+            not isinstance(scope_status, str)
+            or scope_status not in _DIAGNOSTIC_SCOPE_STATUSES
+        ):
+            _invalid_key_claim_diagnostics()
+        if (
+            terminology_status is not None
+            and (
+                not isinstance(terminology_status, str)
+                or terminology_status not in _DIAGNOSTIC_TERMINOLOGY_STATUSES
+            )
+        ):
+            _invalid_key_claim_diagnostics()
+        if severity is not None and (
+            not isinstance(severity, str) or severity not in _DIAGNOSTIC_SEVERITIES
+        ):
+            _invalid_key_claim_diagnostics()
+        codes = item.get("deterministic_issue_codes")
+        if (
+            not isinstance(codes, list)
+            or len(codes) > 32
+            or any(
+                not isinstance(code, str) or code not in _DIAGNOSTIC_CODES
+                for code in codes
+            )
+            or len(codes) != len(set(codes))
+        ):
+            _invalid_key_claim_diagnostics()
+        pair = (claim_id, block_id or "")
+        if pair in seen_pairs:
+            _invalid_key_claim_diagnostics()
+        seen_pairs.add(pair)
+        normalized.append(
+            {
+                "claim_id": claim_id,
+                "block_id": block_id,
+                "relation": relation,
+                "scope_status": scope_status,
+                "terminology_status": terminology_status,
+                "severity": severity,
+                "deterministic_issue_codes": sorted(codes),
+            }
+        )
+    if len(seen_claim_ids) != key_claim_count:
+        _invalid_key_claim_diagnostics()
+    return sorted(
+        normalized,
+        key=lambda item: (item["claim_id"], item["block_id"] or ""),
+    )
+
+
+def _summarize_quality_calibration_diagnostics(
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    quality_record_count = 0
+    available_record_count = 0
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        metrics = _succeeded_metrics(record)
+        if metrics is None or metrics.get("case_group") != "quality":
+            continue
+        quality_record_count += 1
+        diagnostics = _validated_key_claim_diagnostics(metrics)
+        if diagnostics is None:
+            continue
+        available_record_count += 1
+        non_supported = sorted(
+            {
+                item["claim_id"]
+                for item in diagnostics
+                if item["relation"] != "supports"
+            }
+        )
+        deterministic_codes = sorted(
+            {
+                code
+                for item in diagnostics
+                for code in item["deterministic_issue_codes"]
+            }
+        )
+        hard_failure_count = metrics.get("hard_failure_count")
+        if (
+            not isinstance(hard_failure_count, int)
+            or isinstance(hard_failure_count, bool)
+            or hard_failure_count < 0
+        ):
+            hard_failure_count = None
+        decision = metrics.get("decision")
+        if not isinstance(decision, str) or decision not in {
+            "qualified",
+            "needs_revision",
+            "unqualified",
+            "pending_deep_audit",
+        }:
+            decision = None
+        score = metrics.get("overall_score")
+        if (
+            not isinstance(score, (int, float))
+            or isinstance(score, bool)
+            or not math.isfinite(float(score))
+        ):
+            score = None
+        rows.append(
+            {
+                "paper_id": _metric_string(metrics, "paper_id"),
+                "quality_label": _metric_string(metrics, "quality_label"),
+                "overall_score": float(score) if score is not None else None,
+                "decision": decision,
+                "hard_failure_count": hard_failure_count,
+                "non_supported_key_claim_ids": non_supported,
+                "deterministic_issue_codes": deterministic_codes,
+            }
+        )
+    if not quality_record_count or not available_record_count:
+        status = "not_available"
+    elif available_record_count < quality_record_count:
+        status = "partial"
+    else:
+        status = "present"
+    rows.sort(key=lambda row: (row["paper_id"], row["quality_label"]))
+    return {"status": status, "rows": rows}
 
 
 def _spearman_rank_correlation(
@@ -983,6 +1205,49 @@ def _render_markdown(
         )
     else:
         lines.append("- Not available in these JSONL records.")
+    diagnostics = summary["quality_calibration_diagnostics"]
+    lines.extend(
+        [
+            "",
+            "## Quality calibration diagnostics",
+            "",
+            "| paper_id | quality_label | overall_score | decision | hard_failure_count | "
+            "non_supported_key_claim_ids | deterministic_issue_codes |",
+            "|---|---|---:|---|---:|---|---|",
+        ]
+    )
+    if diagnostics["rows"]:
+        for row in diagnostics["rows"]:
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _markdown_cell(row["paper_id"]),
+                        _markdown_cell(row["quality_label"]),
+                        _markdown_cell(
+                            str(row["overall_score"])
+                            if row["overall_score"] is not None
+                            else None
+                        ),
+                        _markdown_cell(row["decision"]),
+                        _markdown_cell(
+                            str(row["hard_failure_count"])
+                            if row["hard_failure_count"] is not None
+                            else None
+                        ),
+                        _markdown_cell(
+                            ", ".join(row["non_supported_key_claim_ids"])
+                            or "-"
+                        ),
+                        _markdown_cell(
+                            ", ".join(row["deterministic_issue_codes"]) or "-"
+                        ),
+                    ]
+                )
+                + " |"
+            )
+    if diagnostics["status"] != "present":
+        lines.append(f"- diagnostics={diagnostics['status']}")
     citation = summary["citation"]
     lines.extend(
         [

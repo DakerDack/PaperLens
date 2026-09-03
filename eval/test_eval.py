@@ -1578,6 +1578,61 @@ def test_live_citation_metrics_support_baseline() -> None:
     assert metrics["key_claim_citation_completeness_denominator"] == 4
 
 
+def test_live_key_claim_diagnostics_are_complete_and_privacy_safe() -> None:
+    case = next(
+        case
+        for case in load_mode_cases("calibrate")
+        if case.payload["quality_label"] == "good"
+    )
+    source_blocks, bundle = materialize_live_case(case)
+    evidence_records, _ = AuditService().quick_check(bundle, source_blocks)
+    expected_pairs = sorted(
+        (record.claim_id, record.block_id or "")
+        for record in evidence_records
+        if any(
+            claim.claim_id == record.claim_id
+            and getattr(claim.importance, "value", claim.importance) == "critical"
+            for claim in bundle.claims
+        )
+    )
+
+    evaluated = evaluate_live_case(case, hy3_service=_FakeLiveService())
+    diagnostics = evaluated["metrics"]["key_claim_diagnostics"]
+
+    assert isinstance(diagnostics, list)
+    assert len(diagnostics) == len(expected_pairs)
+    allowed_fields = {
+        "claim_id",
+        "block_id",
+        "relation",
+        "scope_status",
+        "terminology_status",
+        "severity",
+        "deterministic_issue_codes",
+    }
+    assert all(set(item) == allowed_fields for item in diagnostics)
+    actual_pairs = [
+        (item["claim_id"], item["block_id"] or "") for item in diagnostics
+    ]
+    assert actual_pairs == expected_pairs
+    assert all(isinstance(item["deterministic_issue_codes"], list) for item in diagnostics)
+    assert all(
+        item["relation"] in {"supports", "contradicts", "insufficient", None}
+        and item["scope_status"] in {"preserved", "expanded", "unclear", None}
+        and item["terminology_status"] in {"correct", "misused", "unclear", None}
+        and item["severity"] in {"none", "minor", "major", "critical", None}
+        for item in diagnostics
+    )
+    serialized = json.dumps(diagnostics, ensure_ascii=False).casefold()
+    for forbidden in (
+        "reason",
+        "remediation",
+        "prompt",
+        "candidate_quote",
+    ):
+        assert forbidden not in serialized
+
+
 def test_live_citation_metrics_exclude_contradictory_judgment() -> None:
     case = next(
         case
@@ -1783,6 +1838,246 @@ def test_report_rebuilds_revision_rates_scope_counts_and_actual_cost() -> None:
         "irrelevant_change_count": 1,
         "irrelevant_change_rate": 0.5,
     }
+
+
+def test_report_lists_quality_gate_contributors_without_sensitive_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    missing_freeze_path = root / f"_stage7_diagnostics_missing_{time.time_ns()}.json"
+    assert not missing_freeze_path.exists()
+    monkeypatch.setattr(
+        build_report_module,
+        "DEFAULT_FREEZE_PATH",
+        missing_freeze_path,
+    )
+    record = _existing_result()
+    record.update(
+        {
+            "case_id": "quality:diagnostic-paper:good",
+            "metrics": {
+                "case_group": "quality",
+                "paper_id": "diagnostic-paper",
+                "quality_label": "good",
+                "overall_score": 78,
+                "decision": "needs_revision",
+                "hard_failure_count": 1,
+                "key_claim_count": 2,
+                "key_claim_citation_accuracy_denominator": 2,
+                "key_claim_citation_completeness_denominator": 2,
+                "key_claim_diagnostics": [
+                    {
+                        "claim_id": "claim-supported",
+                        "block_id": "block-01",
+                        "relation": "supports",
+                        "scope_status": "preserved",
+                        "terminology_status": "correct",
+                        "severity": "none",
+                        "deterministic_issue_codes": [],
+                    },
+                    {
+                        "claim_id": "claim-unsupported",
+                        "block_id": "block-02",
+                        "relation": "insufficient",
+                        "scope_status": "unclear",
+                        "terminology_status": "correct",
+                        "severity": "major",
+                        "deterministic_issue_codes": ["NUMBER_MISMATCH"],
+                    },
+                ],
+            },
+        }
+    )
+
+    summary = summarize_results([record])
+    diagnostics = summary["quality_calibration_diagnostics"]
+
+    assert diagnostics["status"] == "present"
+    assert diagnostics["rows"] == [
+        {
+            "paper_id": "diagnostic-paper",
+            "quality_label": "good",
+            "overall_score": 78.0,
+            "decision": "needs_revision",
+            "hard_failure_count": 1,
+            "non_supported_key_claim_ids": ["claim-unsupported"],
+            "deterministic_issue_codes": ["NUMBER_MISMATCH"],
+        }
+    ]
+    markdown = _render_markdown(summary=summary, records=[record])
+    assert "## Quality calibration diagnostics" in markdown
+    assert "| paper_id | quality_label | overall_score | decision | hard_failure_count |" in markdown
+    assert "claim-unsupported" in markdown
+    assert "NUMBER_MISMATCH" in markdown
+    diagnostics_section = markdown.split(
+        "## Quality calibration diagnostics", 1
+    )[1].split("## Key-claim citation coverage", 1)[0]
+    for forbidden in (
+        "reason",
+        "remediation",
+        "candidate_quote",
+        "prompt",
+        "api_key",
+    ):
+        assert forbidden not in diagnostics_section.casefold()
+
+
+def test_report_accepts_legacy_records_without_claim_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    missing_freeze_path = root / f"_stage7_legacy_missing_{time.time_ns()}.json"
+    assert not missing_freeze_path.exists()
+    monkeypatch.setattr(
+        build_report_module,
+        "DEFAULT_FREEZE_PATH",
+        missing_freeze_path,
+    )
+    record = _existing_result()
+    record.update(
+        {
+            "case_id": "quality:legacy-paper:good",
+            "metrics": {
+                "case_group": "quality",
+                "paper_id": "legacy-paper",
+                "quality_label": "good",
+                "overall_score": 90,
+            },
+        }
+    )
+
+    summary = summarize_results([record])
+
+    assert summary["quality_calibration_diagnostics"] == {
+        "status": "not_available",
+        "rows": [],
+    }
+    markdown = _render_markdown(summary=summary, records=[record])
+    assert "## Quality calibration diagnostics" in markdown
+    assert "diagnostics=not_available" in markdown
+
+
+def _report_diagnostic_item(
+    claim_id: str = "claim-01",
+    block_id: str = "block-01",
+) -> dict[str, object]:
+    return {
+        "claim_id": claim_id,
+        "block_id": block_id,
+        "relation": "supports",
+        "scope_status": "preserved",
+        "terminology_status": "correct",
+        "severity": "none",
+        "deterministic_issue_codes": [],
+    }
+
+
+def _report_quality_diagnostics_record(
+    *,
+    diagnostics: list[dict[str, object]],
+    key_claim_count: object = 1,
+    accuracy_denominator: object = 1,
+    completeness_denominator: object = 1,
+) -> dict[str, object]:
+    record = _existing_result()
+    record.update(
+        {
+            "case_id": "quality:diagnostic-integrity:good",
+            "metrics": {
+                "case_group": "quality",
+                "paper_id": "diagnostic-integrity",
+                "quality_label": "good",
+                "overall_score": 80,
+                "decision": "needs_revision",
+                "hard_failure_count": 0,
+                "key_claim_count": key_claim_count,
+                "key_claim_citation_accuracy_denominator": accuracy_denominator,
+                "key_claim_citation_completeness_denominator": completeness_denominator,
+                "key_claim_diagnostics": diagnostics,
+            },
+        }
+    )
+    return record
+
+
+@pytest.mark.parametrize(
+    ("diagnostics", "key_claim_count", "accuracy_denominator", "completeness_denominator"),
+    (
+        ([], 4, 4, 4),
+        ([_report_diagnostic_item()], 1, 4, 1),
+        (
+            [
+                _report_diagnostic_item("claim-01", "block-01"),
+                _report_diagnostic_item("claim-01", "block-02"),
+            ],
+            2,
+            2,
+            2,
+        ),
+    ),
+)
+def test_report_claim_diagnostics_incomplete_counts_fail_closed(
+    diagnostics: list[dict[str, object]],
+    key_claim_count: object,
+    accuracy_denominator: object,
+    completeness_denominator: object,
+) -> None:
+    record = _report_quality_diagnostics_record(
+        diagnostics=diagnostics,
+        key_claim_count=key_claim_count,
+        accuracy_denominator=accuracy_denominator,
+        completeness_denominator=completeness_denominator,
+    )
+
+    with pytest.raises(ValueError, match="invalid key_claim_diagnostics"):
+        summarize_results([record])
+
+
+def test_report_claim_diagnostics_missing_counts_fail_closed() -> None:
+    record = _report_quality_diagnostics_record(
+        diagnostics=[_report_diagnostic_item()]
+    )
+    metrics = record["metrics"]
+    assert isinstance(metrics, dict)
+    for field in (
+        "key_claim_count",
+        "key_claim_citation_accuracy_denominator",
+        "key_claim_citation_completeness_denominator",
+    ):
+        metrics.pop(field)
+
+    with pytest.raises(ValueError, match="invalid key_claim_diagnostics"):
+        summarize_results([record])
+
+
+def test_report_claim_diagnostics_complete_counts_are_present() -> None:
+    diagnostics = [
+        _report_diagnostic_item("claim-01", "block-01"),
+        _report_diagnostic_item("claim-02", "block-02"),
+    ]
+    record = _report_quality_diagnostics_record(
+        diagnostics=diagnostics,
+        key_claim_count=2,
+        accuracy_denominator=2,
+        completeness_denominator=2,
+    )
+
+    summary = summarize_results([record])
+
+    assert summary["quality_calibration_diagnostics"]["status"] == "present"
+
+
+def test_report_claim_diagnostics_zero_claims_allow_empty_diagnostics() -> None:
+    record = _report_quality_diagnostics_record(
+        diagnostics=[],
+        key_claim_count=0,
+        accuracy_denominator=0,
+        completeness_denominator=0,
+    )
+
+    summary = summarize_results([record])
+
+    assert summary["quality_calibration_diagnostics"]["status"] == "present"
 
 
 def test_live_report_includes_manifest_sample_selection_and_license_metadata() -> None:

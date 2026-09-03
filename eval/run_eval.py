@@ -784,6 +784,11 @@ def _live_report_metrics(
         for record in key_evidence_records
         if _has_citation_deterministic_issue(record)
     }
+    key_claim_diagnostics = _key_claim_diagnostics(
+        bundle=bundle,
+        evidence_records=evidence_records,
+        deep_result=deep_result,
+    )
     accurate_count = sum(
         1
         for record in key_evidence_records
@@ -829,6 +834,7 @@ def _live_report_metrics(
                 sufficiently_covered_claim_ids
             ),
             "key_claim_citation_completeness_denominator": len(key_claim_ids),
+            "key_claim_diagnostics": key_claim_diagnostics,
         }
     )
     if case.payload.get("case_group") == "quality":
@@ -860,11 +866,87 @@ _CITATION_DETERMINISTIC_FLAG_PREFIXES = (
     "COMPARISON_DIRECTION_MISMATCH",
 )
 
+_DIAGNOSTIC_ISSUE_CODE_PREFIXES = (
+    ("CANDIDATE_BLOCK_NOT_FOUND:", "CANDIDATE_BLOCK_NOT_FOUND"),
+    ("CANDIDATE_QUOTE_MISSING:", "CANDIDATE_QUOTE_MISSING"),
+    ("CANDIDATE_QUOTE_NOT_FOUND:", "CANDIDATE_QUOTE_NOT_FOUND"),
+    ("NUMBER_MISMATCH:", "NUMBER_MISMATCH"),
+    ("UNIT_MISMATCH:", "UNIT_MISMATCH"),
+    ("NEGATION_MISMATCH", "NEGATION_MISMATCH"),
+    ("COMPARISON_DIRECTION_MISMATCH", "COMPARISON_DIRECTION_MISMATCH"),
+    ("INSUFFICIENT_EVIDENCE", "INSUFFICIENT_EVIDENCE"),
+    ("NON_AUDITABLE", "NON_AUDITABLE"),
+)
+
 
 def _has_citation_deterministic_issue(record: Any) -> bool:
     return any(
         flag.startswith(_CITATION_DETERMINISTIC_FLAG_PREFIXES)
         for flag in record.rule_flags
+    )
+
+
+def _judgment_field(judgment: Any | None, field: str) -> str | None:
+    if judgment is None:
+        return None
+    value = getattr(judgment, field, None)
+    value = getattr(value, "value", value)
+    return value if isinstance(value, str) else None
+
+
+def _diagnostic_issue_codes(record: Any) -> list[str]:
+    codes: set[str] = set()
+    for flag in record.rule_flags:
+        for prefix, code in _DIAGNOSTIC_ISSUE_CODE_PREFIXES:
+            if flag.startswith(prefix):
+                codes.add(code)
+                break
+    return sorted(codes)
+
+
+def _key_claim_diagnostics(
+    *,
+    bundle: GeneratedBundle,
+    evidence_records: list[Any],
+    deep_result: DeepAuditResult,
+) -> list[dict[str, Any]]:
+    key_claim_ids = {
+        claim.claim_id
+        for claim in bundle.claims
+        if getattr(claim.importance, "value", claim.importance) == "critical"
+    }
+    judgments_by_pair = {
+        (judgment.claim_id, judgment.block_id): judgment
+        for judgment in deep_result.semantic_judgments
+    }
+    diagnostics_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in evidence_records:
+        if record.claim_id not in key_claim_ids:
+            continue
+        pair = (record.claim_id, record.block_id or "")
+        existing = diagnostics_by_pair.get(pair)
+        issue_codes = _diagnostic_issue_codes(record)
+        if existing is not None:
+            existing["deterministic_issue_codes"] = sorted(
+                set(existing["deterministic_issue_codes"]) | set(issue_codes)
+            )
+            continue
+        judgment = judgments_by_pair.get((record.claim_id, record.block_id))
+        diagnostics_by_pair[pair] = {
+            "claim_id": record.claim_id,
+            "block_id": record.block_id,
+            "relation": _judgment_field(judgment, "relation"),
+            "scope_status": _judgment_field(judgment, "scope_status"),
+            "terminology_status": _judgment_field(
+                judgment,
+                "terminology_status",
+            ),
+            "severity": _judgment_field(judgment, "severity"),
+            "deterministic_issue_codes": issue_codes,
+        }
+    return sorted(
+        diagnostics_by_pair.values(),
+        key=lambda item: (item["claim_id"], item["block_id"] or ""),
     )
 
 
@@ -975,7 +1057,7 @@ def _revision_metrics(
             for judgment in after_target_judgments
         )
     )
-    return {
+    metrics = {
         "provider_mode": "live",
         "paper_id": case.payload.get("paper_id"),
         "case_group": "revision",
@@ -998,6 +1080,12 @@ def _revision_metrics(
             record.quote_verified for record in after_evidence
         ),
     }
+    metrics["key_claim_diagnostics"] = _key_claim_diagnostics(
+        bundle=after_bundle,
+        evidence_records=after_evidence,
+        deep_result=after_result,
+    )
+    return metrics
 
 
 def _only_target_sentence_changed(
