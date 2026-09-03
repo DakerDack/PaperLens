@@ -25,7 +25,7 @@ This report is rebuilt exclusively from the input JSONL records.
 - Prompt versions: audit-v2
 - Schema versions: deep-audit-result-v2
 - Data versions: paperlens-smoke-synthetic-v1
-- Code versions: workspace-content-0c39da793cf3006d5148f00af5e7ba7ed3cf050207e947af052d03884ad11342
+- Code versions: workspace-content-aeb08971985daa5907ee8740e9e37f351249278aa6d22370aa170429003f94be
 
 ## Sample selection and licenses
 
@@ -59,6 +59,12 @@ This report is rebuilt exclusively from the input JSONL records.
 - Strict quality ordering: 1/1
 - Correct pairwise orderings: 3/3
 - Spearman rank correlation (descriptive): 1.0
+
+## Quality calibration diagnostics
+
+| paper_id | quality_label | overall_score | decision | hard_failure_count | non_supported_key_claim_ids | deterministic_issue_codes |
+|---|---|---:|---|---:|---|---|
+- diagnostics=not_available
 
 ## Key-claim citation coverage
 
