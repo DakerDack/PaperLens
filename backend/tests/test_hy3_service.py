@@ -31,6 +31,7 @@ from backend.app.models import (
 )
 from backend.app.prompts import (
     COMMON_SYSTEM_PROMPT,
+    DEEP_AUDIT_SYSTEM_PROMPT,
     DEEP_AUDIT_PROMPT_VERSION,
     DEEP_AUDIT_SCHEMA_NAME,
     DEEP_AUDIT_SCHEMA_VERSION,
@@ -955,7 +956,7 @@ def test_deep_audit_prompt_centralizes_v2_document_contract() -> None:
         )
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v2"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v3"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
     assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v2"
     assert "逐条判断" in prompt
@@ -969,6 +970,114 @@ def test_deep_audit_prompt_centralizes_v2_document_contract() -> None:
     assert "页码" in prompt and "bbox" in prompt
     assert "不得补充给定 evidence 之外的知识或证据" in prompt
     assert '"claim_id":"c-001"' in prompt
+
+
+def test_deep_audit_prompt_defines_non_hedging_semantic_contract() -> None:
+    prompt = render_deep_audit_prompt(
+        content_draft_json='{"title":"Synthetic","sections":[]}',
+        verified_claim_evidence_pairs_json=(
+            '[{"claim":{"claim_id":"c-001"},'
+            '"evidence":{"block_id":"p01-b001"}}]'
+        ),
+    )
+
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v3"
+    assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
+    assert "relation=supports：仅当 evidence 直接蕴含 claim 的全部实质事实时选择。" in prompt
+    assert "relation=contradicts：当数字、方向、因果、比较或结论冲突时选择。" in prompt
+    assert "relation=insufficient：仅当给定 evidence 缺少对 claim 的直接支持时选择。" in prompt
+    assert "直接可判定的配对不得以 unclear 作为回避或兜底选择。" in prompt
+    assert (
+        "scope_status=preserved：只有样本、方法、比较对象、条件、数量、适用性、因果强度"
+        "和限定语均未被扩大时选择。"
+    ) in prompt
+    assert (
+        "scope_status=expanded：省略或改变比较对象、实验条件、总体范围、因果边界、数值"
+        "或效应量而使 claim 更宽时选择。"
+    ) in prompt
+    assert "relation=supports 与 scope_status=expanded 可以同时成立。" in prompt
+    assert (
+        "terminology_status=correct：同义改述或不同措辞但语义相同仍为 correct；只有替换、"
+        "泛化或改变含义时才选择 misused，不得仅因措辞不同选择 unclear 或 misused。"
+    ) in prompt
+    assert (
+        "当前绑定 evidence 已明确陈述限制时，应选择 relation=supports；不得额外要求背景"
+        "或其他 SourceBlock。"
+    ) in prompt
+    assert "severity=none：配对不存在事实、范围或术语问题。" in prompt
+    assert (
+        "severity=minor：存在局部精度或限定语损失，但不实质改变研究对象、比较条件、数值"
+        "或效应解释、因果强度、方向或主要结论。"
+    ) in prompt
+    assert (
+        "severity=major：错误会实质改变对一个主张的理解，例如重要范围、因果、数值、比较"
+        "或方向发生变化，但尚未推翻核心或关键结论。"
+    ) in prompt
+    assert (
+        "severity=critical：仅当问题足以反转、伪造或使核心或关键结论实质错误时选择。"
+    ) in prompt
+    assert (
+        "scope_status=expanded 或 terminology_status=misused 时，不得在无充分理由下选择"
+        " severity=none。"
+    ) in prompt
+    assert (
+        "同一未变的 claim/evidence 配对必须给出相同判断，不得受其他 items、顺序或无关"
+        "文档内容影响。"
+    ) in prompt
+
+
+def test_deep_audit_prompt_closes_severity_decision_contract() -> None:
+    prompt = render_deep_audit_prompt(
+        content_draft_json='{"title":"Synthetic","sections":[]}',
+        verified_claim_evidence_pairs_json=(
+            '[{"claim":{"claim_id":"c-001","importance":"critical"},'
+            '"evidence":{"block_id":"p01-b001"}}]'
+        ),
+    )
+
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v3"
+    assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
+    assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v2"
+    assert (
+        "severity=major：错误会实质改变对一个主张的理解，例如重要范围、因果、数值、比较"
+        "或方向发生变化，但尚未推翻核心或关键结论。"
+    ) in prompt
+    assert (
+        "severity=critical：仅当问题足以反转、伪造或使核心或关键结论实质错误时选择。"
+    ) in prompt
+    assert "severity=none：配对不存在事实、范围或术语问题。" in prompt
+    assert (
+        "severity=minor：存在局部精度或限定语损失，但不实质改变研究对象、比较条件、数值"
+        "或效应解释、因果强度、方向或主要结论。"
+    ) in prompt
+    assert (
+        "不得仅因措辞不同、claim 的 importance 标为 critical 或普通范围缺失而选择"
+        " severity=critical。"
+    ) in prompt
+    assert "major 或 critical" not in prompt
+    assert (
+        "同一未变的 claim/evidence 配对必须给出相同判断，不得受其他 items、顺序或无关"
+        "文档内容影响。"
+    ) in prompt
+
+
+def test_deep_audit_prompt_keeps_quality_labels_out_of_model_input() -> None:
+    prompt = render_deep_audit_prompt(
+        content_draft_json='{"title":"Synthetic","sections":[]}',
+        verified_claim_evidence_pairs_json="[]",
+    )
+    model_input = f"{DEEP_AUDIT_SYSTEM_PROMPT}\n{prompt}".casefold()
+
+    for forbidden in (
+        "quality_label",
+        "known_error_type",
+        "known_error_severity",
+        "known_error_detected",
+        "case_id",
+        "paper_id",
+        "dev-01",
+    ):
+        assert forbidden not in model_input
 
 
 def test_deep_audit_prompt_makes_risk_only_output_shape_explicit() -> None:
@@ -1256,7 +1365,7 @@ def test_live_deep_audit_schema_error_retries_and_logs_safely(caplog) -> None:
     retry_prompt = client.completions.calls[1]["messages"][1]["content"]
     assert retry_prompt.count("字段错误摘要：") == 1
     assert invalid not in retry_prompt
-    assert "prompt_version=audit-v2" in caplog.text
+    assert "prompt_version=audit-v3" in caplog.text
     assert "schema_version=deep-audit-result-v2" in caplog.text
     assert "retries=1" in caplog.text
     assert invalid not in caplog.text

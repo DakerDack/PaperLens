@@ -4,7 +4,7 @@ from backend.app.models import ClaimPolicy
 GENERATION_PROMPT_VERSION = "gen-v4"
 GENERATION_SCHEMA_VERSION = "generated-bundle-v1"
 GENERATION_SCHEMA_NAME = "paperlens_generated_bundle_v1"
-DEEP_AUDIT_PROMPT_VERSION = "audit-v2"
+DEEP_AUDIT_PROMPT_VERSION = "audit-v3"
 DEEP_AUDIT_SCHEMA_VERSION = "deep-audit-result-v2"
 DEEP_AUDIT_SCHEMA_NAME = "paperlens_deep_audit_result_v2"
 REVISION_PROMPT_VERSION = "revision-v2"
@@ -79,8 +79,21 @@ DEEP_AUDIT_USER_PROMPT_TEMPLATE = """任务一：逐条判断 claim 是否被给
 
 每个输出必须保留对应输入的 claim_id 和 evidence.block_id，且每个输入项恰好返回一次判断。
 不得参考分数、预设质量档位、攻击标签或其他 claim 的最终判断。
-重点检查事实关系、相关性与因果、样本和适用范围、术语语境、关键限定条件。
-证据不能直接支持时选择 insufficient，不得依靠常识补足。
+语义判定固定规则：
+- relation=supports：仅当 evidence 直接蕴含 claim 的全部实质事实时选择。
+- relation=contradicts：当数字、方向、因果、比较或结论冲突时选择。
+- relation=insufficient：仅当给定 evidence 缺少对 claim 的直接支持时选择。当前 evidence 已直接支持时，不得额外要求背景、其他 SourceBlock 或外部知识。
+- scope_status=preserved：只有样本、方法、比较对象、条件、数量、适用性、因果强度和限定语均未被扩大时选择。缩短表述但仍保留全部边界时仍为 preserved。
+- scope_status=expanded：省略或改变比较对象、实验条件、总体范围、因果边界、数值或效应量而使 claim 更宽时选择。relation=supports 与 scope_status=expanded 可以同时成立。
+- terminology_status=correct：同义改述或不同措辞但语义相同仍为 correct；只有替换、泛化或改变含义时才选择 misused，不得仅因措辞不同选择 unclear 或 misused。
+- 只有该 claim/evidence 配对本身无法判断时才选择 scope_status=unclear 或 terminology_status=unclear。直接可判定的配对不得以 unclear 作为回避或兜底选择。
+- severity=none：配对不存在事实、范围或术语问题。
+- severity=minor：存在局部精度或限定语损失，但不实质改变研究对象、比较条件、数值或效应解释、因果强度、方向或主要结论。
+- severity=major：错误会实质改变对一个主张的理解，例如重要范围、因果、数值、比较或方向发生变化，但尚未推翻核心或关键结论。
+- severity=critical：仅当问题足以反转、伪造或使核心或关键结论实质错误时选择。不得仅因措辞不同、claim 的 importance 标为 critical 或普通范围缺失而选择 severity=critical。
+- scope_status=expanded 或 terminology_status=misused 时，不得在无充分理由下选择 severity=none。不得为了区分标签而虚构问题。
+- 当前绑定 evidence 已明确陈述限制时，应选择 relation=supports；不得额外要求背景或其他 SourceBlock。
+- 同一未变的 claim/evidence 配对必须给出相同判断，不得受其他 items、顺序或无关文档内容影响。
 不得补充给定 evidence 之外的知识或证据，不得返回页码或 bbox。
 即使 items 为空，也必须继续执行任务二。
 items 为空时，semantic_judgments 必须为空数组；不得为不存在的配对生成判断。

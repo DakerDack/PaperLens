@@ -1969,12 +1969,19 @@ def test_freeze_configuration_records_manifest_and_model_contract_without_key(
     assert frozen["data_version"] == "paperlens-plos-abstracts-v1"
     assert len(frozen["manifest_sha256"]) == 64
     assert frozen["model"] == "hy3"
-    assert frozen["prompt_versions"]["deep_audit"] == "audit-v2"
+    assert frozen["prompt_versions"]["deep_audit"] == "audit-v3"
     assert frozen["schema_versions"]["deep_audit"] == "deep-audit-result-v2"
     assert frozen["overall_score_threshold"] == 75
     assert frozen["dimension_weights"]["factual_consistency"] == 0.20
     assert frozen["core_dimension_gates"]["risk_compliance"] == 3
     assert "api_key" not in json.dumps(frozen).casefold()
+
+
+def test_stage7_freeze_payload_tracks_audit_v3_without_schema_change() -> None:
+    payload = _freeze_payload()
+
+    assert payload["prompt_versions"]["deep_audit"] == "audit-v3"
+    assert payload["schema_versions"]["deep_audit"] == "deep-audit-result-v2"
 
 
 def test_non_smoke_cli_requires_explicit_cost_confirmation(
