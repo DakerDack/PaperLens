@@ -453,6 +453,175 @@ def test_evidence_detects_negation_reversal() -> None:
     assert "NEGATION_MISMATCH" in record.rule_flags
 
 
+def test_model_candidate_ignores_negation_in_unrelated_fragment() -> None:
+    block = source_block(
+        "p01-b001",
+        "The treatment improved accuracy. No unrelated adverse events were reported.",
+    )
+    claim = atomic_claim(
+        "The treatment improved accuracy.",
+        candidate_block_ids=["p01-b001"],
+        candidate_quote=block.text,
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.match_method == "model_candidate"
+    assert record.quote_verified is True
+    assert "NEGATION_MISMATCH" not in record.rule_flags
+
+
+def test_negation_mismatch_requires_comparable_proposition() -> None:
+    block = source_block(
+        "p01-b001",
+        "The treatment did not worsen accuracy.",
+    )
+    claim = atomic_claim(
+        "The treatment improved accuracy.",
+        candidate_block_ids=["p01-b001"],
+        candidate_quote=block.text,
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert "NEGATION_MISMATCH" not in record.rule_flags
+
+
+@pytest.mark.parametrize(
+    ("claim_text", "evidence_text"),
+    (
+        (
+            "Participants were in contact.",
+            "Participants were in no-contact condition.",
+        ),
+        (
+            "Participants were in no-contact condition.",
+            "Participants were in contact.",
+        ),
+    ),
+)
+def test_hyphenated_negation_reversal_is_detected(
+    claim_text: str,
+    evidence_text: str,
+) -> None:
+    block = source_block("p01-b001", evidence_text)
+    claim = atomic_claim(
+        claim_text,
+        candidate_block_ids=["p01-b001"],
+        candidate_quote=evidence_text,
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.match_method == "model_candidate"
+    assert record.quote_verified is True
+    assert "NEGATION_MISMATCH" in record.rule_flags
+
+
+def test_hyphenated_negation_in_unrelated_fragment_is_ignored() -> None:
+    block = source_block(
+        "p01-b001",
+        "Participants were in contact. The no-contact arm was excluded.",
+    )
+    claim = atomic_claim(
+        "Participants were in contact.",
+        candidate_block_ids=["p01-b001"],
+        candidate_quote=block.text,
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.match_method == "model_candidate"
+    assert record.quote_verified is True
+    assert "NEGATION_MISMATCH" not in record.rule_flags
+
+
+@pytest.mark.parametrize("embedded_term", ("nobody", "notable"))
+def test_embedded_negation_boundary_does_not_flag(
+    embedded_term: str,
+) -> None:
+    block = source_block("p01-b001", f"The report described {embedded_term}.")
+    claim = atomic_claim(
+        f"The report described {embedded_term}.",
+        candidate_block_ids=["p01-b001"],
+        candidate_quote=block.text,
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert audit_module._negations(embedded_term) == set()
+    assert "NEGATION_MISMATCH" not in record.rule_flags
+
+
+@pytest.mark.parametrize(
+    ("claim_text", "evidence_text", "negation_mismatch"),
+    (
+        (
+            "The treatment did not improve accuracy.",
+            "The treatment had no improvement in accuracy.",
+            False,
+        ),
+        (
+            "该方法未提升准确率。",
+            "该方法没有提升准确率。",
+            False,
+        ),
+        (
+            "The treatment improved accuracy.",
+            "The treatment did not improve accuracy.",
+            True,
+        ),
+    ),
+)
+def test_negation_equivalence_compares_polarity_not_marker_identity(
+    claim_text: str,
+    evidence_text: str,
+    negation_mismatch: bool,
+) -> None:
+    block = source_block("p01-b001", evidence_text)
+    claim = atomic_claim(
+        claim_text,
+        candidate_block_ids=["p01-b001"],
+        candidate_quote=evidence_text,
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert ("NEGATION_MISMATCH" in record.rule_flags) is negation_mismatch
+
+
+@pytest.mark.parametrize(
+    ("claim_text", "evidence_text"),
+    (
+        (
+            "The treatment did not improve accuracy.",
+            "The treatment had no improvement in accuracy.",
+        ),
+        (
+            "该方法未提升准确率。",
+            "该方法没有提升准确率。",
+        ),
+    ),
+)
+def test_negation_equivalence_bm25_fallback(
+    claim_text: str,
+    evidence_text: str,
+) -> None:
+    block = source_block("p01-b001", evidence_text)
+    claim = atomic_claim(
+        claim_text,
+        candidate_block_ids=["p99-b999"],
+        candidate_quote="fabricated candidate",
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.match_method == "bm25_fallback"
+    assert record.quote_verified is True
+    assert "NEGATION_MISMATCH" not in record.rule_flags
+    assert "CANDIDATE_BLOCK_NOT_FOUND:p99-b999" in record.rule_flags
+
+
 def test_evidence_detects_comparison_direction_change() -> None:
     block = source_block("p01-b001", "Accuracy decreased relative to baseline.")
     claim = atomic_claim(

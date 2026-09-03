@@ -770,13 +770,64 @@ def _live_report_metrics(
     key_evidence_records = [
         record for record in evidence_records if record.claim_id in key_claim_ids
     ]
-    key_verified_count = sum(record.quote_verified for record in key_evidence_records)
+    judgments_by_pair = {
+        (judgment.claim_id, judgment.block_id): judgment
+        for judgment in deep_result.semantic_judgments
+    }
+    contradictory_claim_ids = {
+        judgment.claim_id
+        for judgment in deep_result.semantic_judgments
+        if getattr(judgment.relation, "value", judgment.relation) == "contradicts"
+    }
+    deterministic_issue_claim_ids = {
+        record.claim_id
+        for record in key_evidence_records
+        if _has_citation_deterministic_issue(record)
+    }
+    accurate_count = sum(
+        1
+        for record in key_evidence_records
+        if (
+            record.quote_verified
+            and getattr(record.match_method, "value", record.match_method)
+            == "model_candidate"
+            and (
+                judgment := judgments_by_pair.get(
+                    (record.claim_id, record.block_id)
+                )
+            )
+            is not None
+            and getattr(judgment.relation, "value", judgment.relation)
+            == "supports"
+            and not _has_citation_deterministic_issue(record)
+        )
+    )
+    sufficiently_covered_claim_ids = {
+        record.claim_id
+        for record in key_evidence_records
+        if (
+            record.quote_verified
+            and record.claim_id not in deterministic_issue_claim_ids
+            and record.claim_id not in contradictory_claim_ids
+            and (
+                judgment := judgments_by_pair.get(
+                    (record.claim_id, record.block_id)
+                )
+            )
+            is not None
+            and getattr(judgment.relation, "value", judgment.relation)
+            == "supports"
+            and not _has_citation_deterministic_issue(record)
+        )
+    }
     metrics.update(
         {
             "key_claim_count": len(key_claim_ids),
-            "key_claim_citation_accuracy_numerator": key_verified_count,
+            "key_claim_citation_accuracy_numerator": accurate_count,
             "key_claim_citation_accuracy_denominator": len(key_evidence_records),
-            "key_claim_citation_completeness_numerator": key_verified_count,
+            "key_claim_citation_completeness_numerator": len(
+                sufficiently_covered_claim_ids
+            ),
             "key_claim_citation_completeness_denominator": len(key_claim_ids),
         }
     )
@@ -800,6 +851,21 @@ def _live_report_metrics(
             report=report,
         )
     return metrics
+
+
+_CITATION_DETERMINISTIC_FLAG_PREFIXES = (
+    "NUMBER_MISMATCH:",
+    "UNIT_MISMATCH:",
+    "NEGATION_MISMATCH",
+    "COMPARISON_DIRECTION_MISMATCH",
+)
+
+
+def _has_citation_deterministic_issue(record: Any) -> bool:
+    return any(
+        flag.startswith(_CITATION_DETERMINISTIC_FLAG_PREFIXES)
+        for flag in record.rule_flags
+    )
 
 
 def _attack_detected(

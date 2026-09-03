@@ -196,6 +196,12 @@ _NEGATION_TERMS = (
     "并非",
     "不能",
 )
+
+
+def _negation_pattern(term: str) -> str:
+    return rf"(?<!\w){re.escape(term)}(?!\w)"
+
+
 _DIRECTION_TERMS = {
     "up": (
         "increase",
@@ -744,7 +750,7 @@ class AuditService:
             )
             if claim_numbers.issubset(_numbers(fragment))
             and claim_units.issubset(_units(fragment))
-            and claim_negations == _negations(fragment)
+            and bool(claim_negations) == bool(_negations(fragment))
         ]
         if not eligible:
             return []
@@ -863,11 +869,65 @@ def _negations(text: str) -> set[str]:
     found: set[str] = set()
     for term in _NEGATION_TERMS:
         if term.isascii():
-            if re.search(rf"\b{re.escape(term)}\b", normalized):
+            if re.search(_negation_pattern(term), normalized):
                 found.add(term)
         elif term in normalized:
             found.add(term)
     return found
+
+
+def _negation_free_tokens(text: str) -> set[str]:
+    normalized = normalize_evidence_text(text)
+    for term in sorted(_negations(text), key=len, reverse=True):
+        if term.isascii():
+            normalized = re.sub(_negation_pattern(term), " ", normalized)
+        else:
+            normalized = normalized.replace(term, " ")
+
+    direction_terms = {
+        term.casefold(): f"__direction_{direction}"
+        for direction, terms in _DIRECTION_TERMS.items()
+        for term in terms
+        if term.isalnum()
+    }
+    tokens: set[str] = set()
+    for token in _tokenize(normalized):
+        folded = token.casefold()
+        tokens.add(direction_terms.get(folded, folded))
+    return tokens
+
+
+def _relevant_negation_fragment(claim_text: str, source_text: str) -> str:
+    fragments = _evidence_fragments(source_text)
+    if len(fragments) == 1:
+        return fragments[0]
+    claim_tokens = _negation_free_tokens(claim_text)
+    ranked = []
+    for index, fragment in enumerate(fragments):
+        fragment_tokens = _negation_free_tokens(fragment)
+        ranked.append(
+            (
+                -len(claim_tokens.intersection(fragment_tokens)),
+                len(fragment_tokens),
+                index,
+                fragment,
+            )
+        )
+    return min(ranked)[3]
+
+
+def _negation_mismatch(claim_text: str, source_text: str) -> bool:
+    claim_negated = bool(_negations(claim_text))
+    source_negated = bool(_negations(source_text))
+    if claim_negated == source_negated:
+        return False
+    claim_tokens = _negation_free_tokens(claim_text)
+    source_tokens = _negation_free_tokens(source_text)
+    if not claim_tokens or not source_tokens:
+        return False
+    return claim_tokens.issubset(source_tokens) or source_tokens.issubset(
+        claim_tokens
+    )
 
 
 def _comparison_directions(text: str) -> set[str]:
@@ -896,7 +956,8 @@ def _claim_source_flags(claim: AtomicClaim, source_text: str) -> list[str]:
         f"UNIT_MISMATCH:{unit}"
         for unit in sorted(_units(claim.text) - source_units)
     )
-    if _negations(claim.text) != _negations(source_text):
+    negation_source = _relevant_negation_fragment(claim.text, source_text)
+    if _negation_mismatch(claim.text, negation_source):
         flags.append("NEGATION_MISMATCH")
     claim_directions = _comparison_directions(claim.text)
     source_directions = _comparison_directions(source_text)

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from backend.app.audit_service import AuditService
+from backend.app.audit_service import AuditService, normalize_evidence_text
 from backend.app.hy3_service import Hy3ServiceError
 from backend.app.models import DeepAuditResult
 import eval.build_report as build_report_module
@@ -1132,8 +1132,15 @@ def test_every_frozen_live_slot_materializes_against_production_models() -> None
         assert len(source_blocks) == 3
         assert all(block.bbox is None for block in source_blocks)
         assert all(block.parser.value == "pdfplumber" for block in source_blocks)
-        assert len(bundle.document.sections) == 5
-        assert len(bundle.claims) == 3
+        if len(bundle.document.sections) != 5:
+            pytest.fail(f"{case.payload['paper_id']}: section_count_invalid")
+        if len(bundle.claims) != 4:
+            pytest.fail(f"{case.payload['paper_id']}: claim_count_invalid")
+        if sum(
+            getattr(claim.claim_type, "value", claim.claim_type) == "limitation"
+            for claim in bundle.claims
+        ) != 1:
+            pytest.fail(f"{case.payload['paper_id']}: limitation_claim_count_invalid")
 
 
 def test_attack_pairs_share_sources_and_change_only_the_declared_sentence() -> None:
@@ -1308,6 +1315,147 @@ class _NonTargetSevereIssueLiveService(_FakeLiveService):
         )
 
 
+def test_every_good_baseline_has_grounded_critical_limitation_claim() -> None:
+    good_cases = [
+        case
+        for mode in ("calibrate", "final")
+        for case in load_mode_cases(mode)
+        if case.payload.get("case_group") == "quality"
+        and case.payload.get("quality_label") == "good"
+    ]
+    assert len(good_cases) == 10
+
+    for case in good_cases:
+        paper_id = str(case.payload["paper_id"])
+        source_blocks, bundle = materialize_live_case(case)
+        limitation_sentences = [
+            sentence
+            for section in bundle.document.sections
+            if getattr(section.section_id, "value", section.section_id)
+            == "limitations"
+            for sentence in section.sentences
+        ]
+        if len(limitation_sentences) != 1:
+            pytest.fail(f"{paper_id}: limitation_sentence_count_invalid")
+        limitation_sentence = limitation_sentences[0]
+        limitation_claims = [
+            claim
+            for claim in bundle.claims
+            if claim.sentence_id == limitation_sentence.sentence_id
+        ]
+        if len(limitation_claims) != 1:
+            pytest.fail(f"{paper_id}: limitation_claim_count_invalid")
+        claim = limitation_claims[0]
+        if claim.claim_id != f"{paper_id}-c04":
+            pytest.fail(f"{paper_id}: limitation_claim_id_invalid")
+        if getattr(claim.claim_type, "value", claim.claim_type) != "limitation":
+            pytest.fail(f"{paper_id}: limitation_claim_type_invalid")
+        if getattr(claim.importance, "value", claim.importance) != "critical":
+            pytest.fail(f"{paper_id}: limitation_claim_importance_invalid")
+        if claim.auditability != "auditable":
+            pytest.fail(f"{paper_id}: limitation_claim_auditability_invalid")
+        if not claim.qualifiers:
+            pytest.fail(f"{paper_id}: limitation_claim_qualifiers_missing")
+        if len(claim.candidate_block_ids) != 1:
+            pytest.fail(f"{paper_id}: limitation_candidate_block_count_invalid")
+        block_by_id = {block.block_id: block for block in source_blocks}
+        block = block_by_id.get(claim.candidate_block_ids[0])
+        if block is None:
+            pytest.fail(f"{paper_id}: limitation_candidate_block_missing")
+        if claim.candidate_quote is None or not (
+            normalize_evidence_text(claim.candidate_quote)
+            in normalize_evidence_text(block.text)
+        ):
+            pytest.fail(f"{paper_id}: limitation_candidate_quote_invalid")
+
+        evidence_records, _ = AuditService().quick_check(bundle, source_blocks)
+        matching_records = [
+            record for record in evidence_records if record.claim_id == claim.claim_id
+        ]
+        if len(matching_records) != 1:
+            pytest.fail(f"{paper_id}: limitation_evidence_count_invalid")
+        record = matching_records[0]
+        if getattr(record.match_method, "value", record.match_method) != (
+            "model_candidate"
+        ):
+            pytest.fail(f"{paper_id}: limitation_match_method_invalid")
+        if record.quote_verified is not True:
+            pytest.fail(f"{paper_id}: limitation_quote_not_verified")
+        if any(
+            flag.startswith(
+                (
+                    "CANDIDATE_BLOCK_NOT_FOUND:",
+                    "CANDIDATE_QUOTE_NOT_FOUND:",
+                    "NUMBER_MISMATCH:",
+                    "UNIT_MISMATCH:",
+                )
+            )
+            or flag in {
+                "NEGATION_MISMATCH",
+                "COMPARISON_DIRECTION_MISMATCH",
+            }
+            for flag in record.rule_flags
+        ):
+            pytest.fail(f"{paper_id}: limitation_evidence_flags_invalid")
+
+
+def test_good_baselines_reach_supported_conclusion_limitation_dimension() -> None:
+    good_cases = [
+        case
+        for mode in ("calibrate", "final")
+        for case in load_mode_cases(mode)
+        if case.payload.get("case_group") == "quality"
+        and case.payload.get("quality_label") == "good"
+    ]
+    assert len(good_cases) == 10
+
+    failures: list[str] = []
+    expected_metrics = {
+        "key_claim_count": 4,
+        "key_claim_citation_accuracy_numerator": 4,
+        "key_claim_citation_accuracy_denominator": 4,
+        "key_claim_citation_completeness_numerator": 4,
+        "key_claim_citation_completeness_denominator": 4,
+    }
+    for case in good_cases:
+        paper_id = str(case.payload["paper_id"])
+        metrics = evaluate_live_case(
+            case,
+            hy3_service=_FakeLiveService(),
+        )["metrics"]
+        if metrics.get("dimension_points", {}).get("conclusion_limitations") != 4:
+            failures.append(f"{paper_id}/conclusion_limitations_dimension_invalid")
+        for field, expected in expected_metrics.items():
+            if metrics.get(field) != expected:
+                failures.append(f"{paper_id}/{field}_invalid")
+    if failures:
+        pytest.fail("good_baseline_metric_failures=" + ",".join(failures))
+
+
+def test_good_baseline_negation_flags_are_aggregated() -> None:
+    good_cases = [
+        case
+        for mode in ("calibrate", "final")
+        for case in load_mode_cases(mode)
+        if case.payload.get("case_group") == "quality"
+        and case.payload.get("quality_label") == "good"
+    ]
+    assert len(good_cases) == 10
+
+    failures: list[str] = []
+    for case in good_cases:
+        paper_id = str(case.payload["paper_id"])
+        source_blocks, bundle = materialize_live_case(case)
+        evidence_records, _ = AuditService().quick_check(bundle, source_blocks)
+        failures.extend(
+            f"{paper_id}/{record.claim_id}"
+            for record in evidence_records
+            if "NEGATION_MISMATCH" in record.rule_flags
+        )
+    if failures:
+        pytest.fail("good_baseline_negation_failures=" + ",".join(failures))
+
+
 class _FailingRevisionLiveService(_FakeLiveService):
     def revise_sentence(self, **_kwargs):
         self.calls.append("revision")
@@ -1413,6 +1561,90 @@ def test_live_evaluator_uses_production_audit_chain_and_aggregates_observations(
     assert evaluated["metrics"]["quality_label"] == "good"
 
 
+def test_live_citation_metrics_support_baseline() -> None:
+    case = next(
+        case
+        for case in load_mode_cases("calibrate")
+        if case.payload["quality_label"] == "good"
+    )
+
+    evaluated = evaluate_live_case(case, hy3_service=_FakeLiveService())
+    metrics = evaluated["metrics"]
+
+    assert metrics["key_claim_count"] == 4
+    assert metrics["key_claim_citation_accuracy_numerator"] == 4
+    assert metrics["key_claim_citation_accuracy_denominator"] == 4
+    assert metrics["key_claim_citation_completeness_numerator"] == 4
+    assert metrics["key_claim_citation_completeness_denominator"] == 4
+
+
+def test_live_citation_metrics_exclude_contradictory_judgment() -> None:
+    case = next(
+        case
+        for case in load_mode_cases("calibrate")
+        if case.payload["quality_label"] == "good"
+    )
+
+    evaluated = evaluate_live_case(
+        case,
+        hy3_service=_NonTargetSevereIssueLiveService(),
+    )
+    metrics = evaluated["metrics"]
+
+    assert metrics["key_claim_citation_accuracy_numerator"] == 3
+    assert metrics["key_claim_citation_accuracy_denominator"] == 4
+    assert metrics["key_claim_citation_completeness_numerator"] == 3
+    assert metrics["key_claim_citation_completeness_denominator"] == 4
+
+
+def test_live_citation_metrics_exclude_deterministic_mismatch() -> None:
+    case = next(
+        case
+        for case in load_mode_cases("calibrate")
+        if case.case_id == "quality:dev-01:bad"
+    )
+
+    evaluated = evaluate_live_case(case, hy3_service=_FakeLiveService())
+    metrics = evaluated["metrics"]
+
+    assert metrics["key_claim_citation_accuracy_numerator"] == 3
+    assert metrics["key_claim_citation_accuracy_denominator"] == 4
+    assert metrics["key_claim_citation_completeness_numerator"] == 3
+    assert metrics["key_claim_citation_completeness_denominator"] == 4
+
+
+def test_live_citation_metrics_separate_bm25_accuracy_and_completeness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import eval.run_eval as run_eval_module
+
+    case = next(
+        case
+        for case in load_mode_cases("calibrate")
+        if case.case_id == "quality:dev-01:good"
+    )
+    source_blocks, bundle = materialize_live_case(case)
+    first_claim = bundle.claims[0].model_copy(
+        update={"candidate_quote": "fabricated candidate"}
+    )
+    modified_bundle = bundle.model_copy(
+        update={"claims": [first_claim, *bundle.claims[1:]]}
+    )
+    monkeypatch.setattr(
+        run_eval_module,
+        "materialize_live_case",
+        lambda _case: (source_blocks, modified_bundle),
+    )
+
+    evaluated = evaluate_live_case(case, hy3_service=_FakeLiveService())
+    metrics = evaluated["metrics"]
+
+    assert metrics["key_claim_citation_accuracy_numerator"] == 3
+    assert metrics["key_claim_citation_accuracy_denominator"] == 4
+    assert metrics["key_claim_citation_completeness_numerator"] == 4
+    assert metrics["key_claim_citation_completeness_denominator"] == 4
+
+
 def test_live_evaluator_revision_runs_four_logical_steps_and_reports_revision_metrics() -> None:
     case = next(
         case
@@ -1482,13 +1714,20 @@ def test_freeze_configuration_records_manifest_and_model_contract_without_key(
 def test_non_smoke_cli_requires_explicit_cost_confirmation(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(sys, "argv", ["run_eval.py", "--mode", "calibrate"])
+    isolated_output = tmp_path / "calibrate_results.jsonl"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_eval.py", "--mode", "calibrate", "--output", str(isolated_output)],
+    )
 
     exit_code = main()
 
     assert exit_code == 2
     assert "COST_CONFIRMATION_REQUIRED" in capsys.readouterr().out
+    assert not isolated_output.exists()
 
 
 def test_report_rebuilds_revision_rates_scope_counts_and_actual_cost() -> None:
