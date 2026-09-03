@@ -1315,6 +1315,73 @@ class _NonTargetSevereIssueLiveService(_FakeLiveService):
         )
 
 
+class _TargetSignalLiveService(_FakeLiveService):
+    def __init__(self, *, target_claim_id: str, signal: dict[str, str]) -> None:
+        super().__init__()
+        self.target_claim_id = target_claim_id
+        self.signal = signal
+
+    def deep_audit(self, *, document, claim_evidence_pairs):
+        from backend.app.models import SemanticJudgment
+
+        pairs = list(claim_evidence_pairs)
+        result = super().deep_audit(
+            document=document,
+            claim_evidence_pairs=pairs,
+        )
+        target = next(
+            judgment
+            for judgment in result.semantic_judgments
+            if judgment.claim_id == self.target_claim_id
+        )
+        replacement = SemanticJudgment(
+            claim_id=target.claim_id,
+            block_id=target.block_id,
+            relation=self.signal.get("relation", "supports"),
+            scope_status=self.signal.get("scope_status", "preserved"),
+            terminology_status=self.signal.get("terminology_status", "correct"),
+            severity=self.signal.get("severity", "none"),
+            reason="Safe synthetic known-error signal.",
+        )
+        return result.model_copy(
+            update={
+                "semantic_judgments": [
+                    replacement
+                    if judgment.claim_id == self.target_claim_id
+                    else judgment
+                    for judgment in result.semantic_judgments
+                ]
+            }
+        )
+
+
+class _CapturingLiveService(_FakeLiveService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.review_input = ""
+
+    def deep_audit(self, *, document, claim_evidence_pairs):
+        pairs = list(claim_evidence_pairs)
+        self.review_input = json.dumps(
+            {
+                "document": document.model_dump(mode="json"),
+                "claim_evidence_pairs": [
+                    {
+                        "claim": claim.model_dump(mode="json"),
+                        "evidence": evidence.model_dump(mode="json"),
+                    }
+                    for claim, evidence in pairs
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return super().deep_audit(
+            document=document,
+            claim_evidence_pairs=pairs,
+        )
+
+
 def test_every_good_baseline_has_grounded_critical_limitation_claim() -> None:
     good_cases = [
         case
@@ -1631,6 +1698,150 @@ def test_live_key_claim_diagnostics_are_complete_and_privacy_safe() -> None:
         "candidate_quote",
     ):
         assert forbidden not in serialized
+
+
+def test_known_error_detection_labels_do_not_enter_review_model_input() -> None:
+    case = next(
+        case
+        for case in load_mode_cases("calibrate")
+        if case.case_id == "quality:dev-01:bad"
+    )
+    service = _CapturingLiveService()
+
+    evaluated = evaluate_live_case(case, hy3_service=service)
+
+    review_input = service.review_input.casefold()
+    for forbidden in (
+        "known_error_type",
+        "known_error_severity",
+        "known_error_target_claim_ids",
+        "known_error_detected",
+        "numeric_factual_error",
+    ):
+        assert forbidden not in review_input
+    metrics = evaluated["metrics"]
+    assert metrics["known_error_type"] == "numeric_factual_error"
+    assert metrics["known_error_severity"] == "critical"
+    assert metrics["known_error_detected"] is True
+    serialized_metrics = json.dumps(metrics, ensure_ascii=False).casefold()
+    for forbidden in (
+        "replacement_text",
+        "paper_text",
+        "prompt",
+        "reason",
+        "raw_response",
+        "api_key",
+    ):
+        assert forbidden not in serialized_metrics
+
+
+def test_known_error_detection_uses_deterministic_issue_codes() -> None:
+    case = next(
+        case
+        for case in load_mode_cases("calibrate")
+        if case.case_id == "quality:dev-01:bad"
+    )
+
+    metrics = evaluate_live_case(
+        case,
+        hy3_service=_FakeLiveService(),
+    )["metrics"]
+
+    assert metrics["known_error_target_sentence_id"] == "dev-01-s03"
+    assert metrics["known_error_target_claim_ids"] == ["dev-01-c03"]
+    assert metrics["known_error_detected"] is True
+
+
+@pytest.mark.parametrize(
+    ("signal", "expected"),
+    (
+        ({"relation": "contradicts"}, True),
+        ({"relation": "insufficient"}, True),
+        ({"scope_status": "expanded"}, True),
+        ({"terminology_status": "misused"}, True),
+        ({"severity": "minor"}, True),
+        ({"severity": "major"}, True),
+        ({"severity": "critical"}, True),
+        (
+            {
+                "scope_status": "unclear",
+                "terminology_status": "unclear",
+            },
+            False,
+        ),
+    ),
+)
+def test_known_error_detection_uses_only_fixed_review_signals(
+    signal: dict[str, str],
+    expected: bool,
+) -> None:
+    case = next(
+        case
+        for case in load_mode_cases("calibrate")
+        if case.case_id == "quality:dev-02:medium"
+    )
+
+    metrics = evaluate_live_case(
+        case,
+        hy3_service=_TargetSignalLiveService(
+            target_claim_id="dev-02-c03",
+            signal=signal,
+        ),
+    )["metrics"]
+
+    assert metrics["known_error_detected"] is expected
+
+
+def test_known_error_detection_maps_target_sentence_to_sorted_claim_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import eval.run_eval as run_eval_module
+
+    case = next(
+        case
+        for case in load_mode_cases("calibrate")
+        if case.case_id == "quality:dev-02:medium"
+    )
+    source_blocks, bundle = materialize_live_case(case)
+    target_claim = next(
+        claim for claim in bundle.claims if claim.sentence_id == "dev-02-s03"
+    )
+    additional_claim = target_claim.model_copy(
+        update={"claim_id": "dev-02-c03-extra"}
+    )
+    modified_bundle = bundle.model_copy(
+        update={"claims": [additional_claim, *bundle.claims]}
+    )
+    monkeypatch.setattr(
+        run_eval_module,
+        "materialize_live_case",
+        lambda _case: (source_blocks, modified_bundle),
+    )
+
+    metrics = evaluate_live_case(
+        case,
+        hy3_service=_FakeLiveService(),
+    )["metrics"]
+
+    assert metrics["known_error_target_claim_ids"] == [
+        "dev-02-c03",
+        "dev-02-c03-extra",
+    ]
+
+
+def test_good_quality_has_no_known_error_detection_metrics() -> None:
+    case = next(
+        case
+        for case in load_mode_cases("calibrate")
+        if case.case_id == "quality:dev-01:good"
+    )
+
+    metrics = evaluate_live_case(
+        case,
+        hy3_service=_FakeLiveService(),
+    )["metrics"]
+
+    assert not any(key.startswith("known_error_") for key in metrics)
 
 
 def test_live_citation_metrics_exclude_contradictory_judgment() -> None:
@@ -2000,6 +2211,89 @@ def _report_quality_diagnostics_record(
     return record
 
 
+_KNOWN_ERROR_METRIC_FIELDS = {
+    "known_error_type",
+    "known_error_severity",
+    "known_error_target_sentence_id",
+    "known_error_target_claim_ids",
+    "known_error_detected",
+}
+
+
+def _known_error_detection_record(
+    index: int,
+    *,
+    detected: bool,
+    severity: str = "critical",
+    quality_label: str = "bad",
+) -> dict[str, object]:
+    paper_id = f"known-error-{index:02d}"
+    claim_id = f"{paper_id}-claim"
+    diagnostic = _report_diagnostic_item(claim_id, f"{paper_id}-block")
+    if detected:
+        diagnostic["relation"] = "contradicts"
+        diagnostic["severity"] = severity
+    record = _existing_result()
+    record.update(
+        {
+            "case_id": f"quality:{paper_id}:{quality_label}",
+            "mode": "calibrate",
+            "metrics": {
+                "case_group": "quality",
+                "paper_id": paper_id,
+                "quality_label": quality_label,
+                "overall_score": 50 if detected else 80,
+                "decision": "needs_revision",
+                "hard_failure_count": int(detected),
+                "key_claim_count": 1,
+                "key_claim_citation_accuracy_numerator": int(not detected),
+                "key_claim_citation_accuracy_denominator": 1,
+                "key_claim_citation_completeness_numerator": int(not detected),
+                "key_claim_citation_completeness_denominator": 1,
+                "key_claim_diagnostics": [diagnostic],
+                "known_error_type": "synthetic_factual_error",
+                "known_error_severity": severity,
+                "known_error_target_sentence_id": f"{paper_id}-sentence",
+                "known_error_target_claim_ids": [claim_id],
+                "known_error_detected": detected,
+            },
+        }
+    )
+    return record
+
+
+def _without_known_error_detection_metrics(
+    record: dict[str, object],
+) -> dict[str, object]:
+    legacy = json.loads(json.dumps(record))
+    metrics = legacy["metrics"]
+    assert isinstance(metrics, dict)
+    for field in _KNOWN_ERROR_METRIC_FIELDS:
+        metrics.pop(field)
+    return legacy
+
+
+def _non_succeeded_known_error_record(
+    index: int,
+    *,
+    status: str,
+    error_code: str,
+    quality_label: str = "bad",
+) -> dict[str, object]:
+    record = _existing_result()
+    record.update(
+        {
+            "case_id": f"quality:failed-known-error-{index:02d}:{quality_label}",
+            "mode": "calibrate",
+            "status": status,
+            "error_code": error_code,
+            "provider_calls": 0 if status == "unsupported" else 1,
+            "metrics": {},
+        }
+    )
+    return record
+
+
 @pytest.mark.parametrize(
     ("diagnostics", "key_claim_count", "accuracy_denominator", "completeness_denominator"),
     (
@@ -2078,6 +2372,322 @@ def test_report_claim_diagnostics_zero_claims_allow_empty_diagnostics() -> None:
     summary = summarize_results([record])
 
     assert summary["quality_calibration_diagnostics"]["status"] == "present"
+
+
+def test_known_error_detection_legacy_records_are_not_available() -> None:
+    legacy = _without_known_error_detection_metrics(
+        _known_error_detection_record(1, detected=True)
+    )
+
+    summary = summarize_results([legacy])
+
+    assert summary["known_error_detection"] == {
+        "status": "not_available",
+        "records_with_metrics": 0,
+        "eligible_records": 1,
+        "known_error_numerator": 0,
+        "known_error_denominator": 0,
+        "known_error_detection_rate": None,
+        "severe_error_numerator": 0,
+        "severe_error_denominator": 0,
+        "severe_error_detection_rate": None,
+    }
+
+
+def test_known_error_detection_mixed_records_are_partial() -> None:
+    current = _known_error_detection_record(1, detected=True)
+    legacy = _without_known_error_detection_metrics(
+        _known_error_detection_record(2, detected=False)
+    )
+
+    summary = summarize_results([current, legacy])
+
+    assert summary["known_error_detection"] == {
+        "status": "partial",
+        "records_with_metrics": 1,
+        "eligible_records": 2,
+        "known_error_numerator": 1,
+        "known_error_denominator": 1,
+        "known_error_detection_rate": 1.0,
+        "severe_error_numerator": 1,
+        "severe_error_denominator": 1,
+        "severe_error_detection_rate": 1.0,
+    }
+
+
+def test_known_error_detection_non_succeeded_records_make_gate_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing_freeze_path = (
+        Path(__file__).resolve().parent
+        / f"_stage7_failed_known_error_missing_freeze_{time.time_ns()}.json"
+    )
+    assert not missing_freeze_path.exists()
+    monkeypatch.setattr(
+        build_report_module,
+        "DEFAULT_FREEZE_PATH",
+        missing_freeze_path,
+    )
+    succeeded = [
+        _known_error_detection_record(index, detected=True)
+        for index in range(1, 6)
+    ]
+    non_succeeded = [
+        _non_succeeded_known_error_record(
+            6,
+            status="failed",
+            error_code="HY3_UNAVAILABLE",
+        ),
+        _non_succeeded_known_error_record(
+            7,
+            status="timeout",
+            error_code="TIMEOUT",
+        ),
+        _non_succeeded_known_error_record(
+            8,
+            status="unsupported",
+            error_code="UNSUPPORTED_CASE",
+        ),
+        _non_succeeded_known_error_record(
+            9,
+            status="failed",
+            error_code="RUN_INTERRUPTED",
+        ),
+        _non_succeeded_known_error_record(
+            10,
+            status="failed",
+            error_code="AUDIT_INCOMPLETE",
+        ),
+    ]
+    failed_good = _non_succeeded_known_error_record(
+        11,
+        status="failed",
+        error_code="HY3_UNAVAILABLE",
+        quality_label="good",
+    )
+    failed_attack = _non_succeeded_known_error_record(
+        12,
+        status="failed",
+        error_code="HY3_UNAVAILABLE",
+    )
+    failed_attack.update(
+        {
+            "case_id": "attack:failed-attack:attack",
+            "mode": "final",
+        }
+    )
+
+    summary = summarize_results(
+        [*succeeded, *non_succeeded, failed_good, failed_attack]
+    )
+    detection = summary["known_error_detection"]
+    gate = summary["acceptance_gates"]["gates"]["severe_error_detection"]
+
+    assert {
+        "eligible_records": detection["eligible_records"],
+        "records_with_metrics": detection["records_with_metrics"],
+        "status": detection["status"],
+        "gate_status": gate["status"],
+        "gate_observed": gate["observed"],
+    } == {
+        "eligible_records": 10,
+        "records_with_metrics": 5,
+        "status": "partial",
+        "gate_status": "not_available",
+        "gate_observed": None,
+    }
+
+
+def test_known_error_detection_non_succeeded_records_all_fail_remain_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing_freeze_path = (
+        Path(__file__).resolve().parent
+        / f"_stage7_all_failed_known_error_missing_freeze_{time.time_ns()}.json"
+    )
+    assert not missing_freeze_path.exists()
+    monkeypatch.setattr(
+        build_report_module,
+        "DEFAULT_FREEZE_PATH",
+        missing_freeze_path,
+    )
+    records = [
+        _non_succeeded_known_error_record(
+            1,
+            status="failed",
+            error_code="HY3_UNAVAILABLE",
+            quality_label="medium",
+        ),
+        _non_succeeded_known_error_record(
+            2,
+            status="timeout",
+            error_code="TIMEOUT",
+        ),
+        _non_succeeded_known_error_record(
+            3,
+            status="unsupported",
+            error_code="UNSUPPORTED_CASE",
+        ),
+        _non_succeeded_known_error_record(
+            4,
+            status="failed",
+            error_code="RUN_INTERRUPTED",
+        ),
+    ]
+
+    summary = summarize_results(records)
+    detection = summary["known_error_detection"]
+    gate = summary["acceptance_gates"]["gates"]["severe_error_detection"]
+
+    assert detection["eligible_records"] == 4
+    assert detection["records_with_metrics"] == 0
+    assert detection["known_error_numerator"] == 0
+    assert detection["severe_error_numerator"] == 0
+    assert detection["status"] == "not_available"
+    assert gate["status"] == "not_available"
+    assert gate["observed"] is None
+
+
+@pytest.mark.parametrize(
+    ("malformation", "value"),
+    (
+        ("missing", None),
+        ("type", "yes"),
+        ("contradiction", False),
+    ),
+)
+def test_known_error_detection_malformed_metrics_fail_closed(
+    malformation: str,
+    value: object,
+) -> None:
+    record = _known_error_detection_record(1, detected=True)
+    metrics = record["metrics"]
+    assert isinstance(metrics, dict)
+    if malformation == "missing":
+        metrics.pop("known_error_detected")
+    elif malformation == "type":
+        metrics["known_error_target_claim_ids"] = value
+    else:
+        metrics["known_error_detected"] = value
+
+    with pytest.raises(
+        ValueError,
+        match="invalid known_error_detection metrics",
+    ):
+        summarize_results([record])
+
+
+@pytest.mark.parametrize(
+    ("detected_count", "expected_status"),
+    (
+        (4, "failed"),
+        (5, "passed"),
+    ),
+)
+def test_severe_error_detection_gate_uses_five_record_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+    detected_count: int,
+    expected_status: str,
+) -> None:
+    missing_freeze_path = (
+        Path(__file__).resolve().parent
+        / f"_stage7_known_error_missing_freeze_{time.time_ns()}.json"
+    )
+    assert not missing_freeze_path.exists()
+    monkeypatch.setattr(
+        build_report_module,
+        "DEFAULT_FREEZE_PATH",
+        missing_freeze_path,
+    )
+    records = [
+        _known_error_detection_record(
+            index,
+            detected=index <= detected_count,
+        )
+        for index in range(1, 6)
+    ]
+
+    summary = summarize_results(records)
+    gate = summary["acceptance_gates"]["gates"]["severe_error_detection"]
+
+    assert STAGE7_ACCEPTANCE_TARGETS["severe_error_detection_min"] == 0.90
+    assert gate == {
+        "status": expected_status,
+        "observed": detected_count / 5,
+        "target": 0.90,
+        "denominator": 5,
+        "operator": ">=",
+    }
+
+
+def test_known_error_detection_report_numbers_are_rebuilt_from_jsonl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "known_error_results.jsonl"
+    output_path = tmp_path / "known_error_report.md"
+    missing_freeze_path = tmp_path / "missing_freeze.json"
+    monkeypatch.setattr(
+        build_report_module,
+        "DEFAULT_FREEZE_PATH",
+        missing_freeze_path,
+    )
+    records = [
+        _known_error_detection_record(1, detected=True, severity="major"),
+        _known_error_detection_record(
+            2,
+            detected=False,
+            severity="minor",
+            quality_label="medium",
+        ),
+    ]
+    good = _report_quality_diagnostics_record(
+        diagnostics=[_report_diagnostic_item("good-claim", "good-block")],
+    )
+    good_metrics = good["metrics"]
+    assert isinstance(good_metrics, dict)
+    good_metrics["key_claim_citation_accuracy_numerator"] = 1
+    good_metrics["key_claim_citation_completeness_numerator"] = 1
+    records.append(good)
+    input_path.write_text(
+        "".join(
+            json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+            for record in records
+        ),
+        encoding="utf-8",
+    )
+
+    summary = build_report(input_path=input_path, output_path=output_path)
+
+    assert summary["known_error_detection"] == {
+        "status": "present",
+        "records_with_metrics": 2,
+        "eligible_records": 2,
+        "known_error_numerator": 1,
+        "known_error_denominator": 2,
+        "known_error_detection_rate": 0.5,
+        "severe_error_numerator": 1,
+        "severe_error_denominator": 1,
+        "severe_error_detection_rate": 1.0,
+    }
+    markdown = output_path.read_text(encoding="utf-8")
+    assert "## Known-error detection" in markdown
+    assert "1/2 (0.5)" in markdown
+    assert "1/1 (1.0)" in markdown
+    assert "known_error_detection=present" in markdown
+    known_error_section = markdown.split("## Known-error detection", 1)[1].split(
+        "## Key-claim citation coverage",
+        1,
+    )[0]
+    for forbidden in (
+        "replacement_text",
+        "paper_text",
+        "prompt",
+        "reason",
+        "raw_response",
+        "api_key",
+    ):
+        assert forbidden not in known_error_section.casefold()
 
 
 def test_live_report_includes_manifest_sample_selection_and_license_metadata() -> None:

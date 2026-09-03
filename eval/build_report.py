@@ -126,6 +126,7 @@ def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
         else None
     )
     quality = _summarize_quality(records)
+    known_error_detection = _summarize_known_error_detection(records)
     quality_calibration_diagnostics = _summarize_quality_calibration_diagnostics(
         records
     )
@@ -156,6 +157,7 @@ def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
         "sample_scale": _summarize_sample_scale(records),
         "sample_selection": _load_sample_selection(records),
         "quality": quality,
+        "known_error_detection": known_error_detection,
         "quality_calibration_diagnostics": quality_calibration_diagnostics,
         "citation": citation,
         "attacks": attacks,
@@ -164,6 +166,7 @@ def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
         "freeze": freeze,
         "acceptance_gates": _summarize_acceptance_gates(
             quality=quality,
+            known_error_detection=known_error_detection,
             citation=citation,
             attacks=attacks,
             stability=stability,
@@ -517,6 +520,173 @@ def _summarize_quality_calibration_diagnostics(
     return {"status": status, "rows": rows}
 
 
+_KNOWN_ERROR_METRIC_FIELDS = frozenset(
+    {
+        "known_error_type",
+        "known_error_severity",
+        "known_error_target_sentence_id",
+        "known_error_target_claim_ids",
+        "known_error_detected",
+    }
+)
+_KNOWN_ERROR_SEVERITIES = frozenset({"minor", "major", "critical"})
+
+
+def _invalid_known_error_detection_metrics() -> None:
+    raise ValueError("invalid known_error_detection metrics")
+
+
+def _diagnostic_detects_known_error(item: dict[str, Any]) -> bool:
+    return bool(item["deterministic_issue_codes"]) or (
+        item["relation"] in {"contradicts", "insufficient"}
+        or item["scope_status"] == "expanded"
+        or item["terminology_status"] == "misused"
+        or item["severity"] in {"minor", "major", "critical"}
+    )
+
+
+def _validated_known_error_detection(
+    metrics: dict[str, Any],
+) -> tuple[str, bool] | None:
+    present_fields = _KNOWN_ERROR_METRIC_FIELDS.intersection(metrics)
+    unexpected_fields = {
+        key
+        for key in metrics
+        if isinstance(key, str)
+        and key.startswith("known_error_")
+        and key not in _KNOWN_ERROR_METRIC_FIELDS
+    }
+    if unexpected_fields:
+        _invalid_known_error_detection_metrics()
+    if not present_fields:
+        return None
+    if present_fields != _KNOWN_ERROR_METRIC_FIELDS:
+        _invalid_known_error_detection_metrics()
+
+    known_error_type = metrics["known_error_type"]
+    severity = metrics["known_error_severity"]
+    target_sentence_id = metrics["known_error_target_sentence_id"]
+    target_claim_ids = metrics["known_error_target_claim_ids"]
+    detected = metrics["known_error_detected"]
+    if (
+        not isinstance(known_error_type, str)
+        or not _DIAGNOSTIC_IDENTIFIER.fullmatch(known_error_type)
+        or not isinstance(severity, str)
+        or severity not in _KNOWN_ERROR_SEVERITIES
+        or not isinstance(target_sentence_id, str)
+        or not _DIAGNOSTIC_IDENTIFIER.fullmatch(target_sentence_id)
+        or not isinstance(target_claim_ids, list)
+        or not target_claim_ids
+        or len(target_claim_ids) > 256
+        or any(
+            not isinstance(claim_id, str)
+            or not _DIAGNOSTIC_IDENTIFIER.fullmatch(claim_id)
+            for claim_id in target_claim_ids
+        )
+        or target_claim_ids != sorted(set(target_claim_ids))
+        or not isinstance(detected, bool)
+    ):
+        _invalid_known_error_detection_metrics()
+
+    try:
+        diagnostics = _validated_key_claim_diagnostics(metrics)
+    except ValueError:
+        _invalid_known_error_detection_metrics()
+    if diagnostics is None:
+        _invalid_known_error_detection_metrics()
+    target_claim_id_set = set(target_claim_ids)
+    diagnostic_claim_ids = {item["claim_id"] for item in diagnostics}
+    if not target_claim_id_set <= diagnostic_claim_ids:
+        _invalid_known_error_detection_metrics()
+    detected_from_diagnostics = any(
+        item["claim_id"] in target_claim_id_set
+        and _diagnostic_detects_known_error(item)
+        for item in diagnostics
+    )
+    if detected != detected_from_diagnostics:
+        _invalid_known_error_detection_metrics()
+    return severity, detected
+
+
+def _non_succeeded_quality_label(record: dict[str, Any]) -> str | None:
+    if record.get("status") not in {"failed", "timeout", "unsupported"}:
+        return None
+    if record.get("mode") not in {"calibrate", "final"}:
+        return None
+    case_id = record.get("case_id")
+    if not isinstance(case_id, str):
+        return None
+    parts = case_id.split(":")
+    if len(parts) != 3 or parts[0] != "quality" or not parts[1]:
+        return None
+    return parts[2] if parts[2] in {"good", "medium", "bad"} else None
+
+
+def _summarize_known_error_detection(
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    eligible_records = 0
+    records_with_metrics = 0
+    known_error_numerator = 0
+    severe_error_numerator = 0
+    severe_error_denominator = 0
+    for record in records:
+        metrics = _succeeded_metrics(record)
+        if metrics is None:
+            if _non_succeeded_quality_label(record) in {"medium", "bad"}:
+                eligible_records += 1
+            continue
+        if metrics.get("case_group") != "quality":
+            continue
+        quality_label = _metric_string(metrics, "quality_label")
+        if quality_label == "good":
+            if any(
+                isinstance(key, str) and key.startswith("known_error_")
+                for key in metrics
+            ):
+                _invalid_known_error_detection_metrics()
+            continue
+        if quality_label not in {"medium", "bad"}:
+            _invalid_known_error_detection_metrics()
+        eligible_records += 1
+        validated = _validated_known_error_detection(metrics)
+        if validated is None:
+            continue
+        severity, detected = validated
+        records_with_metrics += 1
+        known_error_numerator += int(detected)
+        if severity in {"major", "critical"}:
+            severe_error_denominator += 1
+            severe_error_numerator += int(detected)
+
+    known_error_denominator = records_with_metrics
+    if not records_with_metrics:
+        status = "not_available"
+    elif records_with_metrics < eligible_records:
+        status = "partial"
+    else:
+        status = "present"
+    return {
+        "status": status,
+        "records_with_metrics": records_with_metrics,
+        "eligible_records": eligible_records,
+        "known_error_numerator": known_error_numerator,
+        "known_error_denominator": known_error_denominator,
+        "known_error_detection_rate": (
+            round(known_error_numerator / known_error_denominator, 4)
+            if known_error_denominator
+            else None
+        ),
+        "severe_error_numerator": severe_error_numerator,
+        "severe_error_denominator": severe_error_denominator,
+        "severe_error_detection_rate": (
+            round(severe_error_numerator / severe_error_denominator, 4)
+            if severe_error_denominator
+            else None
+        ),
+    }
+
+
 def _spearman_rank_correlation(
     expected: list[float],
     observed: list[float],
@@ -817,6 +987,7 @@ def _summarize_revisions(records: list[dict[str, Any]]) -> dict[str, Any]:
 def _summarize_acceptance_gates(
     *,
     quality: dict[str, Any],
+    known_error_detection: dict[str, Any],
     citation: dict[str, Any],
     attacks: dict[str, Any],
     stability: dict[str, Any],
@@ -862,6 +1033,17 @@ def _summarize_acceptance_gates(
             target=targets["quality_pairwise_min"],
             available=quality["pairwise_total"] >= 15,
             denominator=15,
+            operator=">=",
+        ),
+        "severe_error_detection": _acceptance_gate(
+            observed=known_error_detection["severe_error_detection_rate"],
+            target=targets["severe_error_detection_min"],
+            available=(
+                known_error_detection["status"] == "present"
+                and known_error_detection["severe_error_denominator"] >= 5
+                and known_error_detection["severe_error_detection_rate"] is not None
+            ),
+            denominator=known_error_detection["severe_error_denominator"],
             operator=">=",
         ),
         "key_citation_accuracy": _acceptance_gate(
@@ -1248,6 +1430,32 @@ def _render_markdown(
             )
     if diagnostics["status"] != "present":
         lines.append(f"- diagnostics={diagnostics['status']}")
+    known_error_detection = summary["known_error_detection"]
+    lines.extend(
+        [
+            "",
+            "## Known-error detection",
+            "",
+            (
+                "- Records with known-error metrics: "
+                f"{known_error_detection['records_with_metrics']}/"
+                f"{known_error_detection['eligible_records']}"
+            ),
+            (
+                "- Known-error detection: "
+                f"{known_error_detection['known_error_numerator']}/"
+                f"{known_error_detection['known_error_denominator']} "
+                f"({known_error_detection['known_error_detection_rate']})"
+            ),
+            (
+                "- Severe known-error detection: "
+                f"{known_error_detection['severe_error_numerator']}/"
+                f"{known_error_detection['severe_error_denominator']} "
+                f"({known_error_detection['severe_error_detection_rate']})"
+            ),
+            f"- known_error_detection={known_error_detection['status']}",
+        ]
+    )
     citation = summary["citation"]
     lines.extend(
         [

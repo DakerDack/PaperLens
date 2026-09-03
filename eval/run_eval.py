@@ -101,6 +101,7 @@ FREEZE_VERSION = "paperlens-stage7-freeze-v1"
 STAGE7_ACCEPTANCE_TARGETS = {
     "quality_strict_order_min": 4,
     "quality_pairwise_min": 13,
+    "severe_error_detection_min": 0.90,
     "key_citation_accuracy_min": 0.90,
     "key_citation_completeness_min": 0.80,
     "stability_mean_score_sd_max": 5.0,
@@ -838,7 +839,17 @@ def _live_report_metrics(
         }
     )
     if case.payload.get("case_group") == "quality":
-        metrics["quality_label"] = case.payload.get("quality_label")
+        quality_label = _required_string(case.payload, "quality_label")
+        metrics["quality_label"] = quality_label
+        if quality_label != "good":
+            metrics.update(
+                _known_error_detection_metrics(
+                    case=case,
+                    bundle=bundle,
+                    evidence_records=evidence_records,
+                    deep_result=deep_result,
+                )
+            )
     if case.payload.get("case_group") == "stability":
         metrics["stability_output_id"] = case.payload.get("stability_output_id")
     if case.payload.get("case_group") == "attack":
@@ -948,6 +959,63 @@ def _key_claim_diagnostics(
         diagnostics_by_pair.values(),
         key=lambda item: (item["claim_id"], item["block_id"] or ""),
     )
+
+
+def _known_error_detection_metrics(
+    *,
+    case: EvaluationCase,
+    bundle: GeneratedBundle,
+    evidence_records: list[Any],
+    deep_result: DeepAuditResult,
+) -> dict[str, Any]:
+    paper_id = _required_string(case.payload, "paper_id")
+    quality_label = _required_string(case.payload, "quality_label")
+    manifest = _load_live_manifest()
+    paper = next(
+        item for item in manifest["papers"] if item["paper_id"] == paper_id
+    )
+    mutation = paper["quality_mutations"].get(quality_label)
+    if not isinstance(mutation, dict):
+        raise ValueError("known error metadata is unavailable")
+    known_error_type = _required_string(mutation, "known_error_type")
+    known_error_severity = _required_string(mutation, "severity")
+    if known_error_severity not in {"minor", "major", "critical"}:
+        raise ValueError("known error severity is invalid")
+    target_sentence_id = _required_string(mutation, "target_sentence_id")
+    target_claim_ids = sorted(
+        {
+            claim.claim_id
+            for claim in bundle.claims
+            if claim.sentence_id == target_sentence_id
+        }
+    )
+    if not target_claim_ids:
+        raise ValueError("known error target sentence has no claims")
+    target_claim_id_set = set(target_claim_ids)
+    deterministic_detected = any(
+        record.claim_id in target_claim_id_set
+        and bool(_diagnostic_issue_codes(record))
+        for record in evidence_records
+    )
+    semantic_detected = any(
+        judgment.claim_id in target_claim_id_set
+        and (
+            _judgment_field(judgment, "relation")
+            in {"contradicts", "insufficient"}
+            or _judgment_field(judgment, "scope_status") == "expanded"
+            or _judgment_field(judgment, "terminology_status") == "misused"
+            or _judgment_field(judgment, "severity")
+            in {"minor", "major", "critical"}
+        )
+        for judgment in deep_result.semantic_judgments
+    )
+    return {
+        "known_error_type": known_error_type,
+        "known_error_severity": known_error_severity,
+        "known_error_target_sentence_id": target_sentence_id,
+        "known_error_target_claim_ids": target_claim_ids,
+        "known_error_detected": deterministic_detected or semantic_detected,
+    }
 
 
 def _attack_detected(
