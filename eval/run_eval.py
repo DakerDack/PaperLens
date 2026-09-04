@@ -29,6 +29,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from backend.app.audit_service import AuditService, AuditServiceError
 from backend.app.hy3_service import Hy3Service, Hy3ServiceError
+from backend.app import hy3_service as hy3_contract
 from backend.app.models import (
     CORE_DIMENSION_GATES,
     ComplianceContext,
@@ -345,16 +346,24 @@ def load_mode_cases(mode: str) -> list[EvaluationCase]:
     return cases
 
 
-def build_mode_plan(*, mode: str, output_path: Path) -> ModePlan:
+def build_mode_plan(
+    *, mode: str, output_path: Path, diagnostic_plan: dict[str, Any] | None = None,
+) -> ModePlan:
     if mode == "smoke":
         raise ValueError("smoke is a zero-cost reference replay and needs no Live plan")
-    cases = load_mode_cases(mode)
+    if diagnostic_plan is not None and mode != "calibrate":
+        raise ValueError("invalid context diagnostic")
+    cases = (
+        context_diagnostic_cases(diagnostic_plan)
+        if diagnostic_plan is not None else load_mode_cases(mode)
+    )
     planned_keys = {(case.case_id, case.run_index) for case in cases}
     completed_keys = _load_existing_keys(output_path=output_path, mode=mode)
     pending_keys = _load_pending_keys(
         pending_path=pending_path_for(output_path),
         mode=mode,
     )
+    _validate_context_resume(output_path, mode, diagnostic_plan)
     resume_keys = completed_keys | pending_keys
     if not resume_keys <= planned_keys:
         raise ValueError("resume data contains keys outside the frozen mode plan")
@@ -393,6 +402,304 @@ def build_mode_plan(*, mode: str, output_path: Path) -> ModePlan:
             completion_tokens=completion_tokens_upper,
         ),
     )
+
+
+CONTEXT_DIAGNOSTIC_VERSION = "paperlens-context-diagnostic-v1"
+CONTEXT_DIAGNOSTIC_CASE_IDS = (
+    "quality:dev-02:good",
+    "quality:dev-02:medium",
+    "quality:dev-02:bad",
+)
+CONTEXT_DIAGNOSTIC_TARGET = ("dev-02-c04", "dev-02-b01")
+_CONTEXT_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_CONTEXT_CASE = re.compile(r"quality:([A-Za-z0-9][A-Za-z0-9_.-]{0,63}):(good|medium|bad)\Z")
+_CONTEXT_HASH = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _sha256_json(value: Any) -> str:
+    # Canonical object keys, but preserve array order and every string byte.
+    return hashlib.sha256(json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def _invalid_context_diagnostic() -> None:
+    raise ValueError("invalid context diagnostic")
+
+
+def _validate_context_plan(plan: Any) -> None:
+    fields = {
+        "version", "diagnostic_id", "target_claim_id", "target_block_id",
+        "pair_sha256", "configuration_sha256", "versions_sha256",
+        "repetitions", "contexts",
+    }
+    if not isinstance(plan, dict) or set(plan) != fields:
+        _invalid_context_diagnostic()
+    if plan["version"] != CONTEXT_DIAGNOSTIC_VERSION or type(plan["repetitions"]) is not int or plan["repetitions"] != 3:
+        _invalid_context_diagnostic()
+    if (plan["target_claim_id"], plan["target_block_id"]) != CONTEXT_DIAGNOSTIC_TARGET:
+        _invalid_context_diagnostic()
+    for field in ("diagnostic_id", "target_claim_id", "target_block_id"):
+        if not isinstance(plan[field], str) or not _CONTEXT_IDENTIFIER.fullmatch(plan[field]):
+            _invalid_context_diagnostic()
+    for field in ("pair_sha256", "configuration_sha256", "versions_sha256"):
+        if not isinstance(plan[field], str) or not _CONTEXT_HASH.fullmatch(plan[field]):
+            _invalid_context_diagnostic()
+    contexts = plan["contexts"]
+    if not isinstance(contexts, list) or len(contexts) != 3:
+        _invalid_context_diagnostic()
+    papers, requests = set(), set()
+    for context, expected_case_id in zip(contexts, CONTEXT_DIAGNOSTIC_CASE_IDS, strict=True):
+        if not isinstance(context, dict) or set(context) != {"case_id", "request_sha256"}:
+            _invalid_context_diagnostic()
+        case_id, request_hash = context["case_id"], context["request_sha256"]
+        match = _CONTEXT_CASE.fullmatch(case_id) if isinstance(case_id, str) else None
+        if case_id != expected_case_id or match is None or not isinstance(request_hash, str) or not _CONTEXT_HASH.fullmatch(request_hash):
+            _invalid_context_diagnostic()
+        papers.add(match[1])
+        requests.add(request_hash)
+    if len(papers) != 1 or len(requests) != 3:
+        _invalid_context_diagnostic()
+
+
+def context_diagnostic_cases(plan: dict[str, Any]) -> list[EvaluationCase]:
+    _validate_context_plan(plan)
+    cases = []
+    for run_index in range(3):
+        for position in range(3):
+            case_id = plan["contexts"][(position + run_index) % 3]["case_id"]
+            _, paper_id, quality_label = case_id.split(":")
+            cases.append(EvaluationCase(case_id=case_id, run_index=run_index, payload={
+                "case_group": "quality", "paper_id": paper_id,
+                "quality_label": quality_label,
+            }))
+    return cases
+
+
+def _context_configuration_sha256(service: Any) -> str:
+    settings = service.settings
+    return _sha256_json({
+        "code_version": _code_version(), "model": settings.hy3_model,
+        "endpoint": settings.hy3_base_url, "timeout": settings.hy3_timeout_seconds,
+        "max_retries": settings.hy3_max_retries,
+    })
+
+
+def _context_input_hashes(service: Any, document: Any, pairs: list[Any], claim_id: str, block_id: str) -> tuple[str, str]:
+    selected = [(c, e) for c, e in pairs if c.claim_id == claim_id and e.block_id == block_id and e.quote_verified]
+    if len(selected) != 1:
+        _invalid_context_diagnostic()
+    claim, evidence = selected[0]
+    pair_hash = _sha256_json({"claim": claim.model_dump(mode="json"), "evidence": evidence.model_dump(mode="json")})
+    # Use the production serializers. Never persist this transient request body.
+    request = {
+        "model": service.settings.hy3_model,
+        "messages": [
+            {"role": "system", "content": hy3_contract.DEEP_AUDIT_SYSTEM_PROMPT},
+            {"role": "user", "content": hy3_contract.Hy3Service._build_deep_audit_prompt(document, pairs)},
+        ],
+        "response_format": hy3_contract.Hy3Service._deep_audit_response_format(),
+        "stream": False, "temperature": hy3_contract.DEEP_AUDIT_TEMPERATURE,
+        "max_completion_tokens": hy3_contract.DEEP_AUDIT_MAX_COMPLETION_TOKENS,
+        "extra_body": {"thinking": {"type": hy3_contract.DEEP_AUDIT_THINKING}},
+    }
+    return pair_hash, _sha256_json(request)
+
+
+def build_context_diagnostic_plan(
+    *, case_ids: list[str], target_claim_id: str, target_block_id: str,
+    diagnostic_id: str, repetitions: int, hy3_service: Any, versions: VersionInfo,
+) -> dict[str, Any]:
+    if (
+        not isinstance(case_ids, list)
+        or tuple(case_ids) != CONTEXT_DIAGNOSTIC_CASE_IDS
+        or (target_claim_id, target_block_id) != CONTEXT_DIAGNOSTIC_TARGET
+        or type(repetitions) is not int
+        or repetitions != 3
+    ):
+        _invalid_context_diagnostic()
+    available = {case.case_id: case for case in load_mode_cases("calibrate")}
+    if not isinstance(case_ids, list) or len(case_ids) != 3 or any(not isinstance(c, str) or c not in available for c in case_ids) or len(set(case_ids)) != 3:
+        _invalid_context_diagnostic()
+    selected = [available[c] for c in case_ids]
+    if len({c.payload["paper_id"] for c in selected}) != 1 or {c.payload["quality_label"] for c in selected} != {"good", "medium", "bad"}:
+        _invalid_context_diagnostic()
+    if versions.model != hy3_service.settings.hy3_model or versions.prompt_version != DEEP_AUDIT_PROMPT_VERSION or versions.schema_version != DEEP_AUDIT_SCHEMA_VERSION or versions.code_version != _code_version():
+        _invalid_context_diagnostic()
+    contexts, pair_hashes = [], set()
+    for label in ("good", "medium", "bad"):
+        case = next(c for c in selected if c.payload["quality_label"] == label)
+        sources, bundle = materialize_live_case(case)
+        audit = AuditService()
+        records, _ = audit.quick_check(bundle, sources)
+        pair_hash, request_hash = _context_input_hashes(
+            hy3_service, bundle.document, audit.semantic_pairs(bundle, records),
+            target_claim_id, target_block_id,
+        )
+        pair_hashes.add(pair_hash)
+        contexts.append({"case_id": case.case_id, "request_sha256": request_hash})
+    if len(pair_hashes) != 1:
+        _invalid_context_diagnostic()
+    plan = {
+        "version": CONTEXT_DIAGNOSTIC_VERSION, "diagnostic_id": diagnostic_id,
+        "target_claim_id": target_claim_id, "target_block_id": target_block_id,
+        "pair_sha256": pair_hashes.pop(), "contexts": contexts,
+        "repetitions": repetitions, "versions_sha256": _sha256_json(versions.__dict__),
+        "configuration_sha256": _context_configuration_sha256(hy3_service),
+    }
+    _validate_context_plan(plan)
+    return plan
+
+
+def _context_diagnostic_metadata(plan: dict[str, Any], case: EvaluationCase) -> dict[str, Any]:
+    return {
+        "plan": copy.deepcopy(plan), "plan_sha256": _sha256_json(plan),
+        # This is the planned digest, never evidence that dispatch was observed.
+        "request_sha256": next(c["request_sha256"] for c in plan["contexts"] if c["case_id"] == case.case_id),
+        "verified_first_request_sha256": None,
+    }
+
+
+def validate_context_diagnostic_record(record: Mapping[str, Any], *, pending: bool = False) -> dict[str, Any]:
+    expected_fields = (
+        {"case_id", "run_index", "mode", "context_diagnostic"}
+        if pending else set(_REQUIRED_RESULT_FIELDS)
+    )
+    if set(record) != expected_fields:
+        _invalid_context_diagnostic()
+    container = record if pending else record.get("metrics")
+    if not isinstance(container, dict):
+        _invalid_context_diagnostic()
+    metadata = container.get("context_diagnostic")
+    planned_fields = {"plan", "plan_sha256", "request_sha256"}
+    if not isinstance(metadata, dict) or set(metadata) not in (planned_fields, planned_fields | {"verified_first_request_sha256"}):
+        _invalid_context_diagnostic()
+    plan = metadata["plan"]
+    _validate_context_plan(plan)
+    if record.get("mode") != "calibrate" or type(record.get("run_index")) is not int:
+        _invalid_context_diagnostic()
+    cases = context_diagnostic_cases(plan)
+    case = next((c for c in cases if (c.case_id, c.run_index) == (record.get("case_id"), record["run_index"])), None)
+    if case is None:
+        _invalid_context_diagnostic()
+    expected = _context_diagnostic_metadata(plan, case)
+    if any(metadata[field] != expected[field] for field in planned_fields):
+        _invalid_context_diagnostic()
+    verified = metadata.get("verified_first_request_sha256")
+    if verified is not None and (pending or not isinstance(verified, str) or verified != expected["request_sha256"]):
+        _invalid_context_diagnostic()
+    if not pending:
+        _validate_existing_result(record=record, mode="calibrate", line_number=1)
+        if plan["versions_sha256"] != _sha256_json({k: record[k] for k in VersionInfo.__dataclass_fields__}):
+            _invalid_context_diagnostic()
+        calls = record["provider_calls"]
+        if calls is not None and calls > 3:
+            _invalid_context_diagnostic()
+        if verified is not None and calls == 0:
+            _invalid_context_diagnostic()
+        if record["error_code"] == "RUN_INTERRUPTED" and (
+            verified is not None or calls is not None or any(value is not None for value in record["usage"].values())
+        ):
+            _invalid_context_diagnostic()
+        if record["status"] == "succeeded" and (record["error_code"] != "NONE" or calls not in (1, 2, 3)):
+            _invalid_context_diagnostic()
+        if record["status"] != "succeeded" and record["error_code"] == "NONE":
+            _invalid_context_diagnostic()
+    return plan
+
+
+def _validate_context_resume(output_path: Path, mode: str, plan: dict[str, Any] | None) -> None:
+    completed_records = []
+    if plan is not None:
+        _validate_context_plan(plan)
+        if mode != "calibrate":
+            _invalid_context_diagnostic()
+    for path, pending in ((output_path, False), (pending_path_for(output_path), True)):
+        if not path.exists():
+            continue
+        for _, record in _read_jsonl(path):
+            container = record if pending else record.get("metrics", {})
+            if plan is None:
+                if "context_diagnostic" in container:
+                    _invalid_context_diagnostic()
+            elif validate_context_diagnostic_record(record, pending=pending) != plan:
+                _invalid_context_diagnostic()
+            elif not pending:
+                completed_records.append(record)
+    if plan is not None and completed_records:
+        # Share the strict claim/count checks instead of allowing resume and
+        # reporting to disagree. This pure in-memory path reads no freeze or
+        # report files. Import lazily because build_report also imports this module.
+        from eval.build_report import _summarize_context_diagnostic
+
+        _summarize_context_diagnostic(completed_records)
+
+
+class _ContextDiagnosticInputDrift(ValueError):
+    def __init__(self):
+        super().__init__("context diagnostic input drift")
+
+
+class _ContextDiagnosticClient:
+    """Guard the actual create kwargs; retries are forwarded unchanged."""
+
+    def __init__(self, get_client: Callable[[], Any], expected_sha256: str):
+        self._get_client, self._expected_sha256 = get_client, expected_sha256
+        self.chat = self.completions = self
+        self.verified_first_request_sha256: str | None = None
+
+    def create(self, **kwargs):
+        if self.verified_first_request_sha256 is None:
+            try:
+                actual_sha256 = _sha256_json(kwargs)
+            except (TypeError, ValueError):
+                raise _ContextDiagnosticInputDrift() from None
+            if actual_sha256 != self._expected_sha256:
+                raise _ContextDiagnosticInputDrift()
+            # Resolve the existing client only after the local drift check.
+            dispatch = self._get_client().chat.completions.create
+            self.verified_first_request_sha256 = actual_sha256
+        else:
+            dispatch = self._get_client().chat.completions.create
+        return dispatch(**kwargs)
+
+
+class _ContextDiagnosticService:
+    """Precheck the pair, then guard the production client's dispatch boundary."""
+
+    def __init__(self, service: Any, plan: dict[str, Any], case: EvaluationCase):
+        self.service, self.plan, self.case = service, copy.deepcopy(plan), case
+        self._dispatch_client: _ContextDiagnosticClient | None = None
+
+    def diagnostic_metadata(self) -> dict[str, Any]:
+        metadata = _context_diagnostic_metadata(self.plan, self.case)
+        if self._dispatch_client is not None:
+            metadata["verified_first_request_sha256"] = self._dispatch_client.verified_first_request_sha256
+        return metadata
+
+    @property
+    def last_run_observation(self):
+        return self.service.last_run_observation
+
+    def deep_audit(self, *, document, claim_evidence_pairs):
+        pair_hash, request_hash = _context_input_hashes(
+            self.service, document, claim_evidence_pairs,
+            self.plan["target_claim_id"], self.plan["target_block_id"],
+        )
+        metadata = _context_diagnostic_metadata(self.plan, self.case)
+        if pair_hash != self.plan["pair_sha256"] or request_hash != metadata["request_sha256"] or _context_configuration_sha256(self.service) != self.plan["configuration_sha256"]:
+            raise _ContextDiagnosticInputDrift()
+        if isinstance(self.service, hy3_contract.Hy3Service):
+            # Isolate instrumentation from the caller's reusable service. The
+            # original Hy3Service still builds, validates and retries requests;
+            # only its client accessor is decorated on this per-evaluation copy.
+            self.service = copy.copy(self.service)
+            self._dispatch_client = _ContextDiagnosticClient(
+                self.service._get_client, metadata["request_sha256"],
+            )
+            self.service._get_client = lambda: self._dispatch_client
+        return self.service.deep_audit(document=document, claim_evidence_pairs=claim_evidence_pairs)
 
 
 def materialize_live_case(
@@ -466,8 +773,13 @@ def evaluate_live_case(
     case: EvaluationCase,
     *,
     hy3_service: Any | None = None,
+    diagnostic_plan: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     service = hy3_service or Hy3Service()
+    if diagnostic_plan is not None:
+        if case not in context_diagnostic_cases(diagnostic_plan):
+            _invalid_context_diagnostic()
+        service = _ContextDiagnosticService(service, diagnostic_plan, case)
     audit_service = AuditService(hy3_service=service)
     observations: list[Mapping[str, Any]] = []
     source_blocks, bundle = materialize_live_case(case)
@@ -509,6 +821,8 @@ def evaluate_live_case(
                 deep_result=deep_result,
                 report=report,
             )
+            if diagnostic_plan is not None:
+                metrics["context_diagnostic"] = service.diagnostic_metadata()
             return _live_evaluation_result(
                 observations=observations,
                 metrics=metrics,
@@ -595,7 +909,10 @@ def evaluate_live_case(
     except EvaluationCaseError:
         raise
     except (Hy3ServiceError, AuditServiceError) as exc:
-        raise _evaluation_case_error(exc, observations) from None
+        error = _evaluation_case_error(exc, observations)
+        if diagnostic_plan is not None:
+            error.context_diagnostic = service.diagnostic_metadata()
+        raise error from None
 
 
 def _call_and_capture(
@@ -1279,6 +1596,7 @@ def run_cases(
     output_path: Path,
     versions: VersionInfo,
     evaluate: Callable[[EvaluationCase], Mapping[str, Any]],
+    diagnostic_plan: dict[str, Any] | None = None,
 ) -> RunSummary:
     with _evaluation_run_lock(output_path):
         return _run_cases_unlocked(
@@ -1287,6 +1605,7 @@ def run_cases(
             output_path=output_path,
             versions=versions,
             evaluate=evaluate,
+            diagnostic_plan=diagnostic_plan,
         )
 
 
@@ -1297,10 +1616,14 @@ def _run_cases_unlocked(
     output_path: Path,
     versions: VersionInfo,
     evaluate: Callable[[EvaluationCase], Mapping[str, Any]],
+    diagnostic_plan: dict[str, Any] | None = None,
 ) -> RunSummary:
     if mode not in SUPPORTED_MODES:
         raise ValueError(f"unsupported evaluation mode: {mode}")
     materialized_cases = list(cases)
+    if diagnostic_plan is not None:
+        if mode != "calibrate" or materialized_cases != context_diagnostic_cases(diagnostic_plan) or diagnostic_plan["versions_sha256"] != _sha256_json(versions.__dict__):
+            _invalid_context_diagnostic()
     requested_keys = [(case.case_id, case.run_index) for case in materialized_cases]
     if len(requested_keys) != len(set(requested_keys)):
         raise ValueError("duplicate case_id and run_index in evaluation input")
@@ -1310,6 +1633,7 @@ def _run_cases_unlocked(
         pending_path=pending_path_for(output_path),
         mode=mode,
     )
+    _validate_context_resume(output_path, mode, diagnostic_plan)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     skipped = 0
@@ -1317,6 +1641,10 @@ def _run_cases_unlocked(
     recovered_interrupted = 0
     for case in materialized_cases:
         key = (case.case_id, case.run_index)
+        diagnostic_metrics = (
+            {"context_diagnostic": _context_diagnostic_metadata(diagnostic_plan, case)}
+            if diagnostic_plan is not None else {}
+        )
         if key in existing_keys:
             skipped += 1
             continue
@@ -1329,7 +1657,7 @@ def _run_cases_unlocked(
                 error_code="RUN_INTERRUPTED",
                 provider_calls=None,
                 usage=None,
-                metrics={},
+                metrics=diagnostic_metrics,
                 elapsed_ms=None,
             )
             _append_jsonl(output_path, record)
@@ -1345,6 +1673,7 @@ def _run_cases_unlocked(
                 "case_id": case.case_id,
                 "run_index": case.run_index,
                 "mode": mode,
+                **diagnostic_metrics,
             },
         )
         started_at = time.perf_counter()
@@ -1366,6 +1695,14 @@ def _run_cases_unlocked(
             normalized_metrics = {}
             status = exc.status
             error_code = exc.error_code
+            if diagnostic_plan is not None and hasattr(exc, "context_diagnostic"):
+                normalized_metrics["context_diagnostic"] = exc.context_diagnostic
+        except _ContextDiagnosticInputDrift:
+            provider_calls = 0
+            normalized_usage = _normalize_usage(None)
+            normalized_metrics = {}
+            status = "failed"
+            error_code = "EVALUATION_FAILED"
         except Exception:
             provider_calls = None
             normalized_usage = _normalize_usage(None)
@@ -1374,6 +1711,8 @@ def _run_cases_unlocked(
             error_code = "EVALUATION_FAILED"
 
         elapsed_ms = max(0, round((time.perf_counter() - started_at) * 1000))
+        for field, value in diagnostic_metrics.items():
+            normalized_metrics.setdefault(field, value)
         record = _result_record(
             case=case,
             mode=mode,
@@ -1385,6 +1724,8 @@ def _run_cases_unlocked(
             metrics=normalized_metrics,
             elapsed_ms=elapsed_ms,
         )
+        if diagnostic_plan is not None:
+            validate_context_diagnostic_record(record)
         _append_jsonl(output_path, record)
         existing_keys.add(key)
         appended += 1
@@ -2082,7 +2423,24 @@ def main() -> int:
         help="write the immutable stage 7 configuration and do not run cases",
     )
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--diagnostic-id")
+    parser.add_argument("--case-id", action="append")
+    parser.add_argument("--target-claim-id")
+    parser.add_argument("--target-block-id")
+    parser.add_argument("--repeat-count", type=int, choices=(3,))
     args = parser.parse_args()
+    diagnostic_requested = any(value is not None for value in (
+        args.diagnostic_id, args.case_id, args.target_claim_id,
+        args.target_block_id, args.repeat_count,
+    ))
+    if diagnostic_requested and (
+        args.mode != "calibrate" or args.freeze_config or args.output is None
+        or not all((args.diagnostic_id, args.case_id, args.target_claim_id, args.target_block_id))
+        or args.repeat_count != 3
+        or args.output.resolve() in {p.resolve() for p in DEFAULT_RESULT_PATHS.values()}
+        or args.output.suffix != ".jsonl"
+    ):
+        parser.error("invalid context diagnostic")
     output_path = args.output or DEFAULT_RESULT_PATHS[args.mode]
     if args.freeze_config:
         if args.mode == "smoke":
@@ -2129,7 +2487,28 @@ def main() -> int:
             print(f"EVAL_REFUSED={exc}")
             return 2
 
-    plan = build_mode_plan(mode=args.mode, output_path=output_path)
+    diagnostic_plan = None
+    service = None
+    if diagnostic_requested:
+        service = Hy3Service()
+        versions = VersionInfo(
+            model=service.settings.hy3_model, prompt_version=DEEP_AUDIT_PROMPT_VERSION,
+            schema_version=DEEP_AUDIT_SCHEMA_VERSION,
+            data_version=_load_live_manifest()["data_version"], code_version=_code_version(),
+        )
+        try:
+            diagnostic_plan = build_context_diagnostic_plan(
+                case_ids=args.case_id, target_claim_id=args.target_claim_id,
+                target_block_id=args.target_block_id, diagnostic_id=args.diagnostic_id,
+                repetitions=args.repeat_count, hy3_service=service, versions=versions,
+            )
+            plan = build_mode_plan(mode=args.mode, output_path=output_path, diagnostic_plan=diagnostic_plan)
+        except ValueError:
+            print("EVAL_REFUSED=invalid context diagnostic")
+            return 2
+        print(f"DIAGNOSTIC_ONLY=True PLAN_SHA256={_sha256_json(diagnostic_plan)}")
+    else:
+        plan = build_mode_plan(mode=args.mode, output_path=output_path)
     print(
         f"EVAL_PLAN={args.mode} "
         f"SLOTS={plan.total_slots} "
@@ -2143,7 +2522,7 @@ def main() -> int:
     if plan.logical_requests_pending and not args.confirm_cost:
         print("COST_CONFIRMATION_REQUIRED=True")
         return 2
-    service = Hy3Service()
+    service = service or Hy3Service()
     if plan.logical_requests_pending and service.settings.paperlens_model_mode != "live":
         print("EVAL_REFUSED=LIVE_MODE_REQUIRED")
         return 2
@@ -2157,10 +2536,11 @@ def main() -> int:
     )
     summary = run_cases(
         mode=args.mode,
-        cases=load_mode_cases(args.mode),
+        cases=(context_diagnostic_cases(diagnostic_plan) if diagnostic_plan is not None else load_mode_cases(args.mode)),
         output_path=output_path,
         versions=versions,
-        evaluate=lambda case: evaluate_live_case(case, hy3_service=service),
+        evaluate=lambda case: evaluate_live_case(case, hy3_service=service, diagnostic_plan=diagnostic_plan),
+        diagnostic_plan=diagnostic_plan,
     )
     print(
         f"EVAL_MODE={args.mode} "

@@ -50,6 +50,673 @@ VERSIONS = VersionInfo(
 )
 
 
+def _context_diagnostic_setup(**overrides):
+    import eval.run_eval as runner
+
+    service = _FakeLiveService()
+    service.settings = SimpleNamespace(
+        hy3_model="hy3", hy3_base_url="https://offline.invalid/v1",
+        hy3_timeout_seconds=120, hy3_max_retries=2, paperlens_model_mode="mock",
+    )
+    versions = VersionInfo(
+        model="hy3", prompt_version=runner.DEEP_AUDIT_PROMPT_VERSION,
+        schema_version=runner.DEEP_AUDIT_SCHEMA_VERSION,
+        data_version=runner._load_live_manifest()["data_version"],
+        code_version=runner._code_version(),
+    )
+    arguments = dict(
+        case_ids=[f"quality:dev-02:{label}" for label in ("good", "medium", "bad")],
+        target_claim_id="dev-02-c04", target_block_id="dev-02-b01",
+        diagnostic_id="offline-context-test", repetitions=3,
+        hy3_service=service, versions=versions,
+    )
+    arguments.update(overrides)
+    plan = runner.build_context_diagnostic_plan(**arguments)
+    return runner, service, versions, plan
+
+
+def _run_context_diagnostic_fixture(tmp_path):
+    runner, _, versions, plan = _context_diagnostic_setup()
+    service, _ = _context_dispatch_service()
+    path = tmp_path / "context_results.jsonl"
+    cases = runner.context_diagnostic_cases(plan)
+    runner.run_cases(
+        mode="calibrate", cases=cases, output_path=path, versions=versions,
+        diagnostic_plan=plan,
+        evaluate=lambda case: runner.evaluate_live_case(
+            case, hy3_service=service, diagnostic_plan=plan,
+        ),
+    )
+    return runner, service, versions, plan, path
+
+
+def test_context_diagnostic_plan_is_nine_balanced_development_requests():
+    runner, service, versions, plan = _context_diagnostic_setup()
+    cases = runner.context_diagnostic_cases(plan)
+    assert [(c.payload["quality_label"], c.run_index) for c in cases] == [
+        (label, index) for index, labels in enumerate(
+            (("good", "medium", "bad"), ("medium", "bad", "good"), ("bad", "good", "medium"))
+        ) for label in labels
+    ]
+    assert len({(c.case_id, c.run_index) for c in cases}) == 9
+    assert len({c["request_sha256"] for c in plan["contexts"]}) == 3
+    assert len(plan["pair_sha256"]) == 64
+    assert service.calls == []
+    assert runner.SUPPORTED_MODES == ("smoke", "calibrate", "final", "stability")
+    assert len(runner.load_mode_cases("calibrate")) == 15
+
+
+_UNAPPROVED_CONTEXT_PROFILES = [
+    ("dev-01", "dev-01-c04", "dev-01-b01"),
+    ("dev-04", "dev-04-c04", "dev-04-b01"),
+    ("dev-02", "dev-02-c01", "dev-02-b01"),
+    ("dev-02", "dev-02-c04", "dev-02-b99"),
+]
+
+
+@pytest.mark.parametrize("paper_id, claim_id, block_id", _UNAPPROVED_CONTEXT_PROFILES)
+def test_context_diagnostic_fixed_profile_builder_rejects_other_targets(paper_id, claim_id, block_id):
+    runner, service, versions, _ = _context_diagnostic_setup()
+    with pytest.raises(ValueError, match="^invalid context diagnostic$"):
+        runner.build_context_diagnostic_plan(
+            case_ids=[f"quality:{paper_id}:{label}" for label in ("good", "medium", "bad")],
+            target_claim_id=claim_id, target_block_id=block_id,
+            diagnostic_id="isolated-profile-test", repetitions=3,
+            hy3_service=service, versions=versions,
+        )
+    assert service.calls == []
+
+
+def test_context_diagnostic_fixed_profile_retains_approved_order_and_local_id():
+    runner, service, versions, plan = _context_diagnostic_setup()
+    expected = [
+        ("quality:dev-02:good", 0), ("quality:dev-02:medium", 0), ("quality:dev-02:bad", 0),
+        ("quality:dev-02:medium", 1), ("quality:dev-02:bad", 1), ("quality:dev-02:good", 1),
+        ("quality:dev-02:bad", 2), ("quality:dev-02:good", 2), ("quality:dev-02:medium", 2),
+    ]
+    assert [(c.case_id, c.run_index) for c in runner.context_diagnostic_cases(plan)] == expected
+    assert (plan["target_claim_id"], plan["target_block_id"], plan["repetitions"]) == ("dev-02-c04", "dev-02-b01", 3)
+    _, _, _, renamed = _context_diagnostic_setup(diagnostic_id="another-local-identifier")
+    assert renamed["contexts"] == plan["contexts"] and renamed["pair_sha256"] == plan["pair_sha256"]
+    assert renamed["diagnostic_id"] != plan["diagnostic_id"]
+    assert service.calls == []
+
+
+@pytest.mark.parametrize("paper_id, claim_id, block_id", _UNAPPROVED_CONTEXT_PROFILES)
+def test_context_diagnostic_fixed_profile_cli_refuses_without_writes(tmp_path, monkeypatch, capsys, paper_id, claim_id, block_id):
+    runner, service, versions, _ = _context_diagnostic_setup()
+    path = tmp_path / "unapproved.jsonl"
+    monkeypatch.setattr(runner, "Hy3Service", lambda: service)
+    monkeypatch.setattr(sys, "argv", [
+        "run_eval.py", "--mode", "calibrate", "--diagnostic-id", "isolated-profile-test",
+        "--target-claim-id", claim_id, "--target-block-id", block_id,
+        "--repeat-count", "3", "--output", str(path),
+        *[value for label in ("good", "medium", "bad") for value in ("--case-id", f"quality:{paper_id}:{label}")],
+    ])
+    assert runner.main() == 2
+    output = capsys.readouterr()
+    assert output.out == "EVAL_REFUSED=invalid context diagnostic\n" and output.err == ""
+    assert service.calls == []
+    assert not path.exists() and not pending_path_for(path).exists()
+
+
+def _self_consistent_unapproved_context_record(paper_id, claim_id, block_id):
+    """Synthetic metadata only: no historical results or provider judgments."""
+    runner, service, versions, approved = _context_diagnostic_setup()
+    plan = copy.deepcopy(approved)
+    plan.update(target_claim_id=claim_id, target_block_id=block_id)
+    for context in plan["contexts"]:
+        context["case_id"] = context["case_id"].replace("dev-02", paper_id)
+    cases = [EvaluationCase(
+        case_id=case.case_id.replace("dev-02", paper_id), run_index=case.run_index,
+        payload={**case.payload, "paper_id": paper_id},
+    ) for case in runner.context_diagnostic_cases(approved)]
+    record = runner._result_record(
+        case=cases[0], mode="calibrate", versions=versions, status="failed",
+        error_code="HY3_UNAVAILABLE", provider_calls=0, usage=None, elapsed_ms=0,
+        metrics={"context_diagnostic": {
+            "plan": plan, "plan_sha256": runner._sha256_json(plan),
+            "request_sha256": plan["contexts"][0]["request_sha256"],
+            "verified_first_request_sha256": None,
+        }},
+    )
+    return runner, service, versions, plan, cases, record
+
+
+@pytest.mark.parametrize("paper_id, claim_id, block_id", _UNAPPROVED_CONTEXT_PROFILES)
+@pytest.mark.parametrize("resume_kind", ["completed", "pending"])
+def test_context_diagnostic_fixed_profile_resume_rejects_self_consistent_plan(tmp_path, resume_kind, paper_id, claim_id, block_id):
+    runner, service, versions, plan, cases, record = _self_consistent_unapproved_context_record(paper_id, claim_id, block_id)
+    output = tmp_path / "resume.jsonl"
+    if resume_kind == "completed":
+        source = output
+        entry = record
+    else:
+        source = pending_path_for(output)
+        entry = {"case_id": cases[0].case_id, "run_index": 0, "mode": "calibrate", **record["metrics"]}
+    source.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    before = source.read_bytes()
+    calls = []
+
+    def unexpected_evaluate(case):
+        calls.append(case.case_id)
+        raise EvaluationCaseError(status="failed", error_code="HY3_UNAVAILABLE", provider_calls=0)
+
+    with pytest.raises(ValueError, match="^invalid context diagnostic$"):
+        runner.run_cases(mode="calibrate", cases=cases, output_path=output, versions=versions,
+                         diagnostic_plan=plan, evaluate=unexpected_evaluate)
+    assert calls == [] and service.calls == []
+    assert source.read_bytes() == before
+    if resume_kind == "pending":
+        assert not output.exists()
+
+
+@pytest.mark.parametrize("paper_id, claim_id, block_id", _UNAPPROVED_CONTEXT_PROFILES)
+def test_context_diagnostic_fixed_profile_report_rejects_self_consistent_plan(tmp_path, paper_id, claim_id, block_id):
+    runner, service, versions, plan, cases, record = _self_consistent_unapproved_context_record(paper_id, claim_id, block_id)
+    source, output = tmp_path / "records.jsonl", tmp_path / "report.md"
+    source.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    before = source.read_bytes()
+    with pytest.raises(ValueError, match="^invalid context diagnostic$"):
+        build_report(input_path=source, output_path=output)
+    assert not output.exists() and source.read_bytes() == before
+    assert service.calls == []
+
+
+@pytest.mark.parametrize("changes", [
+    {"case_ids": ["quality:holdout-01:good", "quality:holdout-01:medium", "quality:holdout-01:bad"]},
+    {"case_ids": ["quality:dev-02:good"] * 3},
+    {"case_ids": ["quality:dev-02:good", "quality:dev-01:medium", "quality:dev-02:bad"]},
+    {"repetitions": 4}, {"repetitions": True},
+    {"target_claim_id": "missing-target"}, {"diagnostic_id": "unsafe|identifier"},
+])
+def test_context_diagnostic_invalid_selection_fails_closed(changes):
+    with pytest.raises(ValueError, match="invalid context diagnostic"):
+        _context_diagnostic_setup(**changes)
+
+
+def test_context_diagnostic_changed_target_pair_is_rejected(monkeypatch):
+    import eval.run_eval as runner
+
+    original = runner.materialize_live_case
+
+    def changed(case):
+        sources, bundle = original(case)
+        if case.payload["quality_label"] == "medium":
+            bundle.claims[-1].qualifiers.append("synthetic changed boundary")
+        return sources, bundle
+
+    monkeypatch.setattr(runner, "materialize_live_case", changed)
+    with pytest.raises(ValueError, match="invalid context diagnostic"):
+        _context_diagnostic_setup()
+
+
+def test_context_diagnostic_fingerprint_matches_actual_provider_request(monkeypatch):
+    from backend.app.hy3_service import Hy3Service
+    from backend.app.settings import Settings
+
+    runner, reference, versions, plan = _context_diagnostic_setup()
+    captured = []
+    service = Hy3Service(settings=Settings(_env_file=None, paperlens_model_mode="mock"))
+
+    class Captured(Exception):
+        pass
+
+    def capture(**kwargs):
+        captured.append(runner._sha256_json(kwargs))
+        encoded = json.dumps(kwargs, ensure_ascii=False)
+        for forbidden in ('"quality_label"', '"known_error_type"', '"case_id"', '"paper_id"', '"diagnostic_id"'):
+            assert forbidden not in encoded
+        raise Captured
+
+    monkeypatch.setattr(service, "_get_client", lambda: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=capture))
+    ))
+    for context, case in zip(plan["contexts"], runner.context_diagnostic_cases(plan)[:3]):
+        sources, bundle = runner.materialize_live_case(case)
+        audit = AuditService()
+        records, _ = audit.quick_check(bundle, sources)
+        pairs = audit.semantic_pairs(bundle, records)
+        prompt = Hy3Service._build_deep_audit_prompt(bundle.document, pairs)
+        with pytest.raises(Captured):
+            service._deep_audit_live(prompt, {(c.claim_id, e.block_id) for c, e in pairs})
+        assert captured[-1] == context["request_sha256"]
+    assert len(captured) == 3
+    assert reference.calls == []
+
+
+def test_context_diagnostic_request_drift_stops_before_provider(monkeypatch):
+    from backend.app.hy3_service import Hy3Service
+
+    runner, service, versions, plan = _context_diagnostic_setup()
+    monkeypatch.setattr(Hy3Service, "_build_deep_audit_prompt", staticmethod(lambda *_: "changed synthetic input"))
+    with pytest.raises(ValueError, match="context diagnostic input drift"):
+        runner.evaluate_live_case(
+            runner.context_diagnostic_cases(plan)[0], hy3_service=service,
+            diagnostic_plan=plan,
+        )
+    assert service.calls == []
+
+
+def _context_dispatch_service():
+    """Exercise the production chain with an injected, network-free client."""
+    from backend.app.hy3_service import Hy3Service
+    from backend.app.settings import Settings
+    import eval.run_eval as runner
+
+    class LocalClient:
+        def __init__(self):
+            self.chat = self.completions = self
+            self.hashes = []
+            self.invalid_first_response = False
+
+        def create(self, **kwargs):
+            self.hashes.append(runner._sha256_json(kwargs))
+            encoded = json.dumps(kwargs, ensure_ascii=False)
+            assert not any(label in encoded for label in (
+                '"quality_label"', '"known_error_type"', '"case_id"',
+                '"paper_id"', '"diagnostic_id"',
+            )), "evaluation_labels_reached_dispatch"
+            content = "{}" if self.invalid_first_response and len(self.hashes) == 1 else self.response
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason="stop")],
+                usage=SimpleNamespace(prompt_tokens=100, completion_tokens=40, total_tokens=140),
+            )
+
+    client = LocalClient()
+
+    class InjectedService(Hy3Service):
+        def deep_audit(self, *, document, claim_evidence_pairs):
+            # Only the local response fixture is synthetic; serialization,
+            # dispatch, Schema validation and retries use Hy3Service itself.
+            client.response = _FakeLiveService().deep_audit(
+                document=document, claim_evidence_pairs=claim_evidence_pairs,
+            ).model_dump_json()
+            return super().deep_audit(document=document, claim_evidence_pairs=claim_evidence_pairs)
+
+    service = InjectedService(settings=Settings(
+        _env_file=None, paperlens_model_mode="live", hy3_api_key="offline-placeholder",
+        hy3_model="hy3", hy3_base_url="https://offline.invalid/v1",
+        hy3_timeout_seconds=120, hy3_max_retries=2,
+    ), client=client)
+    service.calls = client.hashes
+    return service, client
+
+
+@pytest.mark.parametrize("changed", ["messages", "message_whitespace", "schema", "schema_array_order", "model_parameters"])
+def test_context_diagnostic_dispatch_boundary_rejects_second_build_drift(monkeypatch, changed):
+    from backend.app.hy3_service import Hy3Service
+
+    runner, _, versions, plan = _context_diagnostic_setup()
+    service, client = _context_dispatch_service()
+    builds = 0
+    method = "_deep_audit_response_format" if changed.startswith("schema") else "_build_deep_audit_prompt"
+    original = getattr(Hy3Service, method)
+
+    def changing_build(*args):
+        nonlocal builds
+        builds += 1
+        value = original(*args)
+        if builds == 2:
+            if changed == "messages":
+                return value + "\nsynthetic dispatch-only change"
+            if changed == "message_whitespace":
+                return value + " "
+            if changed == "schema":
+                value["json_schema"]["name"] = "synthetic_changed_schema"
+            elif changed == "schema_array_order":
+                value["json_schema"]["schema"]["required"].reverse()
+            else:
+                monkeypatch.setattr(runner.hy3_contract, "DEEP_AUDIT_TEMPERATURE", 0.5)
+        return value
+
+    monkeypatch.setattr(Hy3Service, method, staticmethod(changing_build))
+    error = None
+    try:
+        runner.evaluate_live_case(runner.context_diagnostic_cases(plan)[0],
+                                  hy3_service=service, diagnostic_plan=plan)
+    except ValueError as exc:
+        error = str(exc)
+    assert builds == 2
+    assert len(client.hashes) == 0, "changed_first_request_reached_client"
+    assert error == "context diagnostic input drift"
+
+
+def test_context_diagnostic_dispatch_boundary_records_captured_hash(tmp_path):
+    runner, _, versions, plan = _context_diagnostic_setup()
+    service, client = _context_dispatch_service()
+    path = tmp_path / "verified.jsonl"
+    cases = runner.context_diagnostic_cases(plan)
+
+    def evaluate(case):
+        result = runner.evaluate_live_case(case, hy3_service=service, diagnostic_plan=plan)
+        assert result["metrics"]["context_diagnostic"]["verified_first_request_sha256"] == client.hashes[-1]
+        return result
+
+    runner.run_cases(mode="calibrate", cases=cases, output_path=path, versions=versions,
+                     evaluate=evaluate, diagnostic_plan=plan)
+    records = _read_jsonl(path)
+    assert all(record["status"] == "succeeded" for record in records)
+    assert len(client.hashes) == 9
+    assert service._get_client() is client
+    assert "_get_client" not in vars(service)
+    for record, captured in zip(records, client.hashes):
+        metadata = record["metrics"]["context_diagnostic"]
+        assert metadata["verified_first_request_sha256"] == metadata["request_sha256"] == captured
+        assert set(metadata) == {"plan", "plan_sha256", "request_sha256", "verified_first_request_sha256"}
+    assert summarize_results(records)["context_diagnostic"]["primary_records"] == 9
+
+
+def test_context_diagnostic_dispatch_boundary_unverified_and_pending_are_not_observed(tmp_path):
+    runner, service, versions, plan, path = _run_context_diagnostic_fixture(tmp_path)
+    records = _read_jsonl(path)
+    for record in records:
+        record["metrics"]["context_diagnostic"].pop("verified_first_request_sha256", None)
+    summary = summarize_results(records)
+    assert summary["context_diagnostic"]["primary_records"] == 0
+    assert summary["context_diagnostic"]["status"] == "not_available"
+    assert all(row["verified_first_request_sha256"] is None for row in summary["context_diagnostic"]["rows"])
+
+    interrupted = tmp_path / "pending.jsonl"
+    pending_path_for(interrupted).write_bytes(pending_path_for(path).read_bytes())
+    runner.run_cases(mode="calibrate", cases=runner.context_diagnostic_cases(plan),
+                     output_path=interrupted, versions=versions, diagnostic_plan=plan,
+                     evaluate=lambda _: pytest.fail("pending_reached_provider"))
+    recovered = _read_jsonl(interrupted)
+    assert all(r["error_code"] == "RUN_INTERRUPTED" and r["provider_calls"] is None for r in recovered)
+    assert all(r["metrics"]["context_diagnostic"].get("verified_first_request_sha256") is None for r in recovered)
+    summary = summarize_results(recovered)
+    assert summary["context_diagnostic"]["primary_records"] == 0
+    assert summary["provider_calls_unknown_records"] == 9
+    assert summary["estimated_cost_cny"] is None
+    report = _render_markdown(summary=summary, records=recovered)
+    assert "planned first-request SHA256" in report
+    assert "verified first-request SHA256" in report
+
+
+def test_context_diagnostic_dispatch_boundary_schema_retry_remains_secondary():
+    runner, _, versions, plan = _context_diagnostic_setup()
+    service, client = _context_dispatch_service()
+    client.invalid_first_response = True
+    result = runner.evaluate_live_case(runner.context_diagnostic_cases(plan)[0],
+                                      hy3_service=service, diagnostic_plan=plan)
+    assert result["provider_calls"] == 2
+    assert len(client.hashes) == 2 and client.hashes[0] != client.hashes[1]
+    assert result["metrics"]["context_diagnostic"]["verified_first_request_sha256"] == client.hashes[0]
+    record = runner._result_record(case=runner.context_diagnostic_cases(plan)[0], mode="calibrate",
+        versions=versions, status="succeeded", error_code="NONE", elapsed_ms=1, **result)
+    summary = summarize_results([record])["context_diagnostic"]
+    assert summary["primary_records"] == 0 and summary["retry_success_records"] == 1
+
+
+@pytest.mark.parametrize("damage", ["wrong_hash", "wrong_type", "pending_observed", "interrupted_observed"])
+def test_context_diagnostic_dispatch_boundary_rejects_false_verification(tmp_path, damage):
+    runner, service, versions, plan, path = _run_context_diagnostic_fixture(tmp_path)
+    records = _read_jsonl(path)
+    first = records[0]
+    metadata = first["metrics"]["context_diagnostic"]
+    if damage == "wrong_hash":
+        metadata["verified_first_request_sha256"] = "0" * 64
+    elif damage == "wrong_type":
+        metadata["verified_first_request_sha256"] = True
+    elif damage == "interrupted_observed":
+        first.update(status="failed", error_code="RUN_INTERRUPTED", provider_calls=None)
+        first["usage"] = {key: None for key in first["usage"]}
+        first["metrics"] = {"context_diagnostic": metadata}
+    else:
+        entries = _read_jsonl(pending_path_for(path))
+        entries[0]["context_diagnostic"]["verified_first_request_sha256"] = metadata["request_sha256"]
+        pending_path_for(path).write_text("".join(json.dumps(r) + "\n" for r in entries), encoding="utf-8")
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="invalid context diagnostic"):
+        runner.run_cases(mode="calibrate", cases=runner.context_diagnostic_cases(plan),
+                         output_path=path, versions=versions, diagnostic_plan=plan,
+                         evaluate=lambda _: pytest.fail("false_verification_reached_provider"))
+    assert path.read_bytes() == before and len(service.calls) == 9
+    if damage != "pending_observed":
+        report = tmp_path / "invalid.md"
+        with pytest.raises(ValueError, match="invalid context diagnostic"):
+            build_report(input_path=path, output_path=report)
+        assert not report.exists()
+
+
+def test_context_diagnostic_resume_and_cost_do_not_repeat_calls(tmp_path):
+    runner, service, versions, plan, path = _run_context_diagnostic_fixture(tmp_path)
+    before = path.read_bytes()
+    summary = runner.run_cases(
+        mode="calibrate", cases=runner.context_diagnostic_cases(plan),
+        output_path=path, versions=versions, diagnostic_plan=plan,
+        evaluate=lambda _: pytest.fail("completed_slot_was_called"),
+    )
+    assert len(service.calls) == 9
+    assert summary.skipped == 9 and summary.appended == 0
+    assert path.read_bytes() == before
+    budget = runner.build_mode_plan(mode="calibrate", output_path=path, diagnostic_plan=plan)
+    assert budget.pending_slots == budget.logical_requests_pending == 0
+    fresh = runner.build_mode_plan(mode="calibrate", output_path=tmp_path / "fresh.jsonl", diagnostic_plan=plan)
+    assert (fresh.total_slots, fresh.logical_requests_pending, fresh.provider_attempts_upper) == (9, 9, 27)
+    assert fresh.cost_cny_no_retry == pytest.approx(0.219456)
+    assert fresh.cost_cny_upper == pytest.approx(0.658368)
+
+
+def test_context_diagnostic_pending_and_failures_keep_metadata(tmp_path):
+    runner, service, versions, plan = _context_diagnostic_setup()
+    cases = runner.context_diagnostic_cases(plan)
+    path = tmp_path / "interrupted.jsonl"
+    metadata = runner._context_diagnostic_metadata(plan, cases[0])
+    pending_path_for(path).write_text(json.dumps({
+        "case_id": cases[0].case_id, "run_index": 0, "mode": "calibrate",
+        "context_diagnostic": metadata,
+    }) + "\n", encoding="utf-8")
+    calls = []
+
+    def evaluate(case):
+        calls.append(case.case_id)
+        if len(calls) == 1:
+            raise EvaluationTimeoutError(provider_calls=1)
+        if len(calls) == 2:
+            raise UnsupportedCaseError()
+        raise EvaluationCaseError(status="failed", error_code="HY3_UNAVAILABLE", provider_calls=1)
+
+    runner.run_cases(mode="calibrate", cases=cases, output_path=path, versions=versions,
+                     evaluate=evaluate, diagnostic_plan=plan)
+    records = _read_jsonl(path)
+    assert len(calls) == 8 and len(records) == 9
+    assert records[0]["error_code"] == "RUN_INTERRUPTED"
+    assert records[0]["provider_calls"] is None
+    assert {r["error_code"] for r in records} == {"RUN_INTERRUPTED", "TIMEOUT", "UNSUPPORTED_CASE", "HY3_UNAVAILABLE"}
+    assert all("context_diagnostic" in r["metrics"] for r in records)
+    summary = summarize_results(records)["context_diagnostic"]
+    assert summary["planned_slots"] == 9 and summary["primary_records"] == 0
+    assert summary["status"] == "not_available"
+
+
+@pytest.mark.parametrize("damage", ["missing", "request", "plan", "extra", "version", "duplicate", "pending", "pending_extra", "record_extra", "missing_judgment"])
+def test_context_diagnostic_bad_resume_is_rejected_before_calls(tmp_path, damage):
+    runner, service, versions, plan, path = _run_context_diagnostic_fixture(tmp_path)
+    records = _read_jsonl(path)
+    meta = records[0]["metrics"]["context_diagnostic"]
+    if damage == "missing":
+        del records[0]["metrics"]["context_diagnostic"]
+    elif damage == "request":
+        meta["request_sha256"] = "0" * 64
+    elif damage == "plan":
+        meta["plan_sha256"] = "0" * 64
+    elif damage == "extra":
+        meta["sensitive_text"] = "must not be echoed"
+    elif damage == "version":
+        records[0]["code_version"] = "different-code"
+    elif damage == "duplicate":
+        records.append(records[0])
+    elif damage == "record_extra":
+        records[0]["sensitive_text"] = "must not be echoed"
+    elif damage == "missing_judgment":
+        records[0]["metrics"].pop("key_claim_diagnostics")
+    else:
+        pending = pending_path_for(path)
+        entries = _read_jsonl(pending)
+        if damage == "pending_extra":
+            entries[0]["sensitive_text"] = "must not be echoed"
+        else:
+            del entries[0]["context_diagnostic"]
+        pending.write_text("".join(json.dumps(r) + "\n" for r in entries), encoding="utf-8")
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    before = path.read_bytes()
+    with pytest.raises(ValueError):
+        runner.run_cases(mode="calibrate", cases=runner.context_diagnostic_cases(plan),
+                         output_path=path, versions=versions, diagnostic_plan=plan,
+                         evaluate=lambda _: pytest.fail("invalid_resume_called_provider"))
+    assert path.read_bytes() == before
+    assert len(service.calls) == 9
+
+
+def test_context_diagnostic_report_separates_within_and_between_without_gates(tmp_path, monkeypatch):
+    runner, service, versions, plan, path = _run_context_diagnostic_fixture(tmp_path)
+    records = _read_jsonl(path)
+    changed = next(r for r in records if r["case_id"].endswith(":medium") and r["run_index"] == 1)
+    item = next(d for d in changed["metrics"]["key_claim_diagnostics"] if d["claim_id"] == "dev-02-c04")
+    item.update(scope_status="expanded", severity="minor")
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    monkeypatch.setattr(build_report_module, "_load_freeze_state", lambda _: pytest.fail("diagnostic_read_formal_freeze"))
+    report_path = tmp_path / "context_report.md"
+    summary = build_report(input_path=path, output_path=report_path)
+    diagnosis = summary["context_diagnostic"]
+    assert diagnosis["status"] == "present" and diagnosis["primary_records"] == 9
+    assert [(r["disagreements"], r["comparisons"]) for r in diagnosis["within"]] == [(0, 3), (2, 3), (0, 3)]
+    assert [(r["disagreements"], r["comparisons"]) for r in diagnosis["between"]] == [(3, 9), (0, 9), (3, 9)]
+    assert summary["acceptance_gates"] == {"status": "not_available", "target_source": "diagnostic_only", "targets": {}, "gates": {}}
+    content = report_path.read_text(encoding="utf-8")
+    assert "not a formal stability" in content
+    assert "Within-context" in content and "Between-context" in content
+    assert "causal" in content
+    assert "reason" not in content.casefold()
+    rebuilt = _render_markdown(summary=summarize_results(list(reversed(records))), records=list(reversed(records)))
+    assert rebuilt == content
+
+
+def test_context_diagnostic_report_keeps_retries_and_missing_slots_visible(tmp_path):
+    runner, service, versions, plan, path = _run_context_diagnostic_fixture(tmp_path)
+    records = _read_jsonl(path)[:-1]
+    records[0]["provider_calls"] = 2
+    records[1].update(status="timeout", error_code="TIMEOUT")
+    records[1]["metrics"] = {"context_diagnostic": records[1]["metrics"]["context_diagnostic"]}
+    summary = summarize_results(records)["context_diagnostic"]
+    assert summary["status"] == "partial"
+    assert (summary["planned_slots"], summary["recorded_slots"], summary["primary_records"]) == (9, 8, 6)
+    assert summary["retry_success_records"] == 1
+    assert summary["missing_slots"] == 1
+
+
+def test_context_diagnostic_missing_slot_does_not_imply_known_total_cost(tmp_path):
+    runner, service, versions, plan, path = _run_context_diagnostic_fixture(tmp_path)
+    summary = summarize_results(_read_jsonl(path)[:-1])
+    assert summary["estimated_cost_cny"] is None
+
+
+def _context_diagnostic_concurrent_worker(path, marker, versions, plan, start):
+    import eval.run_eval as runner
+
+    start.wait(timeout=10)
+
+    def evaluate(case):
+        with Path(marker).open("a", encoding="utf-8") as handle:
+            handle.write(f"{case.case_id}:{case.run_index}\n")
+        time.sleep(0.02)
+        raise EvaluationCaseError(status="failed", error_code="HY3_UNAVAILABLE", provider_calls=1)
+
+    runner.run_cases(mode="calibrate", cases=runner.context_diagnostic_cases(plan),
+                     output_path=Path(path), versions=versions, diagnostic_plan=plan,
+                     evaluate=evaluate)
+
+
+def test_context_diagnostic_concurrent_resume_calls_each_slot_once(tmp_path):
+    runner, service, versions, plan = _context_diagnostic_setup()
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    path, marker = tmp_path / "parallel.jsonl", tmp_path / "calls.txt"
+    processes = [context.Process(target=_context_diagnostic_concurrent_worker,
+        args=(str(path), str(marker), versions, plan, start)) for _ in range(2)]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(timeout=20)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        assert process.exitcode == 0
+    calls = marker.read_text(encoding="utf-8").splitlines()
+    records = _read_jsonl(path)
+    assert len(calls) == len(set(calls)) == len(records) == 9
+    assert len({(r["case_id"], r["run_index"]) for r in records}) == 9
+
+
+def test_context_diagnostic_ordinary_report_still_rejects_repeated_quality_labels(tmp_path):
+    runner, service, versions, plan, path = _run_context_diagnostic_fixture(tmp_path)
+    records = _read_jsonl(path)
+    for record in records:
+        record["metrics"].pop("context_diagnostic")
+    with pytest.raises(ValueError, match="duplicate quality label"):
+        summarize_results(records)
+
+
+@pytest.mark.parametrize("extra", [
+    ["--mode", "final"], ["--mode", "stability"], ["--mode", "smoke"],
+    ["--freeze-config"], ["--repeat-count", "4"],
+])
+def test_context_diagnostic_cli_rejects_other_modes_or_refreezing(tmp_path, monkeypatch, extra):
+    import eval.run_eval as runner
+
+    monkeypatch.setattr(runner, "freeze_configuration", lambda: pytest.fail("refreeze_attempted"))
+    monkeypatch.setattr(runner, "Hy3Service", lambda: pytest.fail("invalid_cli_reached_service"))
+    monkeypatch.setattr(sys, "argv", ["run_eval.py", "--mode", "calibrate", "--diagnostic-id", "offline",
+        "--case-id", "quality:dev-02:good", "--case-id", "quality:dev-02:medium", "--case-id", "quality:dev-02:bad",
+        "--target-claim-id", "dev-02-c04", "--target-block-id", "dev-02-b01",
+        "--repeat-count", "3", "--output", str(tmp_path / "invalid.jsonl"), *extra])
+    with pytest.raises(SystemExit) as exc:
+        runner.main()
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("damage", ["mixed", "request", "target", "extra", "missing_judgment"])
+def test_context_diagnostic_report_malformed_input_never_writes(tmp_path, damage):
+    runner, service, versions, plan, path = _run_context_diagnostic_fixture(tmp_path)
+    records = _read_jsonl(path)
+    if damage == "mixed":
+        records[0]["metrics"].pop("context_diagnostic")
+    elif damage == "request":
+        records[0]["metrics"]["context_diagnostic"]["request_sha256"] = "0" * 64
+    elif damage == "target":
+        records[0]["metrics"]["context_diagnostic"]["plan"]["target_claim_id"] = "different"
+    elif damage == "extra":
+        records[0]["metrics"]["context_diagnostic"]["raw_response"] = "sensitive sentinel"
+    else:
+        records[0]["metrics"].pop("key_claim_diagnostics")
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    output = tmp_path / "must_not_exist.md"
+    with pytest.raises(ValueError):
+        build_report(input_path=path, output_path=output)
+    assert not output.exists()
+
+
+def test_context_diagnostic_cli_requires_cost_and_never_runs_without_it(tmp_path, monkeypatch, capsys):
+    runner, service, versions, plan = _context_diagnostic_setup()
+    path = tmp_path / "context_results.jsonl"
+    monkeypatch.setattr(runner, "Hy3Service", lambda: service)
+    # Keep the serializer class intact; the CLI only injects the configured service.
+    monkeypatch.setattr(sys, "argv", ["run_eval.py", "--mode", "calibrate",
+        "--diagnostic-id", "offline-context-test", "--target-claim-id", "dev-02-c04",
+        "--target-block-id", "dev-02-b01", "--repeat-count", "3", "--output", str(path),
+        *[value for c in plan["contexts"] for value in ("--case-id", c["case_id"])]])
+    assert runner.main() == 2
+    output = capsys.readouterr().out
+    assert "SLOTS=9" in output and "PROVIDER_ATTEMPTS_UPPER=27" in output
+    assert "COST_CONFIRMATION_REQUIRED=True" in output
+    assert service.calls == [] and not path.exists()
+    assert not pending_path_for(path).exists()
+
+
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 

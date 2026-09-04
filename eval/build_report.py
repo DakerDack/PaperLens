@@ -16,6 +16,9 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from eval.run_eval import (
+    DIMENSION_WEIGHTS,
+    context_diagnostic_cases,
+    validate_context_diagnostic_record,
     DEFAULT_FREEZE_PATH,
     FREEZE_VERSION,
     RESULT_VERSION,
@@ -81,6 +84,8 @@ def load_results(input_path: Path) -> list[dict[str, Any]]:
 
 
 def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
+    if any(isinstance(record.get("metrics"), dict) and "context_diagnostic" in record["metrics"] for record in records):
+        return _summarize_context_diagnostic(records)
     status_counts = dict(sorted(Counter(record["status"] for record in records).items()))
     mode_counts = dict(sorted(Counter(record["mode"] for record in records).items()))
     known_calls = [
@@ -173,6 +178,117 @@ def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
             revisions=revisions,
             freeze=freeze,
         ),
+    }
+
+
+def _summarize_context_diagnostic(records: list[dict[str, Any]]) -> dict[str, Any]:
+    plan = validate_context_diagnostic_record(records[0])
+    cases = context_diagnostic_cases(plan)
+    by_key, primary, rows = {}, {c["case_id"]: [] for c in plan["contexts"]}, []
+    retry_successes = unverified_successes = 0
+    for record in records:
+        if validate_context_diagnostic_record(record) != plan:
+            raise ValueError("invalid context diagnostic")
+        key = (record["case_id"], record["run_index"])
+        if key in by_key:
+            raise ValueError("invalid context diagnostic")
+        by_key[key] = record
+    # Reuse existing successful known-error validation, without computing gates.
+    _summarize_known_error_detection(records)
+    for case in cases:
+        record = by_key.get((case.case_id, case.run_index))
+        if record is None:
+            continue
+        metrics = record["metrics"]
+        state, score, conclusion_level = None, None, None
+        verified = metrics["context_diagnostic"].get("verified_first_request_sha256")
+        is_primary = record["status"] == "succeeded" and record["provider_calls"] == 1 and verified is not None
+        if record["status"] == "succeeded":
+            if metrics.get("case_group") != "quality" or metrics.get("paper_id") != case.payload["paper_id"] or metrics.get("quality_label") != case.payload["quality_label"]:
+                raise ValueError("invalid context diagnostic")
+            diagnostics = _validated_key_claim_diagnostics(metrics)
+            selected = [d for d in diagnostics or [] if d["claim_id"] == plan["target_claim_id"] and d["block_id"] == plan["target_block_id"]]
+            if len(selected) != 1:
+                raise ValueError("invalid context diagnostic")
+            item = selected[0]
+            fields = ("relation", "scope_status", "terminology_status", "severity")
+            if any(item[field] is None for field in fields):
+                raise ValueError("invalid context diagnostic")
+            state = "/".join([item[field] for field in fields] + [",".join(item["deterministic_issue_codes"]) or "NONE"])
+            score = metrics.get("overall_score")
+            points = metrics.get("dimension_points")
+            if type(score) not in (float, int) or not math.isfinite(score) or not 0 <= score <= 100:
+                raise ValueError("invalid context diagnostic")
+            if not isinstance(points, dict) or set(points) != {d.value for d in DIMENSION_WEIGHTS} or any(type(p) is not int or not 0 <= p <= 4 for p in points.values()):
+                raise ValueError("invalid context diagnostic")
+            conclusion_level = points["conclusion_limitations"]
+            if is_primary:
+                primary[case.case_id].append(state)
+            if record["provider_calls"] > 1:
+                retry_successes += 1
+            if verified is None:
+                unverified_successes += 1
+        elif "key_claim_diagnostics" in metrics:
+            raise ValueError("invalid context diagnostic")
+        rows.append({
+            "case_id": case.case_id, "run_index": case.run_index,
+            "status": record["status"], "error_code": record["error_code"],
+            "provider_calls": record["provider_calls"], "primary": is_primary,
+            "request_verification": "verified" if verified is not None else "not_verified",
+            "verified_first_request_sha256": verified,
+            "judgment": state, "overall_score": score,
+            "conclusion_level": conclusion_level,
+        })
+    within, between = [], []
+    context_ids = list(primary)
+    for case_id, states in primary.items():
+        comparisons = len(states) * (len(states) - 1) // 2
+        disagreements = sum(a != b for i, a in enumerate(states) for b in states[i + 1:])
+        scores = [r["overall_score"] for r in rows if r["case_id"] == case_id and r["primary"]]
+        within.append({
+            "case_id": case_id, "primary_records": len(states),
+            "frequencies": dict(sorted(Counter(states).items())),
+            "disagreements": disagreements, "comparisons": comparisons,
+            "disagreement_rate": disagreements / comparisons if comparisons else None,
+            "score_min": min(scores) if scores else None,
+            "score_max": max(scores) if scores else None,
+        })
+    for i, left in enumerate(context_ids):
+        for right in context_ids[i + 1:]:
+            comparisons = len(primary[left]) * len(primary[right])
+            disagreements = sum(a != b for a in primary[left] for b in primary[right])
+            between.append({
+                "left": left, "right": right, "disagreements": disagreements,
+                "comparisons": comparisons,
+                "disagreement_rate": disagreements / comparisons if comparisons else None,
+            })
+    primary_count = sum(len(values) for values in primary.values())
+    calls = [r["provider_calls"] for r in records if r["provider_calls"] is not None]
+    usage = {field: sum(r["usage"][field] or 0 for r in records) for field in ("prompt_tokens", "completion_tokens", "total_tokens")}
+    usage_unknown = {field: sum(r["usage"][field] is None for r in records) for field in usage}
+    return {
+        "attempted": len(records),
+        "provider_calls_known": sum(calls),
+        "provider_calls_unknown_records": len(records) - len(calls),
+        "usage": usage, "usage_unknown_records": usage_unknown,
+        "estimated_cost_cny": (
+            round((usage["prompt_tokens"] * _INPUT_CNY_PER_MILLION_TOKENS + usage["completion_tokens"] * _OUTPUT_CNY_PER_MILLION_TOKENS) / 1_000_000, 6)
+            if len(calls) == len(records) == 9 and not usage_unknown["prompt_tokens"] and not usage_unknown["completion_tokens"] else None
+        ),
+        "context_diagnostic": {
+            "plan": plan, "plan_sha256": records[0]["metrics"]["context_diagnostic"]["plan_sha256"],
+            "status": "present" if primary_count == 9 else "partial" if primary_count else "not_available",
+            "planned_slots": 9, "recorded_slots": len(records),
+            "missing_slots": 9 - len(records), "primary_records": primary_count,
+            "retry_success_records": retry_successes,
+            "unverified_success_records": unverified_successes,
+            "status_counts": dict(sorted(Counter(r["status"] for r in records).items())),
+            "rows": rows, "within": within, "between": between,
+        },
+        "acceptance_gates": {
+            "status": "not_available", "target_source": "diagnostic_only",
+            "targets": {}, "gates": {},
+        },
     }
 
 
@@ -1222,6 +1338,8 @@ def _metric_number(metrics: dict[str, Any], field: str) -> float:
 def build_report(*, input_path: Path, output_path: Path) -> dict[str, Any]:
     records = load_results(input_path)
     summary = summarize_results(records)
+    if "context_diagnostic" in summary and input_path.resolve() == output_path.resolve():
+        raise ValueError("invalid context diagnostic output")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
         _render_markdown(summary=summary, records=records),
@@ -1236,6 +1354,8 @@ def _render_markdown(
     summary: dict[str, Any],
     records: list[dict[str, Any]],
 ) -> str:
+    if "context_diagnostic" in summary:
+        return _render_context_diagnostic(summary)
     lines = [
         "# PaperLens Evaluation Report",
         "",
@@ -1617,6 +1737,59 @@ def _markdown_cell(value: Any) -> str:
     if not isinstance(value, str) or not value:
         return "-"
     return value.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
+def _render_context_diagnostic(summary: dict[str, Any]) -> str:
+    diagnosis = summary["context_diagnostic"]
+    plan = diagnosis["plan"]
+    lines = [
+        "# PaperLens Development Context Diagnostic",
+        "", "Rebuilt exclusively from JSONL; not a formal stability or acceptance result.",
+        "No acceptance thresholds are evaluated. Small samples do not establish a causal context effect.",
+        "Pair comparisons share observations and are not independent additional requests.",
+        "Primary analysis uses only dispatch-verified first-attempt successes. Schema retries alter the request and are listed separately.",
+        "Planned fingerprints are not dispatch observations. Missing verified fingerprints (including legacy and interrupted records) are not verified.",
+        "Failure, unknown usage and missing slots are not treated as agreement or zero cost.",
+        "", f"- Diagnostic: {_markdown_cell(plan['diagnostic_id'])}",
+        f"- Target: {_markdown_cell(plan['target_claim_id'])} / {_markdown_cell(plan['target_block_id'])}",
+        f"- Primary status: {diagnosis['status']}",
+        f"- Planned / recorded / primary / missing: 9 / {diagnosis['recorded_slots']} / {diagnosis['primary_records']} / {diagnosis['missing_slots']}",
+        f"- Retry successes (excluded from primary): {diagnosis['retry_success_records']}",
+        f"- Unverified successes (excluded from primary): {diagnosis['unverified_success_records']}",
+        f"- Known calls / records with unknown calls: {summary['provider_calls_known']} / {summary['provider_calls_unknown_records']}",
+        f"- Known input / output tokens: {summary['usage']['prompt_tokens']} / {summary['usage']['completion_tokens']}",
+        f"- Estimated cost CNY: {summary['estimated_cost_cny'] if summary['estimated_cost_cny'] is not None else 'unknown'}",
+        "- Pricing basis: input 1 / output 4 CNY per million tokens; not a guaranteed current tariff.",
+        f"- Plan SHA256: {diagnosis['plan_sha256']}",
+        f"- Pair SHA256: {plan['pair_sha256']}",
+        f"- Configuration SHA256: {plan['configuration_sha256']}",
+        "", "## Request fingerprints", "",
+        "| context | planned first-request SHA256 |", "|---|---|",
+    ]
+    for context in plan["contexts"]:
+        lines.append(f"| {_markdown_cell(context['case_id'])} | {context['request_sha256']} |")
+    lines.extend(["", "## Within-context changes", "",
+                  "| context | first-attempt successes | disagreements / comparisons | judgment frequencies | score range |",
+                  "|---|---:|---:|---|---|"])
+    for row in diagnosis["within"]:
+        frequencies = json.dumps(row["frequencies"], sort_keys=True)
+        lines.append(f"| {_markdown_cell(row['case_id'])} | {row['primary_records']}/3 | {row['disagreements']}/{row['comparisons']} | {_markdown_cell(frequencies)} | {row['score_min']}–{row['score_max']} |")
+    lines.extend(["", "## Between-context changes", "",
+                  "Cross-context score differences are not used as evidence of a local context effect.", "",
+                  "| contexts | disagreements / comparisons |", "|---|---:|"])
+    for row in diagnosis["between"]:
+        lines.append(f"| {_markdown_cell(row['left'])} / {_markdown_cell(row['right'])} | {row['disagreements']}/{row['comparisons']} |")
+    lines.extend(["", "## All recorded slots", "",
+                  "Judgment order: relation / scope / terminology / severity / deterministic codes.", "",
+                  "| case | run | status | error code | calls | primary | verification | verified first-request SHA256 | judgment | score | conclusion level |",
+                  "|---|---:|---|---|---:|---|---|---|---|---:|---:|"])
+    for row in diagnosis["rows"]:
+        lines.append("| " + " | ".join(_markdown_cell(row[field]) for field in (
+            "case_id", "run_index", "status", "error_code", "provider_calls",
+            "primary", "request_verification", "verified_first_request_sha256",
+            "judgment", "overall_score", "conclusion_level",
+        )) + " |")
+    return "\n".join(lines) + "\n"
 
 
 def _default_output_path(input_path: Path) -> Path:
