@@ -595,6 +595,87 @@ def test_context_diagnostic_report_separates_within_and_between_without_gates(tm
     assert rebuilt == content
 
 
+@pytest.mark.parametrize("scenario, calls, score, level, primary", [
+    ("first_success", 1, 87.5, 3, "true"),
+    ("zero_success", 1, 0, 0, "true"),
+    ("retry_success", 2, 75.25, 2, "false"),
+    ("failed_known_zero", 0, None, None, "false"),
+    ("failed_unknown", None, None, None, "false"),
+    ("interrupted", None, None, None, "false"),
+])
+def test_context_diagnostic_markdown_scalars_render_validated_jsonl(tmp_path, scenario, calls, score, level, primary):
+    runner, service, versions, plan, source = _run_context_diagnostic_fixture(tmp_path)
+    records = _read_jsonl(source)
+    record = records[0]
+    record["provider_calls"] = calls
+    if score is not None:
+        record["metrics"]["overall_score"] = score
+        record["metrics"]["dimension_points"]["conclusion_limitations"] = level
+    else:
+        record.update(status="failed", error_code="RUN_INTERRUPTED" if scenario == "interrupted" else "HY3_UNAVAILABLE")
+        record["usage"] = {key: None for key in record["usage"]}
+        metadata = record["metrics"]["context_diagnostic"]
+        metadata["verified_first_request_sha256"] = None
+        record["metrics"] = {"context_diagnostic": metadata}
+    source.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    before = source.read_bytes()
+    expected_summary = copy.deepcopy(summarize_results(records))
+    output = tmp_path / "scalars.md"
+    summary = build_report(input_path=source, output_path=output)
+    content = output.read_text(encoding="utf-8")
+    table = content.split("## All recorded slots\n", 1)[1]
+    rows = [line for line in table.splitlines() if line.startswith("| quality:")]
+    cells = [cell.strip() for cell in rows[0].strip("|").split("|")]
+    assert len(rows) == 9 and len(cells) == 11
+    assert {"run": cells[1], "calls": cells[4], "primary": cells[5],
+            "score": cells[9], "level": cells[10]} == {
+        "run": "0", "calls": "-" if calls is None else str(calls),
+        "primary": primary, "score": "-" if score is None else str(score),
+        "level": "-" if level is None else str(level),
+    }
+    assert [line.strip("|").split("|")[1].strip() for line in rows] == [
+        str(row["run_index"]) for row in summary["context_diagnostic"]["rows"]
+    ]
+    assert summary == expected_summary and source.read_bytes() == before
+    assert summary["context_diagnostic"]["primary_records"] == (9 if primary == "true" else 8)
+    assert summary["context_diagnostic"]["retry_success_records"] == (1 if scenario == "retry_success" else 0)
+    assert summary["acceptance_gates"] == {
+        "status": "not_available", "target_source": "diagnostic_only", "targets": {}, "gates": {},
+    }
+    reversed_source = tmp_path / "reversed.jsonl"
+    reversed_output = tmp_path / "reversed.md"
+    reversed_source.write_text("".join(json.dumps(r) + "\n" for r in reversed(records)), encoding="utf-8")
+    assert build_report(input_path=reversed_source, output_path=reversed_output) == summary
+    assert reversed_output.read_bytes() == output.read_bytes()
+
+
+def test_context_diagnostic_markdown_scalars_preserve_escaping_and_whitelist(tmp_path):
+    runner, service, versions, plan, source = _run_context_diagnostic_fixture(tmp_path)
+    records = _read_jsonl(source)
+    summary = summarize_results(records)
+    # Exercise the real renderer's defensive string handling with synthetic
+    # display text; invalid JSONL is still rejected by the existing loader tests.
+    row = summary["context_diagnostic"]["rows"][0]
+    row["judgment"] = "synthetic | bounded\r\nlocal"
+    row["reason"] = "UNLISTED_PRIVATE_SENTINEL"
+    snapshot = copy.deepcopy(summary)
+    content = _render_markdown(summary=summary, records=records)
+    assert "synthetic \\| bounded  local" in content
+    assert "UNLISTED_PRIVATE_SENTINEL" not in content
+    assert summary == snapshot
+
+    class MustNotStringify:
+        def __str__(self):
+            pytest.fail("arbitrary_object_was_stringified")
+
+    row["overall_score"] = MustNotStringify()
+    content = _render_markdown(summary=summary, records=records)
+    table = content.split("## All recorded slots\n", 1)[1]
+    first = next(line for line in table.splitlines() if line.startswith("| quality:"))
+    assert first.endswith(" | - | 4 |")
+    assert "UNLISTED_PRIVATE_SENTINEL" not in content
+
+
 def test_context_diagnostic_report_keeps_retries_and_missing_slots_visible(tmp_path):
     runner, service, versions, plan, path = _run_context_diagnostic_fixture(tmp_path)
     records = _read_jsonl(path)[:-1]

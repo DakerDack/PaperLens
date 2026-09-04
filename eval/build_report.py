@@ -1784,11 +1784,19 @@ def _render_context_diagnostic(summary: dict[str, Any]) -> str:
                   "| case | run | status | error code | calls | primary | verification | verified first-request SHA256 | judgment | score | conclusion level |",
                   "|---|---:|---|---|---:|---|---|---|---|---:|---:|"])
     for row in diagnosis["rows"]:
-        lines.append("| " + " | ".join(_markdown_cell(row[field]) for field in (
+        cells = []
+        for field in (
             "case_id", "run_index", "status", "error_code", "provider_calls",
             "primary", "request_verification", "verified_first_request_sha256",
             "judgment", "overall_score", "conclusion_level",
-        )) + " |")
+        ):
+            value = row[field]
+            if field == "primary" and type(value) is bool:
+                value = "true" if value else "false"
+            elif field in {"run_index", "provider_calls", "overall_score", "conclusion_level"} and type(value) in (int, float):
+                value = str(value)
+            cells.append(_markdown_cell(value))
+        lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n"
 
 
