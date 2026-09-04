@@ -1717,6 +1717,15 @@ def _apply_live_mutation(
 ) -> None:
     target_sentence_id = _required_string(mutation, "target_sentence_id")
     replacement_text = _required_string(mutation, "replacement_text")
+    if "qualifiers" in mutation:
+        qualifiers = mutation["qualifiers"]
+        if not isinstance(qualifiers, list) or any(
+            not isinstance(qualifier, str) or not qualifier.strip()
+            for qualifier in qualifiers
+        ):
+            raise ValueError(
+                "mutation qualifiers must be an array of non-empty strings"
+            )
     target_found = False
     for section in bundle_data["document"]["sections"]:
         for sentence in section["sentences"]:
@@ -1729,6 +1738,8 @@ def _apply_live_mutation(
         if claim["sentence_id"] != target_sentence_id:
             continue
         claim["text"] = replacement_text
+        if "qualifiers" in mutation:
+            claim["qualifiers"] = copy.deepcopy(mutation["qualifiers"])
         if "numeric_entities" in mutation:
             numeric_entities = mutation["numeric_entities"]
             if not isinstance(numeric_entities, list):

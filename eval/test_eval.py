@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import multiprocessing
@@ -1141,6 +1142,228 @@ def test_every_frozen_live_slot_materializes_against_production_models() -> None
             for claim in bundle.claims
         ) != 1:
             pytest.fail(f"{case.payload['paper_id']}: limitation_claim_count_invalid")
+
+
+@pytest.fixture
+def mutation_qualifiers_case(monkeypatch: pytest.MonkeyPatch):
+    import eval.run_eval as run_eval_module
+
+    original_text = "The sensor was tested only in the pilot group."
+    sections = {}
+    for index, section_id in enumerate(
+        ("research_question", "methods", "results", "limitations", "plain_explanation")
+    ):
+        sections[section_id] = {
+            "sentence_id": f"synthetic-s{index}",
+            "text": original_text,
+            "claim": {
+                "claim_id": f"synthetic-c{index}",
+                "claim_type": "result",
+                "importance": "critical",
+                "qualifiers": ["only", "pilot group"],
+                "numeric_entities": [],
+                "auditability": "auditable",
+                "candidate_block_id": "p01-b001",
+                "candidate_quote": original_text,
+            },
+        }
+    paper = {
+        "paper_id": "synthetic",
+        "source_blocks": [{"block_id": "p01-b001", "text": original_text}],
+        "base_output": {"title": "Synthetic sensor study", "sections": sections},
+        "quality_mutations": {
+            "medium": {
+                "target_sentence_id": "synthetic-s2",
+                "replacement_text": "The sensor was tested in the pilot group.",
+            }
+        },
+    }
+    manifest = {"papers": [paper], "attacks": []}
+    monkeypatch.setattr(run_eval_module, "_load_live_manifest", lambda: manifest)
+    case = EvaluationCase(
+        case_id="quality:synthetic:medium",
+        run_index=0,
+        payload={
+            "case_group": "quality",
+            "paper_id": "synthetic",
+            "quality_label": "medium",
+        },
+    )
+    return case, paper
+
+
+@pytest.mark.parametrize("qualifiers", [["pilot group"], []], ids=["explicit", "empty"])
+def test_mutation_qualifiers_override_only_target_and_preserve_base(
+    mutation_qualifiers_case, qualifiers: list[str],
+) -> None:
+    case, paper = mutation_qualifiers_case
+    mutation = paper["quality_mutations"]["medium"]
+    mutation["qualifiers"] = qualifiers
+    original_paper = copy.deepcopy(paper)
+    good_case = EvaluationCase(
+        case_id="quality:synthetic:good",
+        run_index=0,
+        payload={**case.payload, "quality_label": "good"},
+    )
+    original_sources, original_bundle = materialize_live_case(good_case)
+
+    sources, bundle = materialize_live_case(case)
+
+    assert sources == original_sources
+    assert paper == original_paper
+    for original, changed in zip(original_bundle.claims, bundle.claims, strict=True):
+        expected = original.model_dump(mode="json")
+        if original.sentence_id == mutation["target_sentence_id"]:
+            expected.update(text=mutation["replacement_text"], qualifiers=qualifiers)
+        assert changed.model_dump(mode="json") == expected
+    expected_document = original_bundle.document.model_dump(mode="json")
+    for section in expected_document["sections"]:
+        for sentence in section["sentences"]:
+            if sentence["sentence_id"] == mutation["target_sentence_id"]:
+                sentence["text"] = mutation["replacement_text"]
+    assert bundle.document.model_dump(mode="json") == expected_document
+    target = next(claim for claim in bundle.claims if claim.claim_id == "synthetic-c2")
+    target.qualifiers.append("local copy only")
+    assert paper == original_paper
+    assert materialize_live_case(good_case) == (original_sources, original_bundle)
+
+
+def test_mutation_qualifiers_missing_keeps_legacy_behavior(
+    mutation_qualifiers_case,
+) -> None:
+    case, paper = mutation_qualifiers_case
+    original_paper = copy.deepcopy(paper)
+
+    _, bundle = materialize_live_case(case)
+
+    target = next(claim for claim in bundle.claims if claim.claim_id == "synthetic-c2")
+    assert target.qualifiers == ["only", "pilot group"]
+    assert target.text == paper["quality_mutations"]["medium"]["replacement_text"]
+    assert paper == original_paper
+
+
+@pytest.mark.parametrize(
+    "invalid_qualifiers",
+    [None, "pilot group", [1], [None], [False], [""], [" \t\n"], ["pilot group", " "]],
+    ids=["null", "string", "number-member", "null-member", "bool-member", "empty-member", "blank-member", "mixed-members"],
+)
+def test_mutation_qualifiers_invalid_fails_before_provider(
+    mutation_qualifiers_case, invalid_qualifiers: object,
+) -> None:
+    case, paper = mutation_qualifiers_case
+    paper["quality_mutations"]["medium"]["qualifiers"] = invalid_qualifiers
+    original_paper = copy.deepcopy(paper)
+    provider_calls = 0
+
+    def forbidden_deep_audit(**_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise ValueError("unexpected provider boundary")
+
+    with pytest.raises(ValueError) as error:
+        evaluate_live_case(
+            case, hy3_service=SimpleNamespace(deep_audit=forbidden_deep_audit)
+        )
+
+    assert provider_calls == 0
+    assert str(error.value) == (
+        "mutation qualifiers must be an array of non-empty strings"
+    )
+    assert paper == original_paper
+
+
+@pytest.mark.parametrize(
+    ("quality_label", "expected_qualifiers"),
+    [("medium", ["video-game group"]), ("bad", ["All three groups"])],
+)
+def test_dev03_mutation_qualifiers_match_text_without_changing_base(
+    quality_label: str, expected_qualifiers: list[str],
+) -> None:
+    import eval.run_eval as run_eval_module
+
+    manifest = run_eval_module._load_live_manifest()
+    original_manifest = copy.deepcopy(manifest)
+    paper = next(paper for paper in manifest["papers"] if paper["paper_id"] == "dev-03")
+    mutation = paper["quality_mutations"][quality_label]
+    actual_qualifiers = mutation.get("qualifiers")
+    assert actual_qualifiers == expected_qualifiers
+    cases = {case.case_id: case for case in load_mode_cases("calibrate")}
+    good_sources, good_bundle = materialize_live_case(cases["quality:dev-03:good"])
+
+    sources, bundle = materialize_live_case(cases[f"quality:dev-03:{quality_label}"])
+
+    if sources != good_sources:
+        pytest.fail("source_blocks_changed")
+    for original, changed in zip(good_bundle.claims, bundle.claims, strict=True):
+        if changed.sentence_id == mutation["target_sentence_id"]:
+            assert changed.qualifiers == expected_qualifiers
+            assert all(term in changed.text for term in changed.qualifiers)
+            if changed.candidate_quote != original.candidate_quote:
+                pytest.fail("evidence_changed")
+            assert original.qualifiers == ["only", "video-game group"]
+        elif changed != original:
+            pytest.fail("non_target_claim_changed")
+    if manifest != original_manifest:
+        pytest.fail("base_manifest_changed")
+
+
+@pytest.mark.parametrize(
+    ("quality_label", "expected_qualifiers"),
+    [("medium", ["video-game group"]), ("bad", ["All three groups"])],
+)
+def test_dev03_mutation_qualifiers_reach_deep_audit_prompt_with_original_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    quality_label: str,
+    expected_qualifiers: list[str],
+) -> None:
+    import backend.app.hy3_service as hy3_service_module
+
+    cases = {case.case_id: case for case in load_mode_cases("calibrate")}
+    good_sources, good_bundle = materialize_live_case(cases["quality:dev-03:good"])
+    original_claim = next(c for c in good_bundle.claims if c.claim_id == "dev-03-c03")
+    captured = []
+
+    class PromptInputCaptured(Exception):
+        pass
+
+    def capture_render_input(*, content_draft_json, verified_claim_evidence_pairs_json):
+        pairs = json.loads(verified_claim_evidence_pairs_json)
+        for pair in pairs:
+            if pair["claim"]["claim_id"] != original_claim.claim_id:
+                continue
+            evidence = pair["evidence"]
+            captured.append({
+                "qualifiers": pair["claim"]["qualifiers"],
+                "qualifiers_match_text": all(
+                    term in pair["claim"]["text"] for term in pair["claim"]["qualifiers"]
+                ),
+                "quote_verified": evidence["quote_verified"],
+                "original_evidence_retained": (
+                    evidence["quote"] == original_claim.candidate_quote
+                    and "only" in evidence["quote"].casefold().split()
+                    and any(
+                        block.block_id == evidence["block_id"]
+                        and evidence["quote"] in block.text
+                        for block in good_sources
+                    )
+                ),
+            })
+        # Stop at the real serializer/renderer boundary: no provider or fake judgment.
+        raise PromptInputCaptured
+
+    monkeypatch.setattr(hy3_service_module, "render_deep_audit_prompt", capture_render_input)
+    service = SimpleNamespace(
+        deep_audit=hy3_service_module.Hy3Service._build_deep_audit_prompt
+    )
+    with pytest.raises(PromptInputCaptured):
+        evaluate_live_case(cases[f"quality:dev-03:{quality_label}"], hy3_service=service)
+
+    assert captured == [{
+        "qualifiers": expected_qualifiers,
+        "qualifiers_match_text": True,
+        "quote_verified": True,
+        "original_evidence_retained": True,
+    }]
 
 
 def test_attack_pairs_share_sources_and_change_only_the_declared_sentence() -> None:

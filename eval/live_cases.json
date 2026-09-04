@@ -105,8 +105,8 @@
         }
       },
       "quality_mutations": {
-        "medium": {"target_sentence_id": "dev-03-s03", "replacement_text": "The video-game group showed increased hippocampal grey matter.", "known_error_type": "comparison_omission", "severity": "minor"},
-        "bad": {"target_sentence_id": "dev-03-s03", "replacement_text": "All three groups showed identical hippocampal grey-matter increases.", "known_error_type": "result_contradiction", "severity": "critical"}
+        "medium": {"target_sentence_id": "dev-03-s03", "replacement_text": "The video-game group showed increased hippocampal grey matter.", "known_error_type": "comparison_omission", "severity": "minor", "qualifiers": ["video-game group"]},
+        "bad": {"target_sentence_id": "dev-03-s03", "replacement_text": "All three groups showed identical hippocampal grey-matter increases.", "known_error_type": "result_contradiction", "severity": "critical", "qualifiers": ["All three groups"]}
       }
     },
     {
