@@ -4,7 +4,7 @@ from backend.app.models import ClaimPolicy
 GENERATION_PROMPT_VERSION = "gen-v4"
 GENERATION_SCHEMA_VERSION = "generated-bundle-v1"
 GENERATION_SCHEMA_NAME = "paperlens_generated_bundle_v1"
-DEEP_AUDIT_PROMPT_VERSION = "audit-v3"
+DEEP_AUDIT_PROMPT_VERSION = "audit-v4"
 DEEP_AUDIT_SCHEMA_VERSION = "deep-audit-result-v2"
 DEEP_AUDIT_SCHEMA_NAME = "paperlens_deep_audit_result_v2"
 REVISION_PROMPT_VERSION = "revision-v2"
@@ -79,6 +79,19 @@ DEEP_AUDIT_USER_PROMPT_TEMPLATE = """任务一：逐条判断 claim 是否被给
 
 每个输出必须保留对应输入的 claim_id 和 evidence.block_id，且每个输入项恰好返回一次判断。
 不得参考分数、预设质量档位、攻击标签或其他 claim 的最终判断。
+逐项检查顺序：
+1. 先判断 claim 中保留的事实是否被 evidence 支持；再独立检查相关边界或精度是否丢失。
+2. 只核对与当前断言的同一对象、谓词、结果或比较关系直接相关的数值精度和比较基准。数值精度遗漏包括相关数量或效应量的精确程度丢失；比较基准遗漏包括相对对象或参照条件丢失。不得把 evidence 中出现但 claim 未重复的所有数字、条件都判为遗漏。
+3. 核心事实仍被支持，且相关精度或比较边界仅有局部损失、未实质改变主张理解时，可以使用 relation=supports + scope_status=expanded + severity=minor。不得仅因省略细节就自动判 contradicts、insufficient、major、critical。
+保留完整边界的同义改述、语序变化或合法简写不应误报；与当前断言无关的背景事实可以省略。
+真正的数值错误、方向反转、因果改变仍按事实与严重度契约处理，不得统一降为 minor。
+检查步骤仅为内部指令，不新增输出字段。
+合成对照：
+- 数值精度遗漏：证据“装置比基准耗能低 18%”；断言“装置比基准耗能低”——仅丢失幅度且不改变结论时为 supports/expanded/minor。
+- 比较基准遗漏：证据“传感器比标准探头更灵敏”；断言“传感器更灵敏”——仅丢失比较对象且未引入更强结论时为 supports/expanded/minor。
+- 完整同义改述：证据“与标准探头相比，传感器灵敏度更高”；断言“传感器比标准探头更灵敏”——supports/preserved/none。
+- 无关背景省略：证据“记录仪外壳为绿色。阀门在 8 秒后关闭”；断言“阀门在 8 秒后关闭”——supports/preserved/none。
+
 语义判定固定规则：
 - relation=supports：仅当 evidence 直接蕴含 claim 的全部实质事实时选择。
 - relation=contradicts：当数字、方向、因果、比较或结论冲突时选择。

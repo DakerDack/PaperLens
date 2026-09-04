@@ -210,6 +210,7 @@ _DIRECTION_TERMS = {
         "increasing",
         "higher",
         "greater",
+        "faster",
         "more",
         "improve",
         "improved",
@@ -228,6 +229,7 @@ _DIRECTION_TERMS = {
         "decreases",
         "decreasing",
         "lower",
+        "slower",
         "less",
         "reduce",
         "reduced",
@@ -250,6 +252,10 @@ _DIRECTION_TERMS = {
         "=",
     ),
 }
+_DIRECTION_PHRASE_PATTERNS = (
+    ("up", re.compile(r"\bmore\s+quickly\b")),
+    ("down", re.compile(r"\bmore\s+slowly\b")),
+)
 _CLAUSE_BOUNDARY = re.compile(
     r"(?:[,，]\s*(?:and|but|while|whereas|并且|同时|但是|但|而|且)\s*|"
     r"[;；]\s*|\s+(?:and|but|while|whereas)\s+)",
@@ -933,6 +939,10 @@ def _negation_mismatch(claim_text: str, source_text: str) -> bool:
 def _comparison_directions(text: str) -> set[str]:
     normalized = normalize_evidence_text(text)
     directions: set[str] = set()
+    for direction, pattern in _DIRECTION_PHRASE_PATTERNS:
+        if pattern.search(normalized):
+            directions.add(direction)
+            normalized = pattern.sub(" ", normalized)
     for direction, terms in _DIRECTION_TERMS.items():
         for term in terms:
             if term.isalpha() and term.isascii():

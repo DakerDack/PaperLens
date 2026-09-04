@@ -635,6 +635,107 @@ def test_evidence_detects_comparison_direction_change() -> None:
     assert "COMPARISON_DIRECTION_MISMATCH" in record.rule_flags
 
 
+@pytest.mark.parametrize(
+    ("claim_text", "evidence_text"),
+    (
+        (
+            "The process completed more slowly than the baseline.",
+            "The process completed slower than the baseline.",
+        ),
+        (
+            "The process completed slower than the baseline.",
+            "The process completed more slowly than the baseline.",
+        ),
+    ),
+)
+def test_comparison_direction_treats_more_slowly_as_slower(
+    claim_text: str,
+    evidence_text: str,
+) -> None:
+    block = source_block("p01-b001", evidence_text)
+    claim = atomic_claim(
+        claim_text,
+        candidate_block_ids=["p01-b001"],
+        candidate_quote=evidence_text,
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.match_method == "model_candidate"
+    assert record.quote_verified is True
+    assert "COMPARISON_DIRECTION_MISMATCH" not in record.rule_flags
+
+
+@pytest.mark.parametrize(
+    ("claim_text", "evidence_text"),
+    (
+        (
+            "The process completed more quickly than the baseline.",
+            "The process completed faster than the baseline.",
+        ),
+        (
+            "The process completed faster than the baseline.",
+            "The process completed more quickly than the baseline.",
+        ),
+    ),
+)
+def test_comparison_direction_treats_more_quickly_as_faster(
+    claim_text: str,
+    evidence_text: str,
+) -> None:
+    block = source_block("p01-b001", evidence_text)
+    claim = atomic_claim(
+        claim_text,
+        candidate_block_ids=["p01-b001"],
+        candidate_quote=evidence_text,
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.match_method == "model_candidate"
+    assert record.quote_verified is True
+    assert "COMPARISON_DIRECTION_MISMATCH" not in record.rule_flags
+
+
+@pytest.mark.parametrize(
+    ("claim_text", "evidence_text"),
+    (
+        (
+            "The process completed faster than the baseline.",
+            "The process completed slower than the baseline.",
+        ),
+        (
+            "The process completed slower than the baseline.",
+            "The process completed faster than the baseline.",
+        ),
+        (
+            "The process completed more quickly than the baseline.",
+            "The process completed more slowly than the baseline.",
+        ),
+        (
+            "The process completed more slowly than the baseline.",
+            "The process completed more quickly than the baseline.",
+        ),
+    ),
+)
+def test_comparison_direction_detects_faster_vs_slower(
+    claim_text: str,
+    evidence_text: str,
+) -> None:
+    block = source_block("p01-b001", evidence_text)
+    claim = atomic_claim(
+        claim_text,
+        candidate_block_ids=["p01-b001"],
+        candidate_quote=evidence_text,
+    )
+
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+
+    assert record.match_method == "model_candidate"
+    assert record.quote_verified is True
+    assert "COMPARISON_DIRECTION_MISMATCH" in record.rule_flags
+
+
 def test_evidence_without_valid_candidate_or_recall_is_insufficient() -> None:
     block = source_block("p01-b001", "The study used interviews only.")
     claim = atomic_claim(

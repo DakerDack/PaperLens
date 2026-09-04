@@ -1201,6 +1201,33 @@ def test_local_quick_check_exposes_numeric_and_fake_citation_attacks() -> None:
             )
 
 
+def test_dev04_medium_condition_omission_has_no_deterministic_direction_mismatch(
+) -> None:
+    case = next(
+        case
+        for case in load_mode_cases("calibrate")
+        if case.case_id == "quality:dev-04:medium"
+    )
+
+    source_blocks, bundle = materialize_live_case(case)
+    records, report = AuditService().quick_check(bundle, source_blocks)
+    issue_codes = {
+        flag
+        for record in records
+        for flag in record.rule_flags
+    }
+
+    assert getattr(report.audit_status, "value", report.audit_status) == (
+        "quick_complete"
+    )
+    assert getattr(report.decision, "value", report.decision) == (
+        "pending_deep_audit"
+    )
+    assert report.core_gate_passed is None
+    assert report.overall_score is None
+    assert "COMPARISON_DIRECTION_MISMATCH" not in issue_codes
+
+
 class _FakeLiveService:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -1969,7 +1996,7 @@ def test_freeze_configuration_records_manifest_and_model_contract_without_key(
     assert frozen["data_version"] == "paperlens-plos-abstracts-v1"
     assert len(frozen["manifest_sha256"]) == 64
     assert frozen["model"] == "hy3"
-    assert frozen["prompt_versions"]["deep_audit"] == "audit-v3"
+    assert frozen["prompt_versions"]["deep_audit"] == "audit-v4"
     assert frozen["schema_versions"]["deep_audit"] == "deep-audit-result-v2"
     assert frozen["overall_score_threshold"] == 75
     assert frozen["dimension_weights"]["factual_consistency"] == 0.20
@@ -1977,10 +2004,10 @@ def test_freeze_configuration_records_manifest_and_model_contract_without_key(
     assert "api_key" not in json.dumps(frozen).casefold()
 
 
-def test_stage7_freeze_payload_tracks_audit_v3_without_schema_change() -> None:
+def test_stage7_freeze_payload_tracks_audit_v4_without_schema_change() -> None:
     payload = _freeze_payload()
 
-    assert payload["prompt_versions"]["deep_audit"] == "audit-v3"
+    assert payload["prompt_versions"]["deep_audit"] == "audit-v4"
     assert payload["schema_versions"]["deep_audit"] == "deep-audit-result-v2"
 
 

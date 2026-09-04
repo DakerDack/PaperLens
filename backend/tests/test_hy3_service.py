@@ -956,7 +956,7 @@ def test_deep_audit_prompt_centralizes_v2_document_contract() -> None:
         )
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v3"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v4"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
     assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v2"
     assert "逐条判断" in prompt
@@ -981,7 +981,7 @@ def test_deep_audit_prompt_defines_non_hedging_semantic_contract() -> None:
         ),
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v3"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v4"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
     assert "relation=supports：仅当 evidence 直接蕴含 claim 的全部实质事实时选择。" in prompt
     assert "relation=contradicts：当数字、方向、因果、比较或结论冲突时选择。" in prompt
@@ -1035,7 +1035,7 @@ def test_deep_audit_prompt_closes_severity_decision_contract() -> None:
         ),
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v3"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v4"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
     assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v2"
     assert (
@@ -1061,6 +1061,100 @@ def test_deep_audit_prompt_closes_severity_decision_contract() -> None:
     ) in prompt
 
 
+def test_deep_audit_prompt_defines_material_omission_contract() -> None:
+    prompt = render_deep_audit_prompt(
+        content_draft_json='{"title":"Synthetic","sections":[]}',
+        verified_claim_evidence_pairs_json="[]",
+    )
+    ordered_checks = (
+        (
+            "先判断 claim 中保留的事实是否被 evidence 支持；再独立检查相关边界或精度是否丢失。",
+            "MATERIAL_OMISSION_SUPPORT_CHECK_MISSING",
+        ),
+        (
+            "只核对与当前断言的同一对象、谓词、结果或比较关系直接相关的数值精度和比较基准。",
+            "MATERIAL_OMISSION_RELEVANCE_CHECK_MISSING",
+        ),
+        (
+            "核心事实仍被支持，且相关精度或比较边界仅有局部损失、未实质改变主张理解时，"
+            "可以使用 relation=supports + scope_status=expanded + severity=minor。",
+            "MATERIAL_OMISSION_JOINT_JUDGMENT_MISSING",
+        ),
+    )
+    for rule, category in ordered_checks:
+        if rule not in prompt:
+            pytest.fail(category)
+    positions = [prompt.index(rule) for rule, _ in ordered_checks]
+    if positions != sorted(positions):
+        pytest.fail("MATERIAL_OMISSION_CHECK_ORDER_INVALID")
+    for rule, category in (
+        (
+            "数值精度遗漏包括相关数量或效应量的精确程度丢失；"
+            "比较基准遗漏包括相对对象或参照条件丢失。",
+            "MATERIAL_OMISSION_TYPES_MISSING",
+        ),
+        (
+            "数值精度遗漏：证据“装置比基准耗能低 18%”；断言“装置比基准耗能低”"
+            "——仅丢失幅度且不改变结论时为 supports/expanded/minor。",
+            "MATERIAL_OMISSION_NUMERIC_EXAMPLE_MISSING",
+        ),
+        (
+            "比较基准遗漏：证据“传感器比标准探头更灵敏”；断言“传感器更灵敏”"
+            "——仅丢失比较对象且未引入更强结论时为 supports/expanded/minor。",
+            "MATERIAL_OMISSION_COMPARATOR_EXAMPLE_MISSING",
+        ),
+    ):
+        if rule not in prompt:
+            pytest.fail(category)
+
+
+def test_deep_audit_prompt_keeps_omission_negative_controls() -> None:
+    prompt = render_deep_audit_prompt(
+        content_draft_json='{"title":"Synthetic","sections":[]}',
+        verified_claim_evidence_pairs_json="[]",
+    )
+    for rule, category in (
+        (
+            "不得把 evidence 中出现但 claim 未重复的所有数字、条件都判为遗漏。",
+            "OMISSION_RELEVANCE_NEGATIVE_CONTROL_MISSING",
+        ),
+        (
+            "不得仅因省略细节就自动判 contradicts、insufficient、major、critical。",
+            "OMISSION_NO_AUTOMATIC_ESCALATION_MISSING",
+        ),
+        (
+            "保留完整边界的同义改述、语序变化或合法简写不应误报；"
+            "与当前断言无关的背景事实可以省略。",
+            "OMISSION_PARAPHRASE_BACKGROUND_CONTROL_MISSING",
+        ),
+        (
+            "真正的数值错误、方向反转、因果改变仍按事实与严重度契约处理，不得统一降为 minor。",
+            "OMISSION_TRUE_ERROR_PROTECTION_MISSING",
+        ),
+        (
+            "完整同义改述：证据“与标准探头相比，传感器灵敏度更高”；"
+            "断言“传感器比标准探头更灵敏”——supports/preserved/none。",
+            "OMISSION_PARAPHRASE_EXAMPLE_MISSING",
+        ),
+        (
+            "无关背景省略：证据“记录仪外壳为绿色。阀门在 8 秒后关闭”；"
+            "断言“阀门在 8 秒后关闭”——supports/preserved/none。",
+            "OMISSION_BACKGROUND_EXAMPLE_MISSING",
+        ),
+        (
+            "同一未变的 claim/evidence 配对必须给出相同判断，"
+            "不得受其他 items、顺序或无关文档内容影响。",
+            "OMISSION_PAIR_INDEPENDENCE_MISSING",
+        ),
+        (
+            "检查步骤仅为内部指令，不新增输出字段。",
+            "OMISSION_OUTPUT_SHAPE_GUARD_MISSING",
+        ),
+    ):
+        if rule not in prompt:
+            pytest.fail(category)
+
+
 def test_deep_audit_prompt_keeps_quality_labels_out_of_model_input() -> None:
     prompt = render_deep_audit_prompt(
         content_draft_json='{"title":"Synthetic","sections":[]}',
@@ -1073,9 +1167,14 @@ def test_deep_audit_prompt_keeps_quality_labels_out_of_model_input() -> None:
         "known_error_type",
         "known_error_severity",
         "known_error_detected",
+        "known_error_",
         "case_id",
         "paper_id",
         "dev-01",
+        "dev-03",
+        "target_score",
+        "expected_answer",
+        "evaluation_answer",
     ):
         assert forbidden not in model_input
 
@@ -1365,7 +1464,7 @@ def test_live_deep_audit_schema_error_retries_and_logs_safely(caplog) -> None:
     retry_prompt = client.completions.calls[1]["messages"][1]["content"]
     assert retry_prompt.count("字段错误摘要：") == 1
     assert invalid not in retry_prompt
-    assert "prompt_version=audit-v3" in caplog.text
+    assert "prompt_version=audit-v4" in caplog.text
     assert "schema_version=deep-audit-result-v2" in caplog.text
     assert "retries=1" in caplog.text
     assert invalid not in caplog.text
