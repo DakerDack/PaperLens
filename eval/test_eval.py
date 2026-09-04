@@ -1996,7 +1996,7 @@ def test_freeze_configuration_records_manifest_and_model_contract_without_key(
     assert frozen["data_version"] == "paperlens-plos-abstracts-v1"
     assert len(frozen["manifest_sha256"]) == 64
     assert frozen["model"] == "hy3"
-    assert frozen["prompt_versions"]["deep_audit"] == "audit-v4"
+    assert frozen["prompt_versions"]["deep_audit"] == "audit-v5"
     assert frozen["schema_versions"]["deep_audit"] == "deep-audit-result-v2"
     assert frozen["overall_score_threshold"] == 75
     assert frozen["dimension_weights"]["factual_consistency"] == 0.20
@@ -2004,10 +2004,10 @@ def test_freeze_configuration_records_manifest_and_model_contract_without_key(
     assert "api_key" not in json.dumps(frozen).casefold()
 
 
-def test_stage7_freeze_payload_tracks_audit_v4_without_schema_change() -> None:
+def test_stage7_freeze_payload_tracks_audit_v5_without_schema_change() -> None:
     payload = _freeze_payload()
 
-    assert payload["prompt_versions"]["deep_audit"] == "audit-v4"
+    assert payload["prompt_versions"]["deep_audit"] == "audit-v5"
     assert payload["schema_versions"]["deep_audit"] == "deep-audit-result-v2"
 
 

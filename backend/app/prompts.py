@@ -4,7 +4,7 @@ from backend.app.models import ClaimPolicy
 GENERATION_PROMPT_VERSION = "gen-v4"
 GENERATION_SCHEMA_VERSION = "generated-bundle-v1"
 GENERATION_SCHEMA_NAME = "paperlens_generated_bundle_v1"
-DEEP_AUDIT_PROMPT_VERSION = "audit-v4"
+DEEP_AUDIT_PROMPT_VERSION = "audit-v5"
 DEEP_AUDIT_SCHEMA_VERSION = "deep-audit-result-v2"
 DEEP_AUDIT_SCHEMA_NAME = "paperlens_deep_audit_result_v2"
 REVISION_PROMPT_VERSION = "revision-v2"
@@ -79,6 +79,9 @@ DEEP_AUDIT_USER_PROMPT_TEMPLATE = """任务一：逐条判断 claim 是否被给
 
 每个输出必须保留对应输入的 claim_id 和 evidence.block_id，且每个输入项恰好返回一次判断。
 不得参考分数、预设质量档位、攻击标签或其他 claim 的最终判断。
+任务一的局部事实与范围判断只能使用当前 item 的 claim 和 evidence；完整 document 仅供任务二文档风险检查，不得为当前配对补充边界或借入其他句子的问题。
+不得根据其他句子的问题数量、文档整体质量、其他配对或排列顺序改变当前 relation、scope_status、terminology_status、severity。
+判 expanded 前，必须能在当前 claim/evidence 中指出本断言实际丢失或改变的必要条件、数值精度或比较基准；不能用文档级印象代替局部证据。
 逐项检查顺序：
 1. 先判断 claim 中保留的事实是否被 evidence 支持；再独立检查相关边界或精度是否丢失。
 2. 只核对与当前断言的同一对象、谓词、结果或比较关系直接相关的数值精度和比较基准。数值精度遗漏包括相关数量或效应量的精确程度丢失；比较基准遗漏包括相对对象或参照条件丢失。不得把 evidence 中出现但 claim 未重复的所有数字、条件都判为遗漏。
@@ -91,6 +94,8 @@ DEEP_AUDIT_USER_PROMPT_TEMPLATE = """任务一：逐条判断 claim 是否被给
 - 比较基准遗漏：证据“传感器比标准探头更灵敏”；断言“传感器更灵敏”——仅丢失比较对象且未引入更强结论时为 supports/expanded/minor。
 - 完整同义改述：证据“与标准探头相比，传感器灵敏度更高”；断言“传感器比标准探头更灵敏”——supports/preserved/none。
 - 无关背景省略：证据“记录仪外壳为绿色。阀门在 8 秒后关闭”；断言“阀门在 8 秒后关闭”——supports/preserved/none。
+- 局部限制对照：证据“该结论仅适用于密封容器中的样本”；断言“结论只适用于密封容器中的样本”——本配对支持且边界完整时为 supports/preserved/none；其他句子从“指示灯为蓝色”变为“指示灯为红色”不改变此判断。
+- 必要条件遗漏：同一证据下，断言“结论适用于容器中的样本”丢失了密封条件，应标 scope_status=expanded；relation 与 severity 按本配对的实际影响判定，不得沿用前例的 preserved/none。
 
 语义判定固定规则：
 - relation=supports：仅当 evidence 直接蕴含 claim 的全部实质事实时选择。
@@ -105,7 +110,8 @@ DEEP_AUDIT_USER_PROMPT_TEMPLATE = """任务一：逐条判断 claim 是否被给
 - severity=major：错误会实质改变对一个主张的理解，例如重要范围、因果、数值、比较或方向发生变化，但尚未推翻核心或关键结论。
 - severity=critical：仅当问题足以反转、伪造或使核心或关键结论实质错误时选择。不得仅因措辞不同、claim 的 importance 标为 critical 或普通范围缺失而选择 severity=critical。
 - scope_status=expanded 或 terminology_status=misused 时，不得在无充分理由下选择 severity=none。不得为了区分标签而虚构问题。
-- 当前绑定 evidence 已明确陈述限制时，应选择 relation=supports；不得额外要求背景或其他 SourceBlock。
+- 限制性主张须核对其自身限制的对象及必要边界；只有本配对直接支持且无事实、范围或术语问题时才判 supports/preserved/none，不得因它是限制句就预设通过。
+- 当前绑定 evidence 已明确支持该限制性主张及其必要边界时，应选择 relation=supports；不得额外要求背景或其他 SourceBlock。
 - 同一未变的 claim/evidence 配对必须给出相同判断，不得受其他 items、顺序或无关文档内容影响。
 不得补充给定 evidence 之外的知识或证据，不得返回页码或 bbox。
 即使 items 为空，也必须继续执行任务二。

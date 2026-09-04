@@ -956,7 +956,7 @@ def test_deep_audit_prompt_centralizes_v2_document_contract() -> None:
         )
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v4"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v5"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
     assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v2"
     assert "逐条判断" in prompt
@@ -981,7 +981,7 @@ def test_deep_audit_prompt_defines_non_hedging_semantic_contract() -> None:
         ),
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v4"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v5"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
     assert "relation=supports：仅当 evidence 直接蕴含 claim 的全部实质事实时选择。" in prompt
     assert "relation=contradicts：当数字、方向、因果、比较或结论冲突时选择。" in prompt
@@ -1001,8 +1001,8 @@ def test_deep_audit_prompt_defines_non_hedging_semantic_contract() -> None:
         "泛化或改变含义时才选择 misused，不得仅因措辞不同选择 unclear 或 misused。"
     ) in prompt
     assert (
-        "当前绑定 evidence 已明确陈述限制时，应选择 relation=supports；不得额外要求背景"
-        "或其他 SourceBlock。"
+        "当前绑定 evidence 已明确支持该限制性主张及其必要边界时，应选择 relation=supports；"
+        "不得额外要求背景或其他 SourceBlock。"
     ) in prompt
     assert "severity=none：配对不存在事实、范围或术语问题。" in prompt
     assert (
@@ -1035,7 +1035,7 @@ def test_deep_audit_prompt_closes_severity_decision_contract() -> None:
         ),
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v4"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v5"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
     assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v2"
     assert (
@@ -1149,6 +1149,118 @@ def test_deep_audit_prompt_keeps_omission_negative_controls() -> None:
         (
             "检查步骤仅为内部指令，不新增输出字段。",
             "OMISSION_OUTPUT_SHAPE_GUARD_MISSING",
+        ),
+    ):
+        if rule not in prompt:
+            pytest.fail(category)
+
+
+def test_deep_audit_prompt_isolates_claim_scope() -> None:
+    claim_text = "结论只适用于密封容器中的样本。"
+    items_json = json.dumps(
+        [{
+            "claim": {"claim_id": "c-local", "text": claim_text},
+            "evidence": {
+                "block_id": "b-local",
+                "quote": "该结论仅适用于密封容器中的样本。",
+            },
+        }],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    for unrelated_text in ("指示灯为蓝色。", "指示灯为红色。"):
+        document = {
+            "title": "Synthetic",
+            "sections": [{
+                "section_id": "limitations",
+                "sentences": [
+                    {"sentence_id": "s-local", "text": claim_text},
+                    {"sentence_id": "s-other", "text": unrelated_text},
+                ],
+            }],
+        }
+        prompt = render_deep_audit_prompt(
+            content_draft_json=json.dumps(document, ensure_ascii=False),
+            verified_claim_evidence_pairs_json=items_json,
+        )
+        for rule, category in (
+            (
+                "任务一的局部事实与范围判断只能使用当前 item 的 claim 和 evidence；"
+                "完整 document 仅供任务二文档风险检查，不得为当前配对补充边界或借入其他句子的问题。",
+                "LOCAL_SCOPE_INPUT_BOUNDARY_MISSING",
+            ),
+            (
+                "不得根据其他句子的问题数量、文档整体质量、其他配对或排列顺序改变当前 "
+                "relation、scope_status、terminology_status、severity。",
+                "LOCAL_SCOPE_CONTEXT_INDEPENDENCE_MISSING",
+            ),
+            (f"- items: {items_json}", "LOCAL_SCOPE_PAIR_INPUT_CHANGED"),
+        ):
+            if rule not in prompt:
+                pytest.fail(category)
+
+
+def test_deep_audit_prompt_preserves_supported_limitation_scope() -> None:
+    prompt = render_deep_audit_prompt(
+        content_draft_json='{"title":"Synthetic","sections":[]}',
+        verified_claim_evidence_pairs_json="[]",
+    )
+    for rule, category in (
+        (
+            "限制性主张须核对其自身限制的对象及必要边界；只有本配对直接支持且无事实、范围或术语"
+            "问题时才判 supports/preserved/none，不得因它是限制句就预设通过。",
+            "LOCAL_LIMITATION_SUPPORT_GUARD_MISSING",
+        ),
+        (
+            "当前绑定 evidence 已明确支持该限制性主张及其必要边界时，应选择 relation=supports；"
+            "不得额外要求背景或其他 SourceBlock。",
+            "LOCAL_LIMITATION_ENTAILMENT_GUARD_MISSING",
+        ),
+        (
+            "局部限制对照：证据“该结论仅适用于密封容器中的样本”；断言“结论只适用于密封容器中的样本”"
+            "——本配对支持且边界完整时为 supports/preserved/none；"
+            "其他句子从“指示灯为蓝色”变为“指示灯为红色”不改变此判断。",
+            "LOCAL_LIMITATION_CONTEXT_EXAMPLE_MISSING",
+        ),
+        (
+            "保留完整边界的同义改述、语序变化或合法简写不应误报；与当前断言无关的背景事实可以省略。",
+            "LOCAL_SCOPE_BACKGROUND_PROTECTION_MISSING",
+        ),
+    ):
+        if rule not in prompt:
+            pytest.fail(category)
+
+
+def test_deep_audit_prompt_keeps_real_omission_errors() -> None:
+    prompt = render_deep_audit_prompt(
+        content_draft_json='{"title":"Synthetic","sections":[]}',
+        verified_claim_evidence_pairs_json="[]",
+    )
+    for rule, category in (
+        (
+            "判 expanded 前，必须能在当前 claim/evidence 中指出本断言实际丢失或改变的必要条件、"
+            "数值精度或比较基准；不能用文档级印象代替局部证据。",
+            "LOCAL_SCOPE_OMISSION_EVIDENCE_MISSING",
+        ),
+        (
+            "必要条件遗漏：同一证据下，断言“结论适用于容器中的样本”丢失了密封条件，"
+            "应标 scope_status=expanded；relation 与 severity 按本配对的实际影响判定，"
+            "不得沿用前例的 preserved/none。",
+            "LOCAL_SCOPE_CONDITION_OMISSION_EXAMPLE_MISSING",
+        ),
+        (
+            "数值精度遗漏：证据“装置比基准耗能低 18%”；断言“装置比基准耗能低”"
+            "——仅丢失幅度且不改变结论时为 supports/expanded/minor。",
+            "LOCAL_SCOPE_NUMERIC_OMISSION_REGRESSION",
+        ),
+        (
+            "比较基准遗漏：证据“传感器比标准探头更灵敏”；断言“传感器更灵敏”"
+            "——仅丢失比较对象且未引入更强结论时为 supports/expanded/minor。",
+            "LOCAL_SCOPE_COMPARATOR_OMISSION_REGRESSION",
+        ),
+        (
+            "真正的数值错误、方向反转、因果改变仍按事实与严重度契约处理，不得统一降为 minor。",
+            "LOCAL_SCOPE_TRUE_ERROR_REGRESSION",
         ),
     ):
         if rule not in prompt:
@@ -1464,7 +1576,7 @@ def test_live_deep_audit_schema_error_retries_and_logs_safely(caplog) -> None:
     retry_prompt = client.completions.calls[1]["messages"][1]["content"]
     assert retry_prompt.count("字段错误摘要：") == 1
     assert invalid not in retry_prompt
-    assert "prompt_version=audit-v4" in caplog.text
+    assert "prompt_version=audit-v5" in caplog.text
     assert "schema_version=deep-audit-result-v2" in caplog.text
     assert "retries=1" in caplog.text
     assert invalid not in caplog.text
