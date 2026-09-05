@@ -908,6 +908,8 @@ def evaluate_live_case(
         )
     except EvaluationCaseError:
         raise
+    except _RevisionMetricsIndeterminate as exc:
+        raise _evaluation_case_error(exc, observations) from None
     except (Hy3ServiceError, AuditServiceError) as exc:
         error = _evaluation_case_error(exc, observations)
         if diagnostic_plan is not None:
@@ -1397,6 +1399,141 @@ def _attack_detected(
     return False
 
 
+class _RevisionMetricsIndeterminate(ValueError):
+    def __init__(self) -> None:
+        super().__init__("EVALUATION_FAILED")
+
+
+def _revision_judgment_state(judgment: Any) -> tuple[str, ...]:
+    return (
+        judgment.relation.value, judgment.scope_status.value,
+        judgment.terminology_status.value, judgment.severity.value,
+    )
+
+
+def _revision_evidence_identity(record: Any) -> tuple[Any, ...]:
+    return record.block_id, record.page_index, record.quote
+
+
+def _revision_covered_pairs(
+    claims: list[Any], evidence: list[Any], result: DeepAuditResult,
+) -> list[tuple[Any, Any, Any]] | None:
+    """Require every target claim and observed evidence pair, not a surviving subset."""
+    if not claims or any(claim.auditability.value != "auditable" for claim in claims):
+        return None
+    by_claim = {claim.claim_id: claim for claim in claims}
+    records: dict[tuple[str, str], Any] = {}
+    for record in evidence:
+        if record.claim_id not in by_claim:
+            continue
+        if not record.quote_verified or record.block_id is None or not record.quote:
+            return None
+        pair = (record.claim_id, record.block_id)
+        previous = records.get(pair)
+        if previous is not None and (
+            _revision_evidence_identity(previous) != _revision_evidence_identity(record)
+            or set(previous.rule_flags) != set(record.rule_flags)
+        ):
+            return None
+        records[pair] = record
+    if {pair[0] for pair in records} != set(by_claim):
+        return None
+    judgments: dict[tuple[str, str], Any] = {}
+    for judgment in result.semantic_judgments:
+        if judgment.claim_id not in by_claim:
+            continue
+        pair = (judgment.claim_id, judgment.block_id)
+        previous = judgments.get(pair)
+        if previous is not None and _revision_judgment_state(previous) != _revision_judgment_state(judgment):
+            return None
+        judgments[pair] = judgment
+    if set(judgments) != set(records):
+        return None
+    return [(by_claim[pair[0]], record, judgments[pair]) for pair, record in records.items()]
+
+
+def _revision_pair_supported(record: Any, judgment: Any) -> bool:
+    return (
+        judgment.relation.value == "supports"
+        and judgment.scope_status.value == "preserved"
+        and judgment.severity.value not in {"major", "critical"}
+        and not _has_citation_deterministic_issue(record)
+    )
+
+
+def _revision_problem_identity(claim: Any, record: Any, judgment: Any) -> tuple[Any, ...]:
+    # Deliberately exact: no reason similarity or guessed semantic lineage.
+    # IDs, order, retrieval method and major/critical level are not issue identity.
+    proposition = (
+        claim.sentence_id, claim.text, claim.claim_type.value,
+        tuple(sorted(set(claim.qualifiers))), tuple(sorted(set(claim.numeric_entities))),
+    )
+    issue = (
+        _revision_judgment_state(judgment)[:3],
+        tuple(sorted({flag for flag in record.rule_flags if flag.startswith(_CITATION_DETERMINISTIC_FLAG_PREFIXES)})),
+    )
+    return proposition, _revision_evidence_identity(record), issue
+
+
+def _revision_new_severe_errors(
+    before_bundle: GeneratedBundle, after_bundle: GeneratedBundle,
+    before_evidence: list[Any], after_evidence: list[Any],
+    before_result: DeepAuditResult, after_result: DeepAuditResult,
+) -> int:
+    after_claims = {claim.claim_id: claim for claim in after_bundle.claims}
+    severe_ids = {
+        judgment.claim_id for judgment in after_result.semantic_judgments
+        if judgment.severity.value in {"major", "critical"}
+    }
+    if not severe_ids <= after_claims.keys():
+        raise _RevisionMetricsIndeterminate()
+    new_issues: set[tuple[Any, ...]] = set()
+    for sentence_id in {after_claims[claim_id].sentence_id for claim_id in severe_ids}:
+        before_pairs = _revision_covered_pairs(
+            [claim for claim in before_bundle.claims if claim.sentence_id == sentence_id],
+            before_evidence, before_result,
+        )
+        after_pairs = _revision_covered_pairs(
+            [claim for claim in after_bundle.claims if claim.sentence_id == sentence_id],
+            after_evidence, after_result,
+        )
+        if before_pairs is None or after_pairs is None:
+            raise _RevisionMetricsIndeterminate()
+        old_issues = {
+            _revision_problem_identity(claim, record, judgment)
+            for claim, record, judgment in before_pairs
+            if judgment.severity.value in {"major", "critical"}
+        }
+        before_inputs = {
+            _revision_problem_identity(claim, record, judgment)[:2]
+            for claim, record, judgment in before_pairs
+        }
+        for claim, record, judgment in after_pairs:
+            if judgment.severity.value not in {"major", "critical"}:
+                continue
+            identity = _revision_problem_identity(claim, record, judgment)
+            if identity in old_issues:
+                continue
+            # A reanchored severe proposition/type may still be the old issue;
+            # a clean evidence baseline cannot resolve that attribution ambiguity.
+            if any(old[0] == identity[0] and old[2] == identity[2] for old in old_issues):
+                raise _RevisionMetricsIndeterminate()
+            # An unchanged input with a changed judgment is not an introduced error.
+            if identity[:2] in before_inputs:
+                raise _RevisionMetricsIndeterminate()
+            baseline = [(r, j) for _, r, j in before_pairs if _revision_evidence_identity(r) == identity[1]]
+            # Confirm new only against a fully covered, clean same-sentence anchor.
+            # Changed/split old severe claims and changed evidence remain unknown.
+            if not baseline or not all(
+                _revision_pair_supported(r, j)
+                and j.severity.value == "none" and j.terminology_status.value == "correct"
+                for r, j in baseline
+            ):
+                raise _RevisionMetricsIndeterminate()
+            new_issues.add(identity)
+    return len(new_issues)
+
+
 def _revision_metrics(
     *,
     case: EvaluationCase,
@@ -1413,33 +1550,25 @@ def _revision_metrics(
 ) -> dict[str, Any]:
     before_sentence = _find_sentence(before_bundle, target_sentence_id)
     after_sentence = _find_sentence(after_bundle, target_sentence_id)
-    target_claim_ids = {
-        claim.claim_id
+    target_claims = [
+        claim
         for claim in after_bundle.claims
         if claim.sentence_id == target_sentence_id
-    }
-    after_target_judgments = [
-        judgment
-        for judgment in after_result.semantic_judgments
-        if judgment.claim_id in target_claim_ids
     ]
-    severe_before = sum(
-        judgment.severity.value in {"major", "critical"}
-        for judgment in before_result.semantic_judgments
+    after_target_pairs = _revision_covered_pairs(
+        target_claims, after_evidence, after_result,
     )
-    severe_after = sum(
-        judgment.severity.value in {"major", "critical"}
-        for judgment in after_result.semantic_judgments
+    new_severe_errors = _revision_new_severe_errors(
+        before_bundle, after_bundle, before_evidence, after_evidence,
+        before_result, after_result,
     )
     resolved = (
         before_sentence.text == mutation["replacement_text"]
         and after_sentence.text != before_sentence.text
-        and after_target_judgments
+        and after_target_pairs
         and all(
-            judgment.severity.value not in {"major", "critical"}
-            and judgment.relation.value == "supports"
-            and judgment.scope_status.value == "preserved"
-            for judgment in after_target_judgments
+            _revision_pair_supported(record, judgment)
+            for _, record, judgment in after_target_pairs
         )
     )
     metrics = {
@@ -1450,7 +1579,7 @@ def _revision_metrics(
         "known_issue_count": 1,
         "resolved_issue_count": int(bool(resolved)),
         "error_resolution_rate": 1.0 if resolved else 0.0,
-        "new_severe_error_count": max(0, severe_after - severe_before),
+        "new_severe_error_count": new_severe_errors,
         "irrelevant_change": not _only_target_sentence_changed(
             before_bundle.document,
             after_bundle.document,

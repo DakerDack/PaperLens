@@ -2247,12 +2247,15 @@ class _FakeLiveService:
             ],
         )
 
-    def revise_sentence(self, *, current_text, sentence_id, **_kwargs):
+    def revise_sentence(self, *, current_text, sentence_id, evidence_records, **_kwargs):
         from backend.app.models import EditPatch
 
         self.calls.append("revision")
         self._observe("revision")
-        after_text = f"{current_text} Revised with bounded wording."
+        after_text = " ".join(dict.fromkeys(
+            record.quote for record in evidence_records if record.quote_verified and record.quote
+        ))
+        assert after_text, "synthetic_revision_requires_verified_evidence"
         return EditPatch(
             patch_id="323e4567-e89b-42d3-a456-426614174012",
             base_version=1,
@@ -2262,7 +2265,7 @@ class _FakeLiveService:
             before_text=current_text,
             after_text=after_text,
             reason="Bounded test revision.",
-            fact_changed=False,
+            fact_changed=after_text != current_text,
             evidence_changed=False,
         )
 
@@ -2907,6 +2910,416 @@ def test_live_citation_metrics_separate_bm25_accuracy_and_completeness(
     assert metrics["key_claim_citation_accuracy_denominator"] == 4
     assert metrics["key_claim_citation_completeness_numerator"] == 4
     assert metrics["key_claim_citation_completeness_denominator"] == 4
+
+
+def _revision_metrics_fixture(
+    *, after_a="Sensor A measured 10 units.", after_b="Sensor B measured 30 units.",
+    severe_before=("a",), severe_after=(),
+):
+    from backend.app.models import AtomicClaim, GeneratedBundle, SectionId, SemanticJudgment, SourceBlock
+
+    sources = [SourceBlock(
+        block_id=f"synthetic-block-{name}", page_index=0, type="text", text=text,
+        reading_order=index, parser="mineru", parser_version="synthetic",
+    ) for index, (name, text) in enumerate((
+        ("a", "Sensor A measured 10 units."), ("b", "Sensor B measured 30 units."),
+    ))]
+
+    def bundle(texts, suffix):
+        claims = [AtomicClaim(
+            claim_id=f"synthetic-{name}{suffix}", sentence_id="synthetic-target",
+            text=text, claim_type="result", importance="critical", qualifiers=[],
+            numeric_entities=[], auditability="auditable",
+            candidate_block_ids=[source.block_id], candidate_quote=source.text,
+        ) for name, text, source in zip(("a", "b"), texts, sources)]
+        return GeneratedBundle.model_validate({
+            "document": {"title": "Synthetic revision test", "sections": [
+                {"section_id": section.value, "heading": section.value, "sentences": [{
+                    "sentence_id": "synthetic-target" if section.value == "results" else f"synthetic-{section.value}",
+                    "text": " ".join(texts) if section.value == "results" else "Synthetic background.",
+                }]} for section in SectionId
+            ]}, "claims": claims,
+        })
+
+    before = bundle(("Sensor A measured 20 units.", "Sensor B measured 30 units."), "")
+    after = bundle((after_a, after_b), "-rebuilt")
+
+    def result(candidate, severe_names):
+        return DeepAuditResult(semantic_judgments=[SemanticJudgment(
+            claim_id=claim.claim_id, block_id=claim.candidate_block_ids[0],
+            relation="contradicts" if name in severe_names else "supports",
+            scope_status="preserved", terminology_status="correct",
+            severity="critical" if name in severe_names else "none",
+            reason="SYNTHETIC_PRIVATE_REASON",
+        ) for name, claim in zip(("a", "b"), candidate.claims)], risk_findings=[])
+
+    before_evidence, _ = AuditService().quick_check(before, sources)
+    after_evidence, _ = AuditService().quick_check(after, sources)
+    inputs = dict(
+        case=EvaluationCase(case_id="revision:synthetic:bad", run_index=0, payload={
+            "case_group": "revision", "paper_id": "synthetic", "quality_label": "bad",
+        }),
+        before_bundle=before, after_bundle=after, target_sentence_id="synthetic-target",
+        mutation={"replacement_text": " ".join(claim.text for claim in before.claims),
+                  "target_sentence_id": "synthetic-target"},
+        before_result=result(before, severe_before), after_result=result(after, severe_after),
+        before_report=SimpleNamespace(overall_score=50), after_report=SimpleNamespace(overall_score=75),
+        before_evidence=before_evidence, after_evidence=after_evidence,
+    )
+    return inputs, sources
+
+
+@pytest.mark.parametrize("duplicate_and_reorder", [False, True])
+def test_revision_metrics_fail_closed_new_error_cannot_cancel_resolved_old_error(duplicate_and_reorder):
+    import eval.run_eval as runner
+
+    inputs, _ = _revision_metrics_fixture(after_b="Sensor B measured 40 units.", severe_after=("b",))
+    if duplicate_and_reorder:
+        for stage in ("before", "after"):
+            inputs[f"{stage}_bundle"].claims.reverse()
+            inputs[f"{stage}_evidence"] = list(reversed(inputs[f"{stage}_evidence"] * 2))
+            inputs[f"{stage}_result"].semantic_judgments.reverse()
+    metrics = runner._revision_metrics(**inputs)
+    assert metrics["new_severe_error_count"] == 1
+    assert metrics["resolved_issue_count"] == 0
+
+
+@pytest.mark.parametrize("copies", [1, 2])
+def test_revision_metrics_fail_closed_old_issue_survives_claim_rebuild_without_double_count(copies):
+    import eval.run_eval as runner
+
+    inputs, _ = _revision_metrics_fixture(after_a="Sensor A measured 20 units.", severe_after=("a",))
+    for index in range(1, copies):
+        original = inputs["after_bundle"].claims[0]
+        new_id = f"rebuilt-duplicate-{index}"
+        inputs["after_bundle"].claims.append(original.model_copy(update={"claim_id": new_id}))
+        inputs["after_evidence"].append(inputs["after_evidence"][0].model_copy(update={"claim_id": new_id}))
+        judgment = inputs["after_result"].semantic_judgments[0]
+        inputs["after_result"].semantic_judgments.append(judgment.model_copy(update={"claim_id": new_id}))
+    inputs["after_bundle"].claims.reverse()
+    inputs["after_evidence"] = list(reversed(inputs["after_evidence"] * 2))
+    inputs["after_result"].semantic_judgments.reverse()
+    assert runner._revision_metrics(**inputs)["new_severe_error_count"] == 0
+
+
+def test_revision_metrics_fail_closed_rebuilt_new_issue_and_duplicate_evidence_count_once():
+    import eval.run_eval as runner
+
+    inputs, _ = _revision_metrics_fixture(after_b="Sensor B measured 40 units.", severe_after=("b",))
+    duplicate_id = "new-issue-rebuilt-again"
+    inputs["after_bundle"].claims.append(inputs["after_bundle"].claims[1].model_copy(update={"claim_id": duplicate_id}))
+    inputs["after_evidence"].append(inputs["after_evidence"][1].model_copy(update={"claim_id": duplicate_id}))
+    inputs["after_result"].semantic_judgments.append(
+        inputs["after_result"].semantic_judgments[1].model_copy(update={"claim_id": duplicate_id})
+    )
+    inputs["after_evidence"] *= 2
+    assert runner._revision_metrics(**inputs)["new_severe_error_count"] == 1
+
+
+@pytest.mark.parametrize("damage", ["rewritten_old", "one_to_many", "changed_evidence", "judgment_only_drift"])
+def test_revision_metrics_fail_closed_ambiguous_identity_is_not_a_zero_or_new_count(damage):
+    import eval.run_eval as runner
+
+    inputs, _ = _revision_metrics_fixture(after_a="Sensor A measured 21 units.", severe_after=("a",))
+    if damage == "one_to_many":
+        extra = inputs["after_bundle"].claims[0].model_copy(update={
+            "claim_id": "split-claim", "text": "Sensor A measured 22 units.",
+        })
+        inputs["after_bundle"].claims.append(extra)
+        inputs["after_evidence"].append(inputs["after_evidence"][0].model_copy(update={"claim_id": extra.claim_id}))
+        inputs["after_result"].semantic_judgments.append(
+            inputs["after_result"].semantic_judgments[0].model_copy(update={"claim_id": extra.claim_id})
+        )
+    elif damage == "changed_evidence":
+        inputs["after_bundle"].claims[0].text = inputs["before_bundle"].claims[0].text
+        inputs["after_evidence"][0].quote = "A different synthetic evidence fragment."
+    elif damage == "judgment_only_drift":
+        inputs, _ = _revision_metrics_fixture(severe_before=(), severe_after=("b",))
+    with pytest.raises(ValueError, match="^EVALUATION_FAILED$"):
+        runner._revision_metrics(**inputs)
+
+
+@pytest.mark.parametrize("flag", [
+    "NUMBER_MISMATCH:20", "UNIT_MISMATCH:ms", "NEGATION_MISMATCH", "COMPARISON_DIRECTION_MISMATCH",
+])
+def test_revision_metrics_fail_closed_deterministic_conflict_overrides_positive_judgment(flag):
+    import eval.run_eval as runner
+
+    inputs, _ = _revision_metrics_fixture(after_a="Sensor A measured 20 units in this test.")
+    # Metrics consume verified rule results; only this synthetic flag varies.
+    inputs["after_evidence"][0].rule_flags = [flag]
+    assert inputs["after_evidence"][0].quote_verified
+    assert runner._revision_metrics(**inputs)["resolved_issue_count"] == 0
+
+
+@pytest.mark.parametrize("missing", [
+    "all_judgments", "one_claim_judgment", "one_pair_judgment", "one_claim_evidence",
+    "all_target_claims", "unverified_evidence", "non_auditable_claim", "unchanged_sentence",
+])
+def test_revision_metrics_fail_closed_incomplete_target_coverage_is_not_resolved(missing):
+    from backend.app.models import Auditability
+    import eval.run_eval as runner
+
+    inputs, _ = _revision_metrics_fixture()
+    if missing == "all_judgments":
+        inputs["after_result"].semantic_judgments = []
+    elif missing == "one_claim_judgment":
+        inputs["after_result"].semantic_judgments.pop()
+    elif missing == "one_pair_judgment":
+        inputs["after_evidence"].append(inputs["after_evidence"][0].model_copy(update={"block_id": "another-block"}))
+    elif missing == "one_claim_evidence":
+        inputs["after_evidence"].pop()
+    elif missing == "all_target_claims":
+        inputs["after_bundle"].claims = []
+    elif missing == "unverified_evidence":
+        inputs["after_evidence"][0].quote_verified = False
+    elif missing == "non_auditable_claim":
+        inputs["after_bundle"].claims[0].auditability = Auditability.NON_AUDITABLE
+    else:
+        runner._find_sentence(inputs["after_bundle"], "synthetic-target").text = inputs["mutation"]["replacement_text"]
+    assert runner._revision_metrics(**inputs)["resolved_issue_count"] == 0
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_revision_metrics_fail_closed_genuine_supported_repair_still_resolves(fallback):
+    from backend.app.models import MatchMethod
+    import eval.run_eval as runner
+
+    inputs, _ = _revision_metrics_fixture()
+    if fallback:
+        for record in inputs["after_evidence"]:
+            record.match_method = MatchMethod.BM25_FALLBACK
+            record.rule_flags = ["CANDIDATE_QUOTE_MISSING:synthetic", "CANDIDATE_BLOCK_NOT_FOUND:missing"]
+    metrics = runner._revision_metrics(**inputs)
+    assert metrics["known_issue_count"] == metrics["resolved_issue_count"] == 1
+    assert metrics["new_severe_error_count"] == 0
+    assert metrics["irrelevant_change"] is False
+
+
+class _SyntheticRevisionMetricsService(_FakeLiveService):
+    def __init__(self, inputs):
+        super().__init__()
+        self.inputs = inputs
+
+    def deep_audit(self, *, document, claim_evidence_pairs):
+        first = not self.calls
+        result = super().deep_audit(document=document, claim_evidence_pairs=claim_evidence_pairs)
+        result.semantic_judgments = self.inputs["before_result" if first else "after_result"].semantic_judgments
+        return result
+
+    def revise_sentence(self, **kwargs):
+        import eval.run_eval as runner
+
+        patch = super().revise_sentence(**kwargs)
+        patch.after_text = runner._find_sentence(self.inputs["after_bundle"], "synthetic-target").text
+        return patch
+
+    def regenerate_sentence_claims(self, **_kwargs):
+        from backend.app.models import SentenceClaimRegenerationResult
+
+        self.calls.append("sentence_claims")
+        self._observe("sentence_claims")
+        return SentenceClaimRegenerationResult(claims=self.inputs["after_bundle"].claims)
+
+
+def _isolate_revision_metrics_evaluation(monkeypatch, inputs, sources):
+    import eval.run_eval as runner
+
+    monkeypatch.setattr(runner, "materialize_live_case", lambda _: (copy.deepcopy(sources), inputs["before_bundle"].model_copy(deep=True)))
+    monkeypatch.setattr(runner, "_load_live_manifest", lambda: {
+        "papers": [{"paper_id": "synthetic", "quality_mutations": {"bad": inputs["mutation"]}}],
+    })
+    return runner
+
+
+def test_revision_metrics_fail_closed_indeterminate_preserves_observed_cost(monkeypatch):
+    inputs, sources = _revision_metrics_fixture(after_a="Sensor A measured 21 units.", severe_after=("a",))
+    runner = _isolate_revision_metrics_evaluation(monkeypatch, inputs, sources)
+    service = _SyntheticRevisionMetricsService(inputs)
+    with pytest.raises(EvaluationCaseError) as raised:
+        runner.evaluate_live_case(inputs["case"], hy3_service=service)
+    assert str(raised.value) == "EVALUATION_FAILED"
+    assert raised.value.status == "failed"
+    assert raised.value.provider_calls == 4
+    assert raised.value.usage == {"prompt_tokens": 400, "completion_tokens": 160, "total_tokens": 560}
+    assert service.calls == ["deep_audit", "revision", "sentence_claims", "deep_audit"]
+
+
+def test_revision_metrics_fail_closed_does_not_swallow_unrelated_metric_errors(monkeypatch):
+    inputs, sources = _revision_metrics_fixture()
+    runner = _isolate_revision_metrics_evaluation(monkeypatch, inputs, sources)
+
+    def unrelated_error(**_kwargs):
+        raise ValueError("synthetic unrelated error")
+
+    monkeypatch.setattr(runner, "_revision_metrics", unrelated_error)
+    with pytest.raises(ValueError, match="^synthetic unrelated error$"):
+        runner.evaluate_live_case(inputs["case"], hy3_service=_SyntheticRevisionMetricsService(inputs))
+
+
+def test_revision_metrics_fail_closed_failed_jsonl_cannot_complete_revision_gates(tmp_path, monkeypatch):
+    inputs, sources = _revision_metrics_fixture()
+    uncertain, _ = _revision_metrics_fixture(after_a="Sensor A measured 21 units.", severe_after=("a",))
+    runner = _isolate_revision_metrics_evaluation(monkeypatch, inputs, sources)
+    path, report_path = tmp_path / "results.jsonl", tmp_path / "report.md"
+    freeze_path = tmp_path / "freeze.json"
+    freeze_path.write_text(json.dumps(_report_freeze(VERSIONS.code_version)), encoding="utf-8")
+    monkeypatch.setattr(build_report_module, "DEFAULT_FREEZE_PATH", freeze_path)
+    cases = [EvaluationCase(case_id=f"revision:synthetic-{i}:bad", run_index=0, payload=inputs["case"].payload) for i in range(5)]
+    services = {case.case_id: _SyntheticRevisionMetricsService(uncertain if i == 4 else inputs) for i, case in enumerate(cases)}
+    runner.run_cases(mode="final", cases=cases, output_path=path, versions=VERSIONS,
+                     evaluate=lambda case: runner.evaluate_live_case(case, hy3_service=services[case.case_id]))
+    records = _read_jsonl(path)
+    assert records[-1]["status"] == "failed"
+    assert records[-1]["error_code"] == "EVALUATION_FAILED"
+    assert records[-1]["provider_calls"] == 4
+    assert records[-1]["usage"] == {"prompt_tokens": 400, "completion_tokens": 160, "total_tokens": 560}
+    assert records[-1]["metrics"] == {}
+    summary = build_report(input_path=path, output_path=report_path)
+    assert summary["revisions"]["completed"] == 4
+    assert summary["status_counts"] == {"failed": 1, "succeeded": 4}
+    assert summary["provider_calls_known"] == 20
+    assert summary["usage"]["total_tokens"] == 2800
+    for name in ("revision_error_resolution", "revision_new_severe_errors", "revision_irrelevant_change_rate"):
+        assert summary["acceptance_gates"]["gates"][name]["status"] == "not_available"
+    before = path.read_bytes()
+    runner.run_cases(mode="final", cases=cases, output_path=path, versions=VERSIONS,
+                     evaluate=lambda _: pytest.fail("completed_failure_replayed_provider"))
+    assert path.read_bytes() == before
+    assert build_report(input_path=path, output_path=tmp_path / "rebuilt.md") == summary
+    assert (tmp_path / "rebuilt.md").read_bytes() == report_path.read_bytes()
+    persisted = path.read_text(encoding="utf-8") + report_path.read_text(encoding="utf-8")
+    for private in ("SYNTHETIC_PRIVATE_REASON", "Sensor A measured", "Sensor B measured", "candidate_quote", "replacement_text"):
+        assert private not in persisted
+
+
+def _revision_evidence_reanchor_fixture(*, rebuild_and_reorder=False):
+    import eval.run_eval as runner
+
+    inputs, sources = _revision_metrics_fixture(
+        after_a="Sensor A measured 20 units.", after_b="Sensor A measured 10 units.",
+        severe_after=("a",),
+    )
+    sources[1].text = sources[0].text
+    for stage in ("before", "after"):
+        bundle = inputs[f"{stage}_bundle"]
+        bundle.claims[1].text = sources[0].text
+        bundle.claims[1].candidate_quote = sources[0].text
+        if stage == "after":
+            bundle.claims[0].candidate_block_ids = [sources[1].block_id]
+        judgments = inputs[f"{stage}_result"].semantic_judgments
+        for index, (claim, judgment) in enumerate(zip(bundle.claims, judgments)):
+            if stage == "after":
+                claim.claim_id = f"fresh-claim-{index}" if rebuild_and_reorder else inputs["before_bundle"].claims[index].claim_id
+                judgment.claim_id = claim.claim_id
+            judgment.block_id = claim.candidate_block_ids[0]
+        sentence = runner._find_sentence(bundle, "synthetic-target")
+        sentence.text = " ".join(claim.text for claim in bundle.claims)
+        if stage == "after":
+            sentence.text = "In this synthetic test, " + sentence.text
+        evidence, _ = AuditService().quick_check(bundle, sources)
+        inputs[f"{stage}_evidence"] = evidence
+        assert all(record.quote_verified for record in evidence)
+        assert {(record.claim_id, record.block_id) for record in evidence} == {
+            (judgment.claim_id, judgment.block_id) for judgment in judgments
+        }
+    before_a, after_a = inputs["before_bundle"].claims[0], inputs["after_bundle"].claims[0]
+    assert (before_a.text, before_a.qualifiers, before_a.numeric_entities) == (
+        after_a.text, after_a.qualifiers, after_a.numeric_entities,
+    )
+    assert inputs["before_evidence"][0].block_id != inputs["after_evidence"][0].block_id
+    assert inputs["before_evidence"][0].quote == inputs["after_evidence"][0].quote == inputs["before_evidence"][1].quote
+    assert inputs["before_evidence"][1].rule_flags == []
+    inputs["mutation"]["replacement_text"] = runner._find_sentence(inputs["before_bundle"], "synthetic-target").text
+    if rebuild_and_reorder:
+        for stage in ("before", "after"):
+            inputs[f"{stage}_bundle"].claims.reverse()
+            inputs[f"{stage}_evidence"].reverse()
+            inputs[f"{stage}_result"].semantic_judgments.reverse()
+    return inputs, sources
+
+
+@pytest.mark.parametrize("rebuild_and_reorder", [False, True])
+def test_revision_metrics_fail_closed_evidence_reanchor_is_indeterminate(rebuild_and_reorder):
+    import eval.run_eval as runner
+
+    inputs, _ = _revision_evidence_reanchor_fixture(rebuild_and_reorder=rebuild_and_reorder)
+    with pytest.raises(ValueError, match="^EVALUATION_FAILED$"):
+        runner._revision_metrics(**inputs)
+
+
+def test_revision_metrics_fail_closed_evidence_reanchor_preserves_four_observed_calls(monkeypatch):
+    inputs, sources = _revision_evidence_reanchor_fixture(rebuild_and_reorder=True)
+    runner = _isolate_revision_metrics_evaluation(monkeypatch, inputs, sources)
+    service = _SyntheticRevisionMetricsService(inputs)
+    with pytest.raises(EvaluationCaseError) as raised:
+        runner.evaluate_live_case(inputs["case"], hy3_service=service)
+    assert raised.value.status == "failed"
+    assert str(raised.value) == raised.value.error_code == "EVALUATION_FAILED"
+    assert raised.value.provider_calls == 4
+    assert raised.value.usage == {"prompt_tokens": 400, "completion_tokens": 160, "total_tokens": 560}
+    assert service.calls == ["deep_audit", "revision", "sentence_claims", "deep_audit"]
+
+
+def test_revision_metrics_fail_closed_evidence_reanchor_does_not_merge_by_quote_alone():
+    from backend.app.models import Relation, Severity
+    import eval.run_eval as runner
+
+    inputs, sources = _revision_evidence_reanchor_fixture()
+    # Keep the old problem on X and introduce an independent numeric error on Y.
+    inputs["after_bundle"].claims[0].candidate_block_ids = [sources[0].block_id]
+    inputs["after_result"].semantic_judgments[0].block_id = sources[0].block_id
+    inputs["after_bundle"].claims[1].text = "Sensor A measured 40 units."
+    inputs["after_result"].semantic_judgments[1].relation = Relation.CONTRADICTS
+    inputs["after_result"].semantic_judgments[1].severity = Severity.CRITICAL
+    runner._find_sentence(inputs["after_bundle"], "synthetic-target").text = " ".join(
+        claim.text for claim in inputs["after_bundle"].claims
+    )
+    inputs["after_evidence"], _ = AuditService().quick_check(inputs["after_bundle"], sources)
+    assert runner._revision_metrics(**inputs)["new_severe_error_count"] == 1
+
+
+def test_revision_metrics_fail_closed_evidence_reanchor_jsonl_cannot_complete_gates(tmp_path, monkeypatch):
+    from backend.app.models import Relation, Severity
+
+    uncertain, sources = _revision_evidence_reanchor_fixture()
+    repaired = copy.deepcopy(uncertain)
+    repaired["after_bundle"].claims[0].text = sources[0].text
+    repaired["after_result"].semantic_judgments[0].relation = Relation.SUPPORTS
+    repaired["after_result"].semantic_judgments[0].severity = Severity.NONE
+    runner = _isolate_revision_metrics_evaluation(monkeypatch, uncertain, sources)
+    runner._find_sentence(repaired["after_bundle"], "synthetic-target").text = " ".join(
+        claim.text for claim in repaired["after_bundle"].claims
+    )
+    path, output = tmp_path / "reanchor.jsonl", tmp_path / "reanchor.md"
+    freeze_path = tmp_path / "freeze.json"
+    freeze_path.write_text(json.dumps(_report_freeze(VERSIONS.code_version)), encoding="utf-8")
+    monkeypatch.setattr(build_report_module, "DEFAULT_FREEZE_PATH", freeze_path)
+    cases = [EvaluationCase(case_id=f"revision:reanchor-{i}:bad", run_index=0, payload=uncertain["case"].payload) for i in range(5)]
+    services = {case.case_id: _SyntheticRevisionMetricsService(uncertain if i == 4 else repaired) for i, case in enumerate(cases)}
+    runner.run_cases(mode="final", cases=cases, output_path=path, versions=VERSIONS,
+                     evaluate=lambda case: runner.evaluate_live_case(case, hy3_service=services[case.case_id]))
+    records = _read_jsonl(path)
+    failed = records[-1]
+    assert (failed["status"], failed["error_code"], failed["metrics"]) == ("failed", "EVALUATION_FAILED", {})
+    assert failed["provider_calls"] == 4
+    assert failed["usage"] == {"prompt_tokens": 400, "completion_tokens": 160, "total_tokens": 560}
+    summary = build_report(input_path=path, output_path=output)
+    assert summary["status_counts"] == {"failed": 1, "succeeded": 4}
+    assert summary["revisions"]["completed"] == 4
+    assert summary["provider_calls_known"] == 20
+    assert summary["usage"]["total_tokens"] == 2800
+    for gate in ("revision_error_resolution", "revision_new_severe_errors", "revision_irrelevant_change_rate"):
+        assert summary["acceptance_gates"]["gates"][gate]["status"] == "not_available"
+    before = path.read_bytes()
+    runner.run_cases(mode="final", cases=cases, output_path=path, versions=VERSIONS,
+                     evaluate=lambda _: pytest.fail("reanchor_failure_replayed_provider"))
+    assert path.read_bytes() == before
+    assert build_report(input_path=path, output_path=tmp_path / "rebuilt.md") == summary
+    assert (tmp_path / "rebuilt.md").read_bytes() == output.read_bytes()
+    persisted = path.read_text(encoding="utf-8") + output.read_text(encoding="utf-8")
+    for private in ("Sensor A measured", "In this synthetic test", "SYNTHETIC_PRIVATE_REASON", "candidate_quote", "replacement_text"):
+        assert private not in persisted
 
 
 def test_live_evaluator_revision_runs_four_logical_steps_and_reports_revision_metrics() -> None:
