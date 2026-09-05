@@ -98,7 +98,7 @@ _HY3_INPUT_CNY_PER_MILLION_TOKENS = 1.0
 _HY3_OUTPUT_CNY_PER_MILLION_TOKENS = 4.0
 _EVALUATION_LOCK_TIMEOUT_SECONDS = 3600.0
 _EVALUATION_LOCK_POLL_SECONDS = 0.05
-FREEZE_VERSION = "paperlens-stage7-freeze-v1"
+FREEZE_VERSION = "paperlens-stage7-freeze-v2"
 STAGE7_ACCEPTANCE_TARGETS = {
     "quality_strict_order_min": 4,
     "quality_pairwise_min": 13,
@@ -2205,6 +2205,13 @@ def _freeze_payload() -> dict[str, Any]:
         "data_version": manifest["data_version"],
         "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
         "model": settings.hy3_model,
+        "provider_config": {
+            "base_url_sha256": hashlib.sha256(
+                settings.hy3_base_url.encode("utf-8")
+            ).hexdigest(),
+            "timeout_seconds": settings.hy3_timeout_seconds,
+            "max_retries": settings.hy3_max_retries,
+        },
         "prompt_versions": {
             "deep_audit": DEEP_AUDIT_PROMPT_VERSION,
             "revision": REVISION_PROMPT_VERSION,

@@ -2982,6 +2982,237 @@ def test_stage7_freeze_payload_tracks_audit_v5_without_schema_change() -> None:
     assert payload["schema_versions"]["deep_audit"] == "deep-audit-result-v2"
 
 
+class _FrozenRuntimeConfigService:
+    def __init__(self) -> None:
+        self.settings = SimpleNamespace(
+            hy3_model="hy3",
+            hy3_base_url="https://offline.invalid/\u5408\u6210/v1",
+            hy3_timeout_seconds=120,
+            hy3_max_retries=2,
+            paperlens_model_mode="mock",
+            hy3_api_key="PRIVATE_KEY_MUST_NOT_BE_FROZEN",
+            unrelated_private_setting="PRIVATE_SETTINGS_MUST_NOT_BE_FROZEN",
+        )
+        self.provider_calls = 0
+
+    def deep_audit(self, **_kwargs):
+        self.provider_calls += 1
+        pytest.fail("frozen_runtime_config_reached_provider")
+
+
+def _frozen_runtime_config_setup(tmp_path: Path, monkeypatch):
+    import eval.run_eval as runner
+
+    service = _FrozenRuntimeConfigService()
+    freeze_path = tmp_path / "stage7_frozen_config.json"
+    monkeypatch.setattr(runner, "Hy3Service", lambda: service)
+    monkeypatch.setattr(runner, "DEFAULT_FREEZE_PATH", freeze_path)
+    frozen = runner.freeze_configuration(output_path=freeze_path)
+    return runner, service, freeze_path, frozen
+
+
+@pytest.mark.parametrize(
+    "setting_name, changed_value",
+    [
+        ("hy3_base_url", "https://changed.invalid/v1"),
+        ("hy3_timeout_seconds", 121),
+        ("hy3_max_retries", 1),
+    ],
+)
+def test_frozen_runtime_config_payload_tracks_each_provider_setting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    setting_name: str,
+    changed_value: object,
+) -> None:
+    runner, service, _, frozen = _frozen_runtime_config_setup(tmp_path, monkeypatch)
+    expected_url_hash = hashlib.sha256(
+        service.settings.hy3_base_url.encode("utf-8")
+    ).hexdigest()
+
+    assert frozen["freeze_version"] == "paperlens-stage7-freeze-v2"
+    assert frozen["provider_config"] == {
+        "base_url_sha256": expected_url_hash,
+        "timeout_seconds": 120,
+        "max_retries": 2,
+    }
+    setattr(service.settings, setting_name, changed_value)
+    assert runner._freeze_payload()["provider_config"] != frozen["provider_config"]
+
+    serialized = json.dumps(frozen, ensure_ascii=False).casefold()
+    assert service.settings.hy3_base_url.casefold() not in serialized
+    assert "private_key_must_not_be_frozen" not in serialized
+    assert "private_settings_must_not_be_frozen" not in serialized
+    assert "api_key" not in serialized
+    assert service.provider_calls == 0
+
+
+@pytest.mark.parametrize(
+    "setting_name, changed_value",
+    [
+        ("hy3_base_url", "https://changed.invalid/v1"),
+        ("hy3_timeout_seconds", 121),
+        ("hy3_max_retries", 1),
+    ],
+)
+def test_frozen_runtime_config_drift_is_rejected_without_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    setting_name: str,
+    changed_value: object,
+) -> None:
+    runner, service, freeze_path, _ = _frozen_runtime_config_setup(
+        tmp_path, monkeypatch
+    )
+    frozen_before = freeze_path.read_bytes()
+    setattr(service.settings, setting_name, changed_value)
+
+    with pytest.raises(ValueError, match="^CONFIG_DRIFT$"):
+        runner._require_frozen_configuration()
+    with pytest.raises(ValueError, match="^CONFIG_DRIFT$"):
+        runner.freeze_configuration(output_path=freeze_path)
+
+    assert freeze_path.read_bytes() == frozen_before
+    assert service.provider_calls == 0
+
+
+@pytest.mark.parametrize("mode", ["final", "stability"])
+@pytest.mark.parametrize(
+    "setting_name, changed_value",
+    [
+        ("hy3_base_url", "https://changed.invalid/v1"),
+        ("hy3_timeout_seconds", 121),
+        ("hy3_max_retries", 1),
+    ],
+)
+def test_frozen_runtime_config_cli_refuses_drift_before_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mode: str,
+    setting_name: str,
+    changed_value: object,
+) -> None:
+    runner, service, freeze_path, _ = _frozen_runtime_config_setup(
+        tmp_path, monkeypatch
+    )
+    frozen_before = freeze_path.read_bytes()
+    output_path = tmp_path / f"{mode}_results.jsonl"
+    setattr(service.settings, setting_name, changed_value)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_eval.py",
+            "--mode",
+            mode,
+            "--confirm-cost",
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    assert runner.main() == 2
+    assert capsys.readouterr().out == "EVAL_REFUSED=CONFIG_DRIFT\n"
+    assert service.provider_calls == 0
+    assert not output_path.exists()
+    assert not pending_path_for(output_path).exists()
+    assert not (tmp_path / f"{mode}_report.md").exists()
+    assert freeze_path.read_bytes() == frozen_before
+
+
+def test_frozen_runtime_config_accepts_same_settings_and_keeps_model_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, service, freeze_path, frozen = _frozen_runtime_config_setup(
+        tmp_path, monkeypatch
+    )
+    frozen_before = freeze_path.read_bytes()
+
+    assert runner._require_frozen_configuration() == frozen
+    assert runner.freeze_configuration(output_path=freeze_path) == frozen
+    assert freeze_path.read_bytes() == frozen_before
+
+    service.settings.hy3_model = "changed-model"
+    with pytest.raises(ValueError, match="^CONFIG_DRIFT$"):
+        runner._require_frozen_configuration()
+    assert freeze_path.read_bytes() == frozen_before
+    assert service.provider_calls == 0
+
+
+@pytest.mark.parametrize("damage", ["legacy_v1", "missing_provider_config"])
+def test_frozen_runtime_config_rejects_legacy_or_incomplete_freeze(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+) -> None:
+    runner, service, freeze_path, frozen = _frozen_runtime_config_setup(
+        tmp_path, monkeypatch
+    )
+    damaged = copy.deepcopy(frozen)
+    if damage == "legacy_v1":
+        damaged["freeze_version"] = "paperlens-stage7-freeze-v1"
+    else:
+        damaged.pop("provider_config")
+    freeze_path.write_text(
+        json.dumps(damaged, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    damaged_before = freeze_path.read_bytes()
+
+    with pytest.raises(ValueError, match="^CONFIG_DRIFT$"):
+        runner._require_frozen_configuration()
+
+    assert freeze_path.read_bytes() == damaged_before
+    assert service.provider_calls == 0
+
+
+def test_frozen_runtime_config_excludes_mode_and_keeps_cost_live_gates_independent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner, service, _, frozen = _frozen_runtime_config_setup(tmp_path, monkeypatch)
+    service.settings.paperlens_model_mode = "live"
+    assert runner._freeze_payload() == {
+        key: value for key, value in frozen.items() if key != "created_at"
+    }
+    runner._require_frozen_configuration()
+
+    output_path = tmp_path / "final_results.jsonl"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_eval.py", "--mode", "final", "--output", str(output_path)],
+    )
+    assert runner.main() == 2
+    assert "COST_CONFIRMATION_REQUIRED=True" in capsys.readouterr().out
+    assert not output_path.exists()
+    assert service.provider_calls == 0
+
+    service.settings.paperlens_model_mode = "mock"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_eval.py",
+            "--mode",
+            "final",
+            "--confirm-cost",
+            "--output",
+            str(output_path),
+        ],
+    )
+    assert runner.main() == 2
+    assert "EVAL_REFUSED=LIVE_MODE_REQUIRED" in capsys.readouterr().out
+    assert not output_path.exists()
+    assert not pending_path_for(output_path).exists()
+    assert service.provider_calls == 0
+    assert runner.SUPPORTED_MODES == ("smoke", "calibrate", "final", "stability")
+    assert len(runner.context_diagnostic_cases(_context_diagnostic_setup()[3])) == 9
+
+
 def test_non_smoke_cli_requires_explicit_cost_confirmation(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
