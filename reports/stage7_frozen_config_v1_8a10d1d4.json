@@ -9,11 +9,10 @@
     "revision_error_resolution_min": 0.7,
     "revision_irrelevant_change_rate_max": 0.05,
     "revision_new_severe_errors_max": 0,
-    "severe_error_detection_min": 0.9,
     "stability_dimension_consistency_min": 0.8,
     "stability_mean_score_sd_max": 5.0
   },
-  "code_version": "workspace-content-cde6d03f956f5471c041ea3d2734768c0c3099cc80716bfde3c0be07bf05f989",
+  "code_version": "workspace-content-aeb08971985daa5907ee8740e9e37f351249278aa6d22370aa170429003f94be",
   "core_dimension_gates": {
     "citation_completeness": 3,
     "citation_correctness": 3,
@@ -24,7 +23,7 @@
     "risk_compliance": 3,
     "terminology": 2
   },
-  "created_at": "2026-09-05T05:26:06.135178+00:00",
+  "created_at": "2026-09-03T02:50:52.004712+00:00",
   "data_version": "paperlens-plos-abstracts-v1",
   "dimension_weights": {
     "citation_completeness": 0.15,
@@ -36,20 +35,15 @@
     "risk_compliance": 0.05,
     "terminology": 0.07
   },
-  "freeze_version": "paperlens-stage7-freeze-v2",
-  "manifest_sha256": "3ecadba738b409915f92084f7ac21524ce3f702c083da35f99930b12c40a5058",
+  "freeze_version": "paperlens-stage7-freeze-v1",
+  "manifest_sha256": "4e3bc322a3381338e27419086abfed9f75548b00f14fea7c74b6cb54e929f0c9",
   "manifest_version": "paperlens-live-manifest-v1",
   "model": "hy3",
   "overall_score_threshold": 75,
   "prompt_versions": {
-    "deep_audit": "audit-v5",
+    "deep_audit": "audit-v2",
     "revision": "revision-v2",
     "sentence_claims": "sentence-claims-v2"
-  },
-  "provider_config": {
-    "base_url_sha256": "55d8daa779c2677950284ca29b3592b00ba33aa642800c819b5a63f23675965d",
-    "max_retries": 2,
-    "timeout_seconds": 120
   },
   "schema_versions": {
     "deep_audit": "deep-audit-result-v2",
