@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -21,6 +22,7 @@ from eval.run_eval import (
     validate_context_diagnostic_record,
     DEFAULT_FREEZE_PATH,
     FREEZE_VERSION,
+    load_mode_cases,
     RESULT_VERSION,
     STAGE7_ACCEPTANCE_TARGETS,
 )
@@ -175,6 +177,7 @@ def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
             citation=citation,
             attacks=attacks,
             stability=stability,
+            stability_coverage_complete=_stability_coverage_complete(records),
             revisions=revisions,
             freeze=freeze,
         ),
@@ -309,6 +312,10 @@ def _summarize_sample_scale(records: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         counts[group] += 1
         if group == "quality":
+            paper_match = re.fullmatch(r"quality:([^:]+):(good|medium|bad)", record["case_id"])
+            if paper_match:
+                ids[group].add(paper_match.group(1))
+                continue
             ids[group].add(
                 metrics.get("paper_id")
                 if isinstance(metrics, dict) and isinstance(metrics.get("paper_id"), str)
@@ -1053,6 +1060,59 @@ def _summarize_stability(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _stability_coverage_complete(records: list[dict[str, Any]]) -> bool:
+    relevant = [
+        record for record in records
+        if record.get("mode") == "stability"
+        or (isinstance(record.get("metrics"), dict)
+            and record["metrics"].get("case_group") == "stability")
+    ]
+    if not any(record.get("mode") == "stability" for record in relevant):
+        return False
+    # A current plan must not be assumed to describe an unidentifiable old batch.
+    try:
+        frozen = json.loads(DEFAULT_FREEZE_PATH.read_text(encoding="utf-8"))
+        manifest_bytes = (_PROJECT_ROOT / "eval" / "live_cases.json").read_bytes()
+        manifest = json.loads(manifest_bytes)
+    except (OSError, ValueError):
+        return False
+    if (
+        not isinstance(frozen, dict) or not isinstance(manifest, dict)
+        or frozen.get("manifest_sha256") != hashlib.sha256(manifest_bytes).hexdigest()
+        or not isinstance(manifest.get("data_version"), str)
+        or not manifest["data_version"]
+        or frozen.get("data_version") != manifest["data_version"]
+    ):
+        return False
+    cases = load_mode_cases("stability")
+    expected = {(case.case_id, case.run_index): case.payload["stability_output_id"] for case in cases}
+    outputs = set(expected.values())
+    if len(expected) != 36 or len(outputs) != 12:
+        raise ValueError("invalid stability plan")
+    if outputs != set(manifest.get("stability_case_refs", [])):
+        return False
+    by_key = {}
+    for record in relevant:
+        key = (record["case_id"], record["run_index"])
+        if key in by_key:
+            raise ValueError("duplicate stability result key")
+        by_key[key] = record
+    if by_key.keys() != expected.keys():
+        return False
+    dimensions = {dimension.value for dimension in DIMENSION_WEIGHTS}
+    for key, record in by_key.items():
+        metrics = _succeeded_metrics(record)
+        if (
+            record["mode"] != "stability" or metrics is None
+            or record["data_version"] != manifest["data_version"]
+            or metrics.get("case_group") != "stability"
+            or metrics.get("stability_output_id") != expected[key]
+            or set(metrics.get("dimension_points", {})) != dimensions
+        ):
+            return False
+    return True
+
+
 def _summarize_revisions(records: list[dict[str, Any]]) -> dict[str, Any]:
     completed = 0
     known_issue_total = 0
@@ -1107,6 +1167,7 @@ def _summarize_acceptance_gates(
     citation: dict[str, Any],
     attacks: dict[str, Any],
     stability: dict[str, Any],
+    stability_coverage_complete: bool,
     revisions: dict[str, Any],
     freeze: dict[str, Any],
 ) -> dict[str, Any]:
@@ -1185,14 +1246,14 @@ def _summarize_acceptance_gates(
         "stability_mean_score_sd": _acceptance_gate(
             observed=stability["mean_score_standard_deviation"],
             target=targets["stability_mean_score_sd_max"],
-            available=stability["output_count"] >= 12 and stability["run_count"] >= 36,
+            available=stability_coverage_complete,
             denominator=36,
             operator="<=",
         ),
         "stability_dimension_consistency": _acceptance_gate(
             observed=stability["dimension_level_consistency_rate"],
             target=targets["stability_dimension_consistency_min"],
-            available=stability["output_count"] >= 12 and stability["run_count"] >= 36,
+            available=stability_coverage_complete,
             denominator=36,
             operator=">=",
         ),

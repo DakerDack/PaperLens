@@ -1571,6 +1571,333 @@ def test_smoke_report_rebuilds_quality_attack_and_stability_metrics(
     assert "Stability fixed outputs: 2" in report
 
 
+def _quality_paper_count_identity_records(paper_ids, failed_indexes=()):
+    records = []
+    for paper_id in paper_ids:
+        for label, score in (("good", 90), ("medium", 60), ("bad", 30)):
+            record = _existing_result()
+            record.update(case_id=f"quality:{paper_id}:{label}", mode="final", metrics={
+                "case_group": "quality", "paper_id": paper_id,
+                "quality_label": label, "overall_score": score,
+            })
+            if len(records) in failed_indexes:
+                record.update(status="failed", error_code="EVALUATION_FAILED", metrics={})
+            records.append(record)
+    return records
+
+
+@pytest.mark.parametrize(("paper_count", "failed_indexes"), [
+    (5, (14,)), (1, (2,)), (1, (0, 1, 2)), (5, tuple(range(15))), (5, ()),
+])
+def test_quality_paper_count_identity_counts_rows_without_double_counting_papers(paper_count, failed_indexes):
+    records = _quality_paper_count_identity_records(
+        [f"synthetic-paper-{index:02d}" for index in range(paper_count)], failed_indexes,
+    )
+    original = copy.deepcopy(records)
+    scale = build_report_module._summarize_sample_scale(records)
+    assert scale["quality_records"] == paper_count * 3
+    assert scale["quality_paper_count"] == paper_count
+    assert build_report_module._summarize_sample_scale(list(reversed(records))) == scale
+    assert records == original
+
+
+@pytest.mark.parametrize(("status", "error_code"), [
+    ("failed", "EVALUATION_FAILED"), ("failed", "RUN_INTERRUPTED"),
+    ("timeout", "TIMEOUT"), ("unsupported", "UNSUPPORTED_CASE"),
+])
+@pytest.mark.parametrize("failure_metrics", [None, {}, {"case_group": "quality"}])
+def test_quality_paper_count_identity_non_success_uses_the_same_paper(status, error_code, failure_metrics):
+    records = _quality_paper_count_identity_records(["synthetic-long-paper-id"], (2,))
+    records[-1].update(status=status, error_code=error_code, metrics=copy.deepcopy(failure_metrics))
+    scale = build_report_module._summarize_sample_scale(records)
+    assert scale["quality_records"] == 3
+    assert scale["quality_paper_count"] == 1
+
+
+def test_quality_paper_count_identity_preserves_distinct_hyphenated_ids():
+    paper_ids = ["synthetic-paper-a", "synthetic-paper-a-1", "synthetic-paper-a-10", "synthetic-paper-b-long-suffix"]
+    records = _quality_paper_count_identity_records(paper_ids, (2, 4, 8, 11))
+    scale = build_report_module._summarize_sample_scale(records)
+    assert scale["quality_records"] == 12
+    assert scale["quality_paper_count"] == 4
+
+
+def test_quality_paper_count_identity_keeps_smoke_and_other_groups():
+    smoke = []
+    for case in load_mode_cases("smoke"):
+        record = _existing_result()
+        record.update(case_id=case.case_id, run_index=case.run_index,
+                      metrics=evaluate_smoke_case(case)["metrics"])
+        smoke.append(record)
+    assert build_report_module._summarize_sample_scale(smoke) == {
+        "quality_records": 3, "quality_paper_count": 1,
+        "attack_records": 4, "attack_pair_id_count": 4, "revision_records": 0,
+        "stability_records": 4, "stability_output_count": 2,
+    }
+    others = [record for record in smoke if record["metrics"]["case_group"] != "quality"]
+    others.append({**_existing_result(), "case_id": "revision:synthetic-paper:bad",
+                   "status": "failed", "error_code": "RUN_INTERRUPTED", "metrics": {}})
+    original = build_report_module._summarize_sample_scale(others)
+    mixed = build_report_module._summarize_sample_scale(
+        others + _quality_paper_count_identity_records(["synthetic-paper"], (2,))
+    )
+    assert {key: value for key, value in mixed.items() if not key.startswith("quality_")} == {
+        key: value for key, value in original.items() if not key.startswith("quality_")
+    }
+    assert mixed["quality_records"] == 3
+    assert mixed["quality_paper_count"] == 1
+
+
+def test_quality_paper_count_identity_preserves_supported_legacy_format():
+    records = _quality_paper_count_identity_records(["synthetic-legacy-paper"])
+    for index, record in enumerate(records):
+        record["case_id"] = f"legacy-quality-output-{index}"
+    records[-1].update(status="failed", error_code="EVALUATION_FAILED")
+    scale = build_report_module._summarize_sample_scale(records)
+    assert scale["quality_records"] == 3
+    assert scale["quality_paper_count"] == 1
+
+
+def test_quality_paper_count_identity_jsonl_report_and_other_metrics_are_unchanged(tmp_path, monkeypatch):
+    records = _quality_paper_count_identity_records([f"synthetic-paper-{i}" for i in range(5)], (14,))
+    freeze_path = tmp_path / "freeze.json"
+    freeze_path.write_text(json.dumps(_report_freeze(VERSIONS.code_version)), encoding="utf-8")
+    monkeypatch.setattr(build_report_module, "DEFAULT_FREEZE_PATH", freeze_path)
+    # Demonstrate that sample scale does not drive any other metric or gate.
+    with monkeypatch.context() as isolated:
+        isolated.setattr(build_report_module, "_summarize_sample_scale", lambda _: {"sentinel": 999})
+        unrelated_summary = summarize_results(records)
+    unrelated_summary.pop("sample_scale")
+    path, output = tmp_path / "quality.jsonl", tmp_path / "quality.md"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    original = path.read_bytes()
+    assert build_report_module.load_results(path) == records
+    summary = build_report(input_path=path, output_path=output)
+    assert summary["sample_scale"]["quality_records"] == 15
+    assert summary["sample_scale"]["quality_paper_count"] == 5
+    assert {key: value for key, value in summary.items() if key != "sample_scale"} == unrelated_summary
+    assert summary["attempted"] == 15
+    assert summary["status_counts"] == {"failed": 1, "succeeded": 14}
+    assert summary["provider_calls_known"] == 15
+    assert summary["usage"] == {"prompt_tokens": 150, "completion_tokens": 60, "total_tokens": 210}
+    assert summary["quality"]["complete_groups"] == 4
+    assert summary["quality"]["pairwise_total"] == 12
+    assert "Quality records/papers: 15/5" in output.read_text(encoding="utf-8")
+    assert build_report(input_path=path, output_path=tmp_path / "rebuilt.md") == summary
+    assert (tmp_path / "rebuilt.md").read_bytes() == output.read_bytes()
+    assert path.read_bytes() == original
+
+
+def test_quality_paper_count_identity_keeps_malformed_record_rejection(tmp_path, monkeypatch):
+    records = _quality_paper_count_identity_records(["synthetic-paper"])
+    records[0]["metrics"]["quality_label"] = "invalid-label"
+    monkeypatch.setattr(build_report_module, "DEFAULT_FREEZE_PATH", tmp_path / "absent.json")
+    path, output = tmp_path / "invalid.jsonl", tmp_path / "invalid.md"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    original = path.read_bytes()
+    with pytest.raises(ValueError, match="quality_label must be good, medium, or bad"):
+        build_report(input_path=path, output_path=output)
+    assert not output.exists()
+    assert path.read_bytes() == original
+
+
+def _stability_coverage_contract_fixture(tmp_path: Path, monkeypatch):
+    manifest_path = Path(__file__).resolve().parents[1] / "eval" / "live_cases.json"
+    manifest_bytes = manifest_path.read_bytes()
+    data_version = json.loads(manifest_bytes)["data_version"]
+    freeze = _report_freeze(VERSIONS.code_version)
+    freeze.update(data_version=data_version, manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest())
+    freeze_path = tmp_path / "freeze.json"
+    freeze_path.write_text(json.dumps(freeze), encoding="utf-8")
+    monkeypatch.setattr(build_report_module, "DEFAULT_FREEZE_PATH", freeze_path)
+    records = []
+    # Reuse the formal plan; all measured values below are synthetic, not Live results.
+    for case in load_mode_cases("stability"):
+        record = _existing_result()
+        record.update(case_id=case.case_id, run_index=case.run_index,
+                      mode="stability", data_version=data_version)
+        record["metrics"] = {
+            "case_group": "stability",
+            "stability_output_id": case.payload["stability_output_id"],
+            "overall_score": 80.0,
+            "dimension_points": {dimension.value: 4 for dimension in build_report_module.DIMENSION_WEIGHTS},
+        }
+        records.append(record)
+    assert len(records) == 36
+    assert len({record["case_id"] for record in records}) == 12
+    return records, freeze_path
+
+
+def _assert_stability_coverage_contract_gates(summary, *, complete):
+    assert summary["acceptance_gates"]["target_source"] == "frozen"
+    for name, observed, target in (
+        ("stability_mean_score_sd", 0.0, 5.0),
+        ("stability_dimension_consistency", 1.0, 0.80),
+    ):
+        gate = summary["acceptance_gates"]["gates"][name]
+        assert gate["target"] == target
+        assert gate["status"] == ("passed" if complete else "not_available")
+        assert gate["observed"] == (observed if complete else None)
+
+
+@pytest.mark.parametrize("variant", [
+    "complete", "two_plus_four", "missing", "wrong_run_indices", "extra_run",
+    "non_plan_output", "wrong_output_owner", "wrong_case_owner", "smoke_slot",
+    "extra_smoke", "wrong_group", "incomplete_dimensions",
+])
+def test_stability_coverage_contract_requires_each_planned_slot(tmp_path, monkeypatch, variant):
+    records, _ = _stability_coverage_contract_fixture(tmp_path, monkeypatch)
+    if variant == "two_plus_four":
+        records[2] = copy.deepcopy(records[3])
+        records[2]["run_index"] = 3
+    elif variant == "missing":
+        records.pop()
+    elif variant == "wrong_run_indices":
+        for record in records:
+            if record["run_index"] == 2:
+                record["run_index"] = 3
+    elif variant == "extra_run":
+        extra = copy.deepcopy(records[0])
+        extra["run_index"] = 3
+        records.append(extra)
+    elif variant == "non_plan_output":
+        for record in records[:3]:
+            record["case_id"] = "stability:synthetic-unplanned"
+            record["metrics"]["stability_output_id"] = "synthetic-unplanned"
+    elif variant == "wrong_output_owner":
+        first, last = records[0]["metrics"], records[-1]["metrics"]
+        first["stability_output_id"], last["stability_output_id"] = last["stability_output_id"], first["stability_output_id"]
+    elif variant == "wrong_case_owner":
+        records[0]["case_id"] = "stability:synthetic-unplanned"
+    elif variant == "smoke_slot":
+        records[0]["mode"] = "smoke"
+    elif variant == "extra_smoke":
+        extra = copy.deepcopy(records[0])
+        extra.update(case_id="synthetic-smoke-extra", mode="smoke")
+        records.append(extra)
+    elif variant == "wrong_group":
+        records[0]["metrics"]["case_group"] = "synthetic-other-group"
+    elif variant == "incomplete_dimensions":
+        for record in records:
+            record["metrics"]["dimension_points"].pop("factual_consistency")
+    assert len({(record["case_id"], record["run_index"]) for record in records}) == len(records)
+    summary = summarize_results(records)
+    if variant == "two_plus_four":
+        assert summary["stability"]["output_count"] == 12
+        assert summary["stability"]["run_count"] == 36
+        assert sorted(sum(record["case_id"] == case_id for record in records)
+                      for case_id in {record["case_id"] for record in records}) == [2] + [3] * 10 + [4]
+    _assert_stability_coverage_contract_gates(summary, complete=variant == "complete")
+
+
+@pytest.mark.parametrize(("status", "error_code"), [
+    ("failed", "PROVIDER_FAILED"), ("timeout", "TIMEOUT"),
+    ("unsupported", "UNSUPPORTED"), ("failed", "RUN_INTERRUPTED"),
+])
+def test_stability_coverage_contract_failed_slot_cannot_be_replaced(tmp_path, monkeypatch, status, error_code):
+    records, _ = _stability_coverage_contract_fixture(tmp_path, monkeypatch)
+    records[0].update(status=status, error_code=error_code, metrics={}, provider_calls=None)
+    extra = copy.deepcopy(records[-1])
+    extra["run_index"] = 3
+    records.append(extra)
+    summary = summarize_results(records)
+    assert summary["stability"]["run_count"] == 36
+    _assert_stability_coverage_contract_gates(summary, complete=False)
+
+
+@pytest.mark.parametrize("variant", ["data_version", "manifest_hash", "missing_manifest_hash", "missing_data_version"])
+def test_stability_coverage_contract_does_not_guess_historical_plan(tmp_path, monkeypatch, variant):
+    records, freeze_path = _stability_coverage_contract_fixture(tmp_path, monkeypatch)
+    freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+    if variant == "data_version":
+        for record in records:
+            record["data_version"] = "synthetic-historical-data-v0"
+        freeze["data_version"] = "synthetic-historical-data-v0"
+    elif variant == "manifest_hash":
+        freeze["manifest_sha256"] = "0" * 64
+    elif variant == "missing_manifest_hash":
+        freeze.pop("manifest_sha256")
+    else:
+        freeze.pop("data_version")
+    freeze_path.write_text(json.dumps(freeze), encoding="utf-8")
+    _assert_stability_coverage_contract_gates(summarize_results(records), complete=False)
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_stability_coverage_contract_jsonl_report_rebuild(tmp_path, monkeypatch, complete):
+    records, _ = _stability_coverage_contract_fixture(tmp_path, monkeypatch)
+    if not complete:
+        records[2] = copy.deepcopy(records[3])
+        records[2]["run_index"] = 3
+    input_path, report_path = tmp_path / "results.jsonl", tmp_path / "report.md"
+    input_path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    original = input_path.read_bytes()
+    assert build_report_module.load_results(input_path) == records
+    expected = summarize_results(records)
+    summary = build_report(input_path=input_path, output_path=report_path)
+    assert summary == expected == summarize_results(list(reversed(records)))
+    _assert_stability_coverage_contract_gates(summary, complete=complete)
+    rendered = report_path.read_text(encoding="utf-8")
+    for name in ("stability_mean_score_sd", "stability_dimension_consistency"):
+        row = next(line for line in rendered.splitlines() if line.startswith(f"- `{name}`:"))
+        assert ("passed" if complete else "not_available") in row
+    assert build_report(input_path=input_path, output_path=tmp_path / "rebuilt.md") == summary
+    assert (tmp_path / "rebuilt.md").read_bytes() == report_path.read_bytes()
+    assert input_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("variant", ["duplicate", "run_index", "score", "points", "dimension_point"])
+def test_stability_coverage_contract_malformed_records_still_fail(tmp_path, monkeypatch, variant):
+    records, _ = _stability_coverage_contract_fixture(tmp_path, monkeypatch)
+    if variant == "duplicate":
+        records.append(copy.deepcopy(records[0]))
+    elif variant == "run_index":
+        records[0]["run_index"] = True
+    elif variant == "score":
+        records[0]["metrics"]["overall_score"] = "80"
+    elif variant == "points":
+        records[0]["metrics"]["dimension_points"] = {}
+    else:
+        records[0]["metrics"]["dimension_points"]["factual_consistency"] = True
+    path, output = tmp_path / "invalid.jsonl", tmp_path / "invalid.md"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    original = path.read_bytes()
+    with pytest.raises(ValueError):
+        build_report(input_path=path, output_path=output)
+    assert not output.exists()
+    assert path.read_bytes() == original
+
+
+def test_stability_coverage_contract_smoke_remains_descriptive(tmp_path, monkeypatch):
+    monkeypatch.setattr(build_report_module, "DEFAULT_FREEZE_PATH", tmp_path / "absent.json")
+    records = []
+    for case in load_mode_cases("smoke"):
+        if case.payload["case_group"] == "stability":
+            record = _existing_result()
+            record.update(case_id=case.case_id, run_index=case.run_index,
+                          metrics=evaluate_smoke_case(case)["metrics"])
+            records.append(record)
+    path = tmp_path / "smoke.jsonl"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    summary = build_report(input_path=path, output_path=tmp_path / "smoke.md")
+    assert summary["stability"] == {
+        "output_count": 2, "run_count": 4, "mean_score_standard_deviation": 0.0,
+        "maximum_score_range": 0.0, "dimension_level_consistency_rate": 1.0,
+    }
+    for name in ("stability_mean_score_sd", "stability_dimension_consistency"):
+        assert summary["acceptance_gates"]["gates"][name]["status"] == "not_available"
+
+
+def test_stability_coverage_contract_invalid_freeze_is_unchanged(tmp_path, monkeypatch):
+    records, freeze_path = _stability_coverage_contract_fixture(tmp_path, monkeypatch)
+    freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+    freeze["code_version"] = "synthetic-stale-code"
+    freeze_path.write_text(json.dumps(freeze), encoding="utf-8")
+    assert summarize_results(records)["acceptance_gates"] == {
+        "status": "invalid_freeze", "target_source": "invalid", "targets": {}, "gates": {},
+    }
+
+
 def test_build_report_script_runs_from_the_stage_acceptance_command(
     tmp_path: Path,
 ) -> None:
@@ -2588,6 +2915,187 @@ def test_claim_regeneration_failure_preserves_three_calls() -> None:
         "completion_tokens": 120,
         "total_tokens": 420,
     }
+
+
+def _attack_attribution_contract_inputs(*, has_target=True, signal=None, points=None):
+    from backend.app.models import DimensionId, DimensionResult, SemanticJudgment
+    import eval.run_eval as runner
+
+    revision, sources = _revision_metrics_fixture()
+    bundle = revision["after_bundle"]
+    bundle.claims[1].sentence_id = "synthetic-methods"
+    runner._find_sentence(bundle, "synthetic-target").text = bundle.claims[0].text
+    runner._find_sentence(bundle, "synthetic-methods").text = bundle.claims[1].text
+    evidence, _ = AuditService().quick_check(bundle, sources)
+    assert all(record.quote_verified and not record.rule_flags for record in evidence)
+    judgments = [judgment.model_copy(deep=True) for judgment in revision["after_result"].semantic_judgments]
+    non_target = judgments[1].model_dump(mode="json")
+    non_target.update(signal or {})
+    judgments[1] = SemanticJudgment.model_validate(non_target)
+    dimensions = []
+    for dimension in DimensionId:
+        level = (points or {}).get(dimension.value, 4)
+        dimensions.append(DimensionResult(
+            dimension_id=dimension, raw_metrics={"level_points": level}, score=level * 25,
+            level="good" if level == 4 else "acceptable" if level >= 2 else "poor",
+        ))
+    return dict(
+        attack={"target_sentence_id": "synthetic-target" if has_target else "synthetic-absent-target",
+                "attack_type": "numeric_tampering"},
+        bundle=bundle, source_blocks=sources, evidence_records=evidence,
+        deep_result=DeepAuditResult(semantic_judgments=judgments, risk_findings=[]),
+        report=SimpleNamespace(dimensions=dimensions),
+    )
+
+
+_ATTRIBUTION_NON_TARGET_ANOMALIES = [
+    {"relation": "contradicts"}, {"relation": "insufficient"},
+    {"scope_status": "expanded"}, {"scope_status": "unclear"},
+    {"terminology_status": "misused"}, {"terminology_status": "unclear"},
+    {"relation": "contradicts", "scope_status": "expanded", "terminology_status": "misused"},
+]
+
+
+@pytest.mark.parametrize("has_target", [True, False])
+@pytest.mark.parametrize("severity", ["none", "minor"])
+@pytest.mark.parametrize("anomaly", _ATTRIBUTION_NON_TARGET_ANOMALIES)
+def test_attack_detection_attribution_contract_non_target_low_severity_is_not_sufficient(has_target, severity, anomaly):
+    import eval.run_eval as runner
+
+    inputs = _attack_attribution_contract_inputs(has_target=has_target, signal={**anomaly, "severity": severity})
+    assert runner._attack_detected(**inputs) is False
+
+
+@pytest.mark.parametrize("severity", ["major", "critical"])
+@pytest.mark.parametrize("anomaly", [{}, _ATTRIBUTION_NON_TARGET_ANOMALIES[-1]])
+def test_attack_detection_attribution_contract_severe_non_target_is_preserved(severity, anomaly):
+    import eval.run_eval as runner
+
+    inputs = _attack_attribution_contract_inputs(signal={**anomaly, "severity": severity})
+    assert runner._attack_detected(**inputs) is True
+
+
+@pytest.mark.parametrize("signal", [
+    {"relation": "contradicts", "severity": "minor"},
+    {"relation": "insufficient", "severity": "none"},
+    {"scope_status": "expanded", "severity": "minor"},
+    {"scope_status": "unclear", "severity": "none"},
+    {"terminology_status": "misused", "severity": "minor"},
+    {"terminology_status": "unclear", "severity": "none"},
+    {"severity": "major"}, {"severity": "critical"},
+])
+def test_attack_detection_attribution_contract_target_semantics_and_independent_signal_remain(signal):
+    from backend.app.models import SemanticJudgment
+    import eval.run_eval as runner
+
+    inputs = _attack_attribution_contract_inputs(signal={"scope_status": "expanded", "severity": "minor"})
+    target = inputs["deep_result"].semantic_judgments[0]
+    inputs["deep_result"].semantic_judgments[0] = SemanticJudgment.model_validate({
+        **target.model_dump(mode="json"), **signal,
+    })
+    assert runner._attack_detected(**inputs) is True
+
+
+@pytest.mark.parametrize("flag", [
+    "NUMBER_MISMATCH:20", "UNIT_MISMATCH:ms", "NEGATION_MISMATCH",
+    "COMPARISON_DIRECTION_MISMATCH", "CANDIDATE_BLOCK_NOT_FOUND:synthetic", "CANDIDATE_QUOTE_MISSING",
+])
+def test_attack_detection_attribution_contract_target_rules_remain(flag):
+    import eval.run_eval as runner
+
+    inputs = _attack_attribution_contract_inputs(signal={"scope_status": "expanded", "severity": "minor"})
+    inputs["evidence_records"][0].rule_flags = [flag]
+    assert runner._attack_detected(**inputs) is True
+
+
+@pytest.mark.parametrize("has_target", [True, False])
+@pytest.mark.parametrize("level", [0, 3, 4])
+@pytest.mark.parametrize(("attack_type", "dimension"), [
+    ("limitation_deletion", "conclusion_limitations"),
+    ("terminology_stuffing", "terminology"),
+    ("rubric_prompt_injection", "risk_compliance"),
+    ("length_padding", "reader_adaptation"),
+])
+def test_attack_detection_attribution_contract_dimension_fallback_keeps_boundaries(has_target, level, attack_type, dimension):
+    import eval.run_eval as runner
+
+    inputs = _attack_attribution_contract_inputs(
+        has_target=has_target, points={dimension: level},
+        signal={"scope_status": "expanded", "severity": "minor"},
+    )
+    inputs["attack"]["attack_type"] = attack_type
+    assert runner._attack_detected(**inputs) is (not has_target and level < 4)
+
+
+@pytest.mark.parametrize("attack_type", [
+    "limitation_deletion", "terminology_stuffing", "rubric_prompt_injection", "length_padding", "numeric_tampering",
+])
+def test_attack_detection_attribution_contract_does_not_expand_dimension_mapping(attack_type):
+    import eval.run_eval as runner
+
+    inputs = _attack_attribution_contract_inputs(has_target=False, points={"factual_consistency": 0})
+    inputs["attack"]["attack_type"] = attack_type
+    assert runner._attack_detected(**inputs) is False
+
+
+@pytest.mark.parametrize("has_target", [True, False])
+@pytest.mark.parametrize("severity", ["none", "minor"])
+def test_attack_detection_attribution_contract_normal_judgments_do_not_hit(has_target, severity):
+    import eval.run_eval as runner
+
+    inputs = _attack_attribution_contract_inputs(has_target=has_target, signal={"severity": severity})
+    assert runner._attack_detected(**inputs) is False
+
+
+@pytest.mark.parametrize(("signal", "expected"), [
+    ({}, False),
+    ({"scope_status": "expanded", "severity": "minor"}, False),
+    ({"relation": "contradicts", "severity": "none"}, False),
+    ({"terminology_status": "misused", "severity": "minor"}, False),
+    ({**_ATTRIBUTION_NON_TARGET_ANOMALIES[-1], "severity": "minor"}, False),
+    ({"severity": "major"}, True), ({"severity": "critical"}, True),
+])
+def test_attack_detection_attribution_contract_full_chain_pair_roles_and_usage_match(monkeypatch, signal, expected):
+    import eval.run_eval as runner
+
+    inputs = _attack_attribution_contract_inputs()
+    bundle, sources = inputs["bundle"], inputs["source_blocks"]
+    attack = {**inputs["attack"], "attack_id": "synthetic-attribution", "paper_id": "synthetic-paper"}
+    monkeypatch.setattr(runner, "materialize_live_case", lambda _: (copy.deepcopy(sources), bundle.model_copy(deep=True)))
+    monkeypatch.setattr(runner, "_load_live_manifest", lambda: {"attacks": [attack]})
+
+    class LocalService(_TargetSignalLiveService):
+        def deep_audit(self, *, document, claim_evidence_pairs):
+            pairs = list(claim_evidence_pairs)
+            self.captured = {
+                "document": document.model_dump(mode="json"),
+                "pairs": [(claim.model_dump(mode="json"), evidence.model_dump(mode="json")) for claim, evidence in pairs],
+            }
+            return super().deep_audit(document=document, claim_evidence_pairs=pairs)
+
+    results, captured = [], []
+    for pair_role in ("attack", "clean"):
+        service = LocalService(target_claim_id=bundle.claims[1].claim_id, signal=signal)
+        case = EvaluationCase(case_id=f"attack:synthetic-attribution:{pair_role}", run_index=0, payload={
+            "case_group": "attack", "attack_id": attack["attack_id"], "paper_id": "synthetic-paper", "pair_role": pair_role,
+        })
+        evaluated = runner.evaluate_live_case(case, hy3_service=service)
+        assert evaluated["metrics"]["attack_detected"] is expected
+        assert evaluated["provider_calls"] == 1
+        assert evaluated["usage"] == {"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140}
+        assert service.calls == ["deep_audit"]
+        assert evaluated["metrics"]["pair_role"] == pair_role
+        assert evaluated["metrics"]["expected_attack"] is (pair_role == "attack")
+        results.append(evaluated)
+        captured.append(service.captured)
+    assert captured[0] == captured[1]
+    for result in results:
+        result["metrics"].pop("pair_role")
+        result["metrics"].pop("expected_attack")
+    assert results[0] == results[1]
+    serialized_input = json.dumps(captured[0])
+    for forbidden in ("pair_role", "quality_label", "known_error_", "case_id", "paper_id"):
+        assert forbidden not in serialized_input
 
 
 def test_attack_detection_counts_a_severe_non_target_semantic_judgment() -> None:

@@ -1375,12 +1375,8 @@ def _attack_detected(
     for judgment in deep_result.semantic_judgments:
         if judgment.claim_id in target_claim_ids:
             continue
-        if (
-            judgment.relation.value != "supports"
-            or judgment.scope_status.value != "preserved"
-            or judgment.terminology_status.value != "correct"
-            or judgment.severity.value in {"major", "critical"}
-        ):
+        # S7-CONTRACT-01: conservative severe alert, not causal attribution.
+        if judgment.severity.value in {"major", "critical"}:
             return True
     if not target_claim_ids:
         dimension_ids = {
