@@ -956,7 +956,7 @@ def test_deep_audit_prompt_centralizes_v2_document_contract() -> None:
         )
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v5"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v6"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
     assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v2"
     assert "逐条判断" in prompt
@@ -981,7 +981,7 @@ def test_deep_audit_prompt_defines_non_hedging_semantic_contract() -> None:
         ),
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v5"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v6"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
     assert "relation=supports：仅当 evidence 直接蕴含 claim 的全部实质事实时选择。" in prompt
     assert "relation=contradicts：当数字、方向、因果、比较或结论冲突时选择。" in prompt
@@ -1035,7 +1035,7 @@ def test_deep_audit_prompt_closes_severity_decision_contract() -> None:
         ),
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v5"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v6"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
     assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v2"
     assert (
@@ -1397,6 +1397,143 @@ def test_mock_deep_audit_uses_same_v2_schema_validation_chain(
     assert exc_info.value.retryable is False
 
 
+def _deep_audit_prompt_input_regions(request: dict[str, Any]) -> tuple[str, str]:
+    prompt = request["messages"][1]["content"]
+    # Fail with fixed categories, never the captured request or its text.
+    pair_position = prompt.find("- items: ")
+    document_position = prompt.find("- document: ")
+    if not 0 <= pair_position < document_position:
+        pytest.fail("SEMANTIC_PAIRS_MUST_PRECEDE_RISK_DOCUMENT")
+    regions = []
+    for start, end in (
+        ("语义配对输入区域开始\n- items: ", "\n语义配对输入区域结束"),
+        ("文档风险输入区域开始\n- document: ", "\n文档风险输入区域结束"),
+    ):
+        if prompt.count(start) != 1 or prompt.count(end) != 1:
+            pytest.fail("DEEP_AUDIT_INPUT_REGION_BOUNDARY_INVALID")
+        region = prompt.split(start, 1)[1].split(end, 1)[0]
+        try:
+            json.loads(region)
+        except ValueError:
+            pytest.fail("DEEP_AUDIT_INPUT_REGION_JSON_INVALID", pytrace=False)
+        regions.append(region)
+    if prompt.index("语义配对输入区域结束") >= prompt.index("文档风险输入区域开始"):
+        pytest.fail("DEEP_AUDIT_INPUT_REGIONS_OVERLAP")
+    return regions[0], regions[1]
+
+
+@pytest.mark.parametrize("variant", ["batch", "reordered", "risk-only"])
+def test_deep_audit_prompt_dispatches_pairs_before_complete_risk_document(
+    variant: str,
+) -> None:
+    document = generated_bundle().document
+    pairs = verified_claim_evidence_pairs()
+    pairs[0][0].qualifiers = ["only in sealed containers", "室温"]
+    pairs[0][0].numeric_entities = ["10", "2.50"]
+    pairs[0][1].rule_flags = ["CANDIDATE_QUOTE_MISSING"]
+    if variant == "reordered":
+        pairs.reverse()
+    payload = json.loads(valid_deep_audit_json())
+    if variant == "risk-only":
+        pairs = []
+        payload["semantic_judgments"] = []
+    expected_items = json.dumps(
+        [{"claim": claim.model_dump(mode="json"),
+          "evidence": evidence.model_dump(mode="json")} for claim, evidence in pairs],
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    expected_document = document.model_dump_json()
+    non_auditable_ids = {
+        claim.sentence_id for claim in generated_bundle().claims
+        if claim.auditability.value == "non_auditable"
+    }
+    assert len(non_auditable_ids) > 0
+    client = FakeClient([json.dumps(payload)])
+    service = Hy3Service(settings=live_settings(), client=client)
+
+    result = service.deep_audit(document=document, claim_evidence_pairs=pairs)
+
+    assert len(client.completions.calls) == 1
+    request = client.completions.calls[0]
+    actual_items, actual_document = _deep_audit_prompt_input_regions(request)
+    prompt = request["messages"][1]["content"]
+    assert prompt.count("- items: ") == 1
+    assert prompt.count("- document: ") == 1
+    assert prompt.count(expected_document) == 1
+    if pairs:
+        assert prompt.count(expected_items) == 1
+    # Exact UTF-8 equality covers every field, whitespace and array order safely.
+    assert sha256(actual_items.encode()).hexdigest() == sha256(expected_items.encode()).hexdigest()
+    assert sha256(actual_document.encode()).hexdigest() == sha256(expected_document.encode()).hexdigest()
+    sent_document = json.loads(actual_document)
+    sentence_ids = {
+        sentence["sentence_id"] for section in sent_document["sections"]
+        for sentence in section["sentences"]
+    }
+    assert non_auditable_ids <= sentence_ids
+    sent_items = json.loads(actual_items)
+    assert len(sent_items) == len(pairs)
+    assert all(set(item) == {"claim", "evidence"} for item in sent_items)
+    assert len(result.semantic_judgments) == len(pairs)
+    assert [finding.category.value for finding in result.risk_findings] == [
+        "sensitive_information", "author_impersonation", "academic_integrity",
+    ]
+    model_input = json.dumps(request["messages"], ensure_ascii=False).casefold()
+    for forbidden in (
+        "quality_label", "known_error_", "attack_type", "pair_role", "case_id",
+        "paper_id", "diagnostic_id", "expected_answer", "evaluation_answer",
+        "target_score", "overall_score", "dev-03", "dev-04",
+    ):
+        if forbidden in model_input:
+            pytest.fail("DEEP_AUDIT_EVALUATION_LABEL_LEAK")
+    assert request["temperature"] == 0
+    assert request["max_completion_tokens"] == 4096
+    assert request["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert request["stream"] is False
+    schema = request["response_format"]["json_schema"]
+    assert request["response_format"]["type"] == "json_schema"
+    assert schema["name"] == "paperlens_deep_audit_result_v2"
+    assert schema["strict"] is True
+    assert request["response_format"] == Hy3Service._deep_audit_response_format()
+    assert_closed_objects(schema["schema"])
+    assert service.settings.hy3_max_retries == 2
+    assert service.last_run_observation.provider_calls == 1
+    assert service.last_run_observation.retries == 0
+    assert service.last_run_observation.error_code == "NONE"
+    assert sha256(document.model_dump_json().encode()).hexdigest() == sha256(expected_document.encode()).hexdigest()
+    remaining_items = json.dumps(
+        [{"claim": claim.model_dump(mode="json"),
+          "evidence": evidence.model_dump(mode="json")} for claim, evidence in pairs],
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    assert sha256(remaining_items.encode()).hexdigest() == sha256(expected_items.encode()).hexdigest()
+
+
+def test_deep_audit_prompt_keeps_pair_serialization_when_other_sentences_change() -> None:
+    pairs = verified_claim_evidence_pairs()
+    original = generated_bundle().document
+    changed = original.model_copy(deep=True)
+    target_sentence_ids = {claim.sentence_id for claim, _ in pairs}
+    for section in changed.sections:
+        for sentence in section.sentences:
+            if sentence.sentence_id not in target_sentence_ids:
+                sentence.text = "An unrelated synthetic indicator is now blue."
+    documents = (original, changed)
+    captured = []
+    for document in documents:
+        client = FakeClient([valid_deep_audit_json()])
+        Hy3Service(settings=live_settings(), client=client).deep_audit(
+            document=document, claim_evidence_pairs=pairs,
+        )
+        assert len(client.completions.calls) == 1
+        captured.append(_deep_audit_prompt_input_regions(client.completions.calls[0]))
+    # This checks input construction only, not the model's judgments.
+    assert sha256(captured[0][0].encode()).hexdigest() == sha256(captured[1][0].encode()).hexdigest()
+    assert sha256(captured[0][1].encode()).hexdigest() != sha256(captured[1][1].encode()).hexdigest()
+    for (_, actual_document), document in zip(captured, documents, strict=True):
+        assert sha256(actual_document.encode()).hexdigest() == sha256(document.model_dump_json().encode()).hexdigest()
+
+
 def test_live_deep_audit_uses_one_strict_batch_request() -> None:
     client = FakeClient([valid_deep_audit_json()])
     service = Hy3Service(settings=live_settings(), client=client)
@@ -1576,7 +1713,7 @@ def test_live_deep_audit_schema_error_retries_and_logs_safely(caplog) -> None:
     retry_prompt = client.completions.calls[1]["messages"][1]["content"]
     assert retry_prompt.count("字段错误摘要：") == 1
     assert invalid not in retry_prompt
-    assert "prompt_version=audit-v5" in caplog.text
+    assert "prompt_version=audit-v6" in caplog.text
     assert "schema_version=deep-audit-result-v2" in caplog.text
     assert "retries=1" in caplog.text
     assert invalid not in caplog.text

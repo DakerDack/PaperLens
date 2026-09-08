@@ -3888,7 +3888,7 @@ def test_freeze_configuration_records_manifest_and_model_contract_without_key(
     assert frozen["data_version"] == "paperlens-plos-abstracts-v1"
     assert len(frozen["manifest_sha256"]) == 64
     assert frozen["model"] == "hy3"
-    assert frozen["prompt_versions"]["deep_audit"] == "audit-v5"
+    assert frozen["prompt_versions"]["deep_audit"] == "audit-v6"
     assert frozen["schema_versions"]["deep_audit"] == "deep-audit-result-v2"
     assert frozen["overall_score_threshold"] == 75
     assert frozen["dimension_weights"]["factual_consistency"] == 0.20
@@ -3896,11 +3896,33 @@ def test_freeze_configuration_records_manifest_and_model_contract_without_key(
     assert "api_key" not in json.dumps(frozen).casefold()
 
 
-def test_stage7_freeze_payload_tracks_audit_v5_without_schema_change() -> None:
+def test_stage7_freeze_payload_tracks_audit_v6_without_schema_change() -> None:
     payload = _freeze_payload()
 
-    assert payload["prompt_versions"]["deep_audit"] == "audit-v5"
+    assert payload["prompt_versions"]["deep_audit"] == "audit-v6"
     assert payload["schema_versions"]["deep_audit"] == "deep-audit-result-v2"
+
+
+def test_stage7_freeze_rejects_previous_prompt_version_without_rewriting(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import eval.run_eval as runner
+
+    service = _FrozenRuntimeConfigService()
+    freeze_path = tmp_path / "previous_prompt_freeze.json"
+    monkeypatch.setattr(runner, "Hy3Service", lambda: service)
+    monkeypatch.setattr(runner, "DEFAULT_FREEZE_PATH", freeze_path)
+    with monkeypatch.context() as previous:
+        previous.setattr(runner, "DEEP_AUDIT_PROMPT_VERSION", "audit-v5")
+        runner.freeze_configuration(output_path=freeze_path)
+    original_hash = hashlib.sha256(freeze_path.read_bytes()).hexdigest()
+
+    assert runner.DEEP_AUDIT_PROMPT_VERSION == "audit-v6"
+    with pytest.raises(ValueError, match="^CONFIG_DRIFT$"):
+        runner._require_frozen_configuration()
+
+    assert hashlib.sha256(freeze_path.read_bytes()).hexdigest() == original_hash
+    assert service.provider_calls == 0
 
 
 class _FrozenRuntimeConfigService:

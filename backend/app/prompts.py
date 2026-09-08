@@ -4,7 +4,7 @@ from backend.app.models import ClaimPolicy
 GENERATION_PROMPT_VERSION = "gen-v4"
 GENERATION_SCHEMA_VERSION = "generated-bundle-v1"
 GENERATION_SCHEMA_NAME = "paperlens_generated_bundle_v1"
-DEEP_AUDIT_PROMPT_VERSION = "audit-v5"
+DEEP_AUDIT_PROMPT_VERSION = "audit-v6"
 DEEP_AUDIT_SCHEMA_VERSION = "deep-audit-result-v2"
 DEEP_AUDIT_SCHEMA_NAME = "paperlens_deep_audit_result_v2"
 REVISION_PROMPT_VERSION = "revision-v2"
@@ -73,9 +73,9 @@ candidate_quote 必须为 null 或非空字符串；非空时必须复制候选�
 
 DEEP_AUDIT_USER_PROMPT_TEMPLATE = """任务一：逐条判断 claim 是否被给定 evidence 支持。
 
-输入：
-- document: {content_draft_json}
+语义配对输入区域开始
 - items: {verified_claim_evidence_pairs_json}
+语义配对输入区域结束
 
 每个输出必须保留对应输入的 claim_id 和 evidence.block_id，且每个输入项恰好返回一次判断。
 不得参考分数、预设质量档位、攻击标签或其他 claim 的最终判断。
@@ -118,6 +118,10 @@ DEEP_AUDIT_USER_PROMPT_TEMPLATE = """任务一：逐条判断 claim 是否被给
 items 为空时，semantic_judgments 必须为空数组；不得为不存在的配对生成判断。
 
 任务二：检查完整生成文档中的 sensitive_information、author_impersonation 和 academic_integrity。
+文档风险输入区域开始
+- document: {content_draft_json}
+文档风险输入区域结束
+
 每个类别恰好返回一条 RiskFinding；non_auditable 句子也必须检查。
 risk_findings 必须仍为长度恰好为 3 的数组，并使用以下固定顺序：
 - risk_findings[0].category 必须为 sensitive_information
