@@ -2441,6 +2441,150 @@ def test_dev03_mutation_qualifiers_reach_deep_audit_prompt_with_original_evidenc
     }]
 
 
+@pytest.fixture(
+    params=[
+        ("quality:dev-04:medium", [], []),
+        ("attack:attack-numeric-unit-01:attack", ["full alcoholic drink", "about"], ["60 times"]),
+        ("attack:attack-scope-01:attack", ["always", "every person", "every beverage", "every setting"], []),
+    ],
+    ids=["medium", "numeric-unit", "scope"],
+)
+def dev04_mutation_metadata_alignment_case(request):
+    # Manually specified from the fixed replacement statements, not audit output.
+    case_id, qualifiers, numbers = request.param
+    cases = {case.case_id: case for mode in ("calibrate", "final") for case in load_mode_cases(mode)}
+    return cases[case_id], cases["quality:dev-04:good"], qualifiers, numbers
+
+
+def test_dev04_mutation_metadata_alignment_materialized_fields(
+    dev04_mutation_metadata_alignment_case,
+) -> None:
+    import eval.run_eval as runner
+
+    case, good_case, qualifiers, numbers = dev04_mutation_metadata_alignment_case
+    manifest_before = copy.deepcopy(runner._load_live_manifest())
+    good_sources, good = materialize_live_case(good_case)
+    sources, bundle = materialize_live_case(case)
+    target = next(c for c in bundle.claims if c.claim_id == "dev-04-c03")
+    for field, expected in (("qualifiers", qualifiers), ("numeric_entities", numbers)):
+        if getattr(target, field) != expected:
+            pytest.fail(f"{case.case_id}:{field}:METADATA_ALIGNMENT_FAILED")
+    if not all(value in target.text for value in qualifiers + numbers):
+        pytest.fail("dev-04-c03:METADATA_NOT_IN_REPLACEMENT")
+    if sources != good_sources:
+        pytest.fail("dev-04:SOURCE_BLOCKS_CHANGED")
+    for original, changed in zip(good.claims, bundle.claims, strict=True):
+        expected_claim = original.model_dump(mode="json")
+        if original.claim_id == target.claim_id:
+            expected_claim.update(text=target.text, qualifiers=qualifiers, numeric_entities=numbers)
+        if changed.model_dump(mode="json") != expected_claim:
+            pytest.fail(f"{changed.claim_id}:UNAUTHORIZED_CLAIM_CHANGE")
+    if runner._load_live_manifest() != manifest_before:
+        pytest.fail("BASE_MATERIAL_MUTATED")
+    if materialize_live_case(good_case) != (good_sources, good):
+        pytest.fail("GOOD_BASELINE_MUTATED")
+
+
+def test_dev04_mutation_metadata_alignment_reaches_request_construction(
+    monkeypatch, dev04_mutation_metadata_alignment_case,
+) -> None:
+    import backend.app.hy3_service as hy3
+
+    case, good_case, qualifiers, numbers = dev04_mutation_metadata_alignment_case
+    good_sources, good = materialize_live_case(good_case)
+    original = next(c for c in good.claims if c.claim_id == "dev-04-c03")
+    captured = []
+
+    class InputCaptured(Exception):
+        pass
+
+    def capture(*, content_draft_json, verified_claim_evidence_pairs_json):
+        items = json.loads(verified_claim_evidence_pairs_json)
+        targets = [item for item in items if item["claim"]["claim_id"] == original.claim_id]
+        assert len(targets) == 1
+        claim, evidence = targets[0]["claim"], targets[0]["evidence"]
+        for field, expected in (("qualifiers", qualifiers), ("numeric_entities", numbers)):
+            if claim[field] != expected:
+                pytest.fail(f"{case.case_id}:{field}:REQUEST_METADATA_ALIGNMENT_FAILED")
+        if claim["candidate_quote"] != original.candidate_quote:
+            pytest.fail("CANDIDATE_QUOTE_CHANGED")
+        if not (
+            evidence["quote_verified"]
+            and evidence["quote"] == original.candidate_quote
+            and evidence["block_id"] in original.candidate_block_ids
+            and any(block.block_id == evidence["block_id"] and evidence["quote"] in block.text
+                    for block in good_sources)
+        ):
+            pytest.fail("ORIGINAL_VERIFIED_EVIDENCE_NOT_RETAINED")
+        _, expected_bundle = materialize_live_case(case)
+        if json.loads(content_draft_json) != expected_bundle.document.model_dump(mode="json"):
+            pytest.fail("REQUEST_DOCUMENT_CHANGED")
+        captured.append(True)
+        # Existing serializer/renderer boundary; no response or provider call.
+        raise InputCaptured
+
+    monkeypatch.setattr(hy3, "render_deep_audit_prompt", capture)
+    service = SimpleNamespace(deep_audit=hy3.Hy3Service._build_deep_audit_prompt)
+    with pytest.raises(InputCaptured):
+        evaluate_live_case(case, hy3_service=service)
+    assert captured == [True]
+
+
+def test_dev04_mutation_metadata_alignment_preserves_other_materials_and_clean_pairs():
+    import eval.run_eval as runner
+
+    manifest = copy.deepcopy(runner._load_live_manifest())
+    paper = next(p for p in manifest["papers"] if p["paper_id"] == "dev-04")
+    allowed = [paper["quality_mutations"]["medium"]] + [
+        attack for attack in manifest["attacks"]
+        if attack["attack_id"] in {"attack-numeric-unit-01", "attack-scope-01"}
+    ]
+    for mutation in allowed:
+        for field in ("qualifiers", "numeric_entities"):
+            mutation.pop(field, None)
+    # Pin all non-authorized fields, including source hashes, base claims,
+    # replacement text and every other variant; this is not a model answer.
+    digest = hashlib.sha256(json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    assert digest == "0c366842aa8e83400c3a6e124fe6ba80be4cb8c737948381331f119385cbdd5d"
+    cases = {case.case_id: case for mode in ("calibrate", "final") for case in load_mode_cases(mode)}
+    good = materialize_live_case(cases["quality:dev-04:good"])
+    for attack_id in ("attack-numeric-unit-01", "attack-scope-01"):
+        if materialize_live_case(cases[f"attack:{attack_id}:clean"]) != good:
+            pytest.fail(f"{attack_id}:CLEAN_BASELINE_CHANGED")
+
+
+@pytest.mark.parametrize("explicit_empty", [False, True], ids=["missing", "empty"])
+def test_dev04_mutation_metadata_alignment_empty_is_not_missing(
+    mutation_qualifiers_case, explicit_empty,
+) -> None:
+    case, paper = mutation_qualifiers_case
+    base_claim = paper["base_output"]["sections"]["results"]["claim"]
+    base_claim["numeric_entities"] = ["7"]
+    if explicit_empty:
+        paper["quality_mutations"]["medium"].update(qualifiers=[], numeric_entities=[])
+    before = copy.deepcopy(paper)
+    _, bundle = materialize_live_case(case)
+    target = next(c for c in bundle.claims if c.claim_id == "synthetic-c2")
+    for field in ("qualifiers", "numeric_entities"):
+        if getattr(target, field) != ([] if explicit_empty else base_claim[field]):
+            pytest.fail(f"synthetic-c2:{field}:EMPTY_MISSING_CONTRACT_FAILED")
+    if paper != before:
+        pytest.fail("SYNTHETIC_BASE_MUTATED")
+
+
+def test_dev04_mutation_metadata_alignment_freeze_rejects_stale_manifest(tmp_path, monkeypatch):
+    runner, service, freeze_path, frozen = _frozen_runtime_config_setup(tmp_path, monkeypatch)
+    frozen["manifest_sha256"] = "0" * 64
+    freeze_path.write_text(json.dumps(frozen), encoding="utf-8")
+    before_hash = hashlib.sha256(freeze_path.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="^CONFIG_DRIFT$"):
+        runner._require_frozen_configuration()
+    assert service.provider_calls == 0
+    assert hashlib.sha256(freeze_path.read_bytes()).hexdigest() == before_hash
+
+
 def test_attack_pairs_share_sources_and_change_only_the_declared_sentence() -> None:
     final = load_mode_cases("final")
     attacks = [case for case in final if case.payload["case_group"] == "attack"]
