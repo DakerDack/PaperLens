@@ -21,6 +21,7 @@ from backend.app.models import (
     DeepAuditResult,
     EditPatch,
     EvidenceRecord,
+    ExpressionCategory,
     GeneratedBundle,
     PatchScope,
     RiskCategory,
@@ -68,7 +69,7 @@ MOCK_DEEP_AUDIT_FIXTURE = (
     Path(__file__).resolve().parents[1]
     / "tests"
     / "fixtures"
-    / "deep_audit_valid.json"
+    / "deep_audit_v3_valid.json"
 )
 GENERATION_TEMPERATURE = 0
 GENERATION_MAX_COMPLETION_TOKENS = 16384
@@ -332,6 +333,7 @@ class Hy3Service:
                 result = self._validate_deep_audit_result(
                     self._load_mock_deep_audit_response(),
                     expected_pairs,
+                    document,
                 )
             else:
                 self._require_live_config()
@@ -343,6 +345,7 @@ class Hy3Service:
                 result, retries, usage = self._deep_audit_live(
                     prompt,
                     expected_pairs,
+                    document,
                 )
         except Hy3ServiceError as exc:
             self._record_run_observation(
@@ -865,6 +868,7 @@ class Hy3Service:
         self,
         original_prompt: str,
         expected_pairs: set[SemanticPairKey],
+        document: ContentDraft,
     ) -> tuple[DeepAuditResult, int, UsageTuple]:
         field_error_summary: str | None = None
         cumulative_usage: UsageTuple | None = None
@@ -921,6 +925,7 @@ class Hy3Service:
                 result = self._validate_deep_audit_result(
                     raw_response,
                     expected_pairs,
+                    document,
                 )
             except Hy3ServiceError as exc:
                 self._log_deep_audit_attempt(
@@ -1557,6 +1562,17 @@ class Hy3Service:
                 "allOf": coverage_rules,
             }
         )
+        expression_schema = schema["properties"]["expression_findings"]
+        expression_schema.update({
+            "minItems": 2, "maxItems": 2,
+            "allOf": [
+                {"contains": {**deepcopy(schema["$defs"]["ExpressionFinding"]),
+                 "properties": {**deepcopy(schema["$defs"]["ExpressionFinding"]["properties"]),
+                                "category": {"const": category.value}}},
+                 "minContains": 1, "maxContains": 1}
+                for category in ExpressionCategory
+            ],
+        })
         return {
             "type": "json_schema",
             "json_schema": {
@@ -1896,6 +1912,7 @@ class Hy3Service:
     def _validate_deep_audit_result(
         raw_response: Any,
         expected_pairs: set[SemanticPairKey],
+        document: ContentDraft | None = None,
     ) -> DeepAuditResult:
         if not isinstance(raw_response, (str, bytes, bytearray)):
             raise Hy3ServiceError(
@@ -1921,7 +1938,7 @@ class Hy3Service:
             ) = Hy3Service._validation_error_diagnostic(exc)
             raise Hy3ServiceError(
                 "SCHEMA_INVALID",
-                "The model response did not match DeepAuditResult v2.",
+                "The model response did not match DeepAuditResult v3.",
                 retryable=False,
                 field_error_summary=Hy3Service._field_error_summary(exc),
                 validation_boundary=(
@@ -1930,6 +1947,17 @@ class Hy3Service:
                 validation_error_count=validation_error_count,
                 validation_error_type=validation_error_type,
                 validation_location=validation_location,
+            ) from exc
+
+        # Reuse the same code-owned location check at dispatch and scoring.
+        from backend.app.audit_service import AuditServiceError, _validate_expression_findings
+        try:
+            _validate_expression_findings(document, result.expression_findings)
+        except AuditServiceError as exc:
+            raise Hy3ServiceError(
+                "AUDIT_INCOMPLETE", "Expression findings are incomplete.",
+                retryable=True, field_error_summary="expression_findings [incomplete]",
+                validation_boundary="semantic_pair_invalid",
             ) from exc
 
         actual_pairs = [

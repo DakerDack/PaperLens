@@ -42,6 +42,28 @@ from backend.app.models import (
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+def test_document_expression_contract_current_schema_requires_findings():
+    required = DeepAuditResult.model_json_schema()["required"]
+    assert "expression_findings" in required, "EXPRESSION_CHECK_REQUIRED"
+
+
+def test_document_expression_contract_current_response_cannot_be_legacy():
+    payload = {"semantic_judgments": [], "risk_findings": valid_risk_findings_payload()}
+    with pytest.raises(ValidationError):
+        DeepAuditResult.model_validate(payload)
+
+
+def test_document_expression_contract_explicit_v2_reader_preserves_absence():
+    old = models.DeepAuditResultV2.model_validate(load_json("deep_audit_valid.json"))
+    assert "expression_findings" not in old.model_dump()
+    current = DeepAuditResult.model_validate(load_json("deep_audit_v3_valid.json"))
+    assert len(current.expression_findings) == 2
+    payload = current.model_dump(mode="json")
+    payload["expression_findings"][0]["reason"] = "FORBIDDEN_EXPRESSION_TEXT"
+    with pytest.raises(ValidationError):
+        DeepAuditResult.model_validate(payload)
+
+
 def load_json(name: str) -> object:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
@@ -322,7 +344,7 @@ def test_revision_request_rejects_missing_target_history_and_invalid_scope(
 
 
 def test_deep_audit_and_patch_fixtures_are_valid() -> None:
-    result = DeepAuditResult.model_validate(load_json("deep_audit_valid.json"))
+    result = DeepAuditResult.model_validate(load_json("deep_audit_v3_valid.json"))
     patch = EditPatch.model_validate(load_json("patch_sentence_valid.json"))
 
     assert [(item.claim_id, item.block_id) for item in result.semantic_judgments] == [
@@ -385,7 +407,7 @@ def test_deep_audit_v2_schema_closes_every_nested_object() -> None:
                 assert_closed_objects(value)
 
     assert schema["type"] == "object"
-    assert set(schema["required"]) == {"semantic_judgments", "risk_findings"}
+    assert set(schema["required"]) == {"semantic_judgments", "risk_findings", "expression_findings"}
     assert_closed_objects(schema)
 
 
@@ -596,7 +618,7 @@ def test_risk_assessment_rejects_provider_sensitive_free_text() -> None:
 
 
 def test_deep_audit_v2_nested_models_reject_extra_fields() -> None:
-    payload = load_json("deep_audit_valid.json")
+    payload = load_json("deep_audit_v3_valid.json")
     payload["risk_findings"][0]["locations"] = [
         {
             "location_type": "document",

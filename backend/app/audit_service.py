@@ -23,6 +23,9 @@ from backend.app.models import (
     ContentDraft,
     DIMENSION_WEIGHTS,
     DeepAuditResult,
+    DeepAuditResultV2,
+    ExpressionCategory,
+    ExpressionFinding,
     Decision,
     DimensionId,
     DimensionResult,
@@ -485,6 +488,7 @@ class AuditService:
         safe_result = DeepAuditResult(
             semantic_judgments=result.semantic_judgments,
             risk_findings=report.risk_assessment.risk_findings,
+            expression_findings=result.expression_findings,
         )
         return safe_result, report
 
@@ -494,6 +498,20 @@ class AuditService:
         evidence_records: list[EvidenceRecord],
         deep_audit_result: DeepAuditResult,
         compliance_context: ComplianceContext,
+    ) -> AuditReport:
+        return self._score(bundle, evidence_records, deep_audit_result, compliance_context)
+
+    def score_legacy_v2(
+        self, bundle: GeneratedBundle, evidence_records: list[EvidenceRecord],
+        deep_audit_result: DeepAuditResultV2, compliance_context: ComplianceContext,
+    ) -> AuditReport:
+        """Historical Smoke replay only, without inferred expression findings."""
+        return self._score(bundle, evidence_records, deep_audit_result, compliance_context, legacy=True)
+
+    def _score(
+        self, bundle: GeneratedBundle, evidence_records: list[EvidenceRecord],
+        deep_audit_result: DeepAuditResultV2, compliance_context: ComplianceContext,
+        *, legacy: bool = False,
     ) -> AuditReport:
         try:
             validated_context = ComplianceContext.model_validate(
@@ -510,7 +528,7 @@ class AuditService:
                 ),
             ) from exc
         try:
-            validated_result = DeepAuditResult.model_validate(
+            validated_result = (DeepAuditResultV2 if legacy else DeepAuditResult).model_validate(
                 deep_audit_result.model_dump(mode="json")
             )
         except (AttributeError, ValidationError) as exc:
@@ -545,6 +563,37 @@ class AuditService:
                 validation_boundary="semantic_pair_validation",
             )
 
+        expression_findings = None if legacy else validated_result.expression_findings
+        if expression_findings is not None:
+            _validate_expression_findings(bundle.document, expression_findings)
+            if any(item.status == RiskStatus.UNCLEAR for item in expression_findings):
+                error = AuditServiceError("AUDIT_INCOMPLETE", "Expression audit remains unclear.", retryable=False)
+                error.safe_metrics = {
+                    "expression_findings": [
+                        {"category": item.category.value, "status": item.status.value,
+                         "sentence_ids": sorted({loc.sentence_id for loc in item.locations})}
+                        for item in expression_findings
+                    ],
+                    "observed_factual_issue_codes": sorted({code.split(":", 1)[0] for code in (
+                        _rule_hard_failures(bundle, evidence_records)
+                        + _semantic_hard_failures(bundle, semantic_judgments)
+                        + [flag for record in evidence_records for flag in record.rule_flags
+                           if _starts_with_any(flag, _DETERMINISTIC_CONTRADICTION_PREFIXES)]
+                    )}),
+                    "observed_factual_alert_count": len({
+                        (judgment.claim_id, judgment.block_id)
+                        for judgment in semantic_judgments
+                        if (judgment.relation != Relation.SUPPORTS
+                            or judgment.scope_status != ScopeStatus.PRESERVED
+                            or judgment.terminology_status != TerminologyStatus.CORRECT
+                            or judgment.severity != Severity.NONE)
+                    } | {
+                        (record.claim_id, record.block_id) for record in evidence_records
+                        if any(_starts_with_any(flag, _DETERMINISTIC_CONTRADICTION_PREFIXES)
+                               for flag in record.rule_flags)
+                    }),
+                }
+                raise error
         _validate_risk_findings(bundle.document, validated_result.risk_findings)
         safe_risk_findings = _redact_sensitive_risk_findings(
             validated_result.risk_findings
@@ -575,6 +624,7 @@ class AuditService:
                 semantic_judgments,
                 risk_points=risk_points,
                 risk_metrics=risk_metrics,
+                expression_findings=expression_findings,
             )
         except ValidationError as exc:
             raise _audit_service_error(
@@ -987,6 +1037,7 @@ def _build_dimensions(
     *,
     risk_points: int,
     risk_metrics: dict[str, int | float],
+    expression_findings: list[ExpressionFinding] | None = None,
 ) -> tuple[list[DimensionResult], dict[DimensionId, int]]:
     auditable_claims = [
         claim
@@ -1159,6 +1210,7 @@ def _build_dimensions(
         records_by_claim,
         semantic_judgments,
         terminology_points,
+        expression_findings,
     )
     dimension_specs = [
         (
@@ -1224,6 +1276,10 @@ def _build_dimensions(
             {
                 "checks_passed": reader_checks_passed,
                 "checks_total": 5,
+                **({
+                    "expression_checks_complete": 2,
+                    "expression_checks_failed": sum(item.status == RiskStatus.DETECTED for item in expression_findings),
+                } if expression_findings is not None else {}),
             },
             reader_points,
         ),
@@ -1334,6 +1390,7 @@ def _reader_adaptation_level(
     records_by_claim: dict[str, list[EvidenceRecord]],
     judgments: list[SemanticJudgment],
     terminology_points: int,
+    expression_findings: list[ExpressionFinding] | None = None,
 ) -> tuple[int, int]:
     checks = [
         not required_section_flags(
@@ -1358,6 +1415,10 @@ def _reader_adaptation_level(
             for judgment in judgments
         ),
     ]
+    if expression_findings is not None:
+        statuses = {item.category: item.status for item in expression_findings}
+        checks[1] = checks[1] and statuses[ExpressionCategory.UNEXPLAINED_TERMINOLOGY] == RiskStatus.NOT_DETECTED
+        checks[2] = checks[2] and statuses[ExpressionCategory.REDUNDANCY_OR_OFF_TOPIC] == RiskStatus.NOT_DETECTED
     passed = sum(checks)
     if passed == 5:
         points = 4
@@ -1370,6 +1431,29 @@ def _reader_adaptation_level(
     else:
         points = 0
     return points, passed
+
+
+def _validate_expression_findings(
+    document: ContentDraft | None, findings: list[ExpressionFinding],
+) -> None:
+    categories = [item.category for item in findings]
+    valid = len(categories) == 2 and set(categories) == set(ExpressionCategory)
+    sentence_texts = {} if document is None else {
+        sentence.sentence_id: sentence.text
+        for section in document.sections for sentence in section.sentences
+    }
+    for finding in findings:
+        valid = valid and (bool(finding.locations) if finding.status == RiskStatus.DETECTED else not finding.locations)
+        for location in finding.locations:
+            excerpt = normalize_evidence_text(location.evidence_excerpt or "")
+            valid = valid and (
+                location.location_type == RiskLocationType.SENTENCE
+                and location.sentence_id in sentence_texts
+                and bool(excerpt)
+                and excerpt in normalize_evidence_text(sentence_texts.get(location.sentence_id, ""))
+            )
+    if not valid:
+        raise AuditServiceError("AUDIT_INCOMPLETE", "Expression findings are incomplete.", retryable=True)
 
 
 def _validate_risk_findings(

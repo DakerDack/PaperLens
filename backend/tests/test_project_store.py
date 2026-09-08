@@ -248,6 +248,28 @@ def save_generated_and_quick_checked(
     return version_id, bundle, evidence, quick_report
 
 
+@pytest.mark.parametrize("legacy", [True, False])
+def test_document_expression_contract_persisted_reports_round_trip(tmp_path, legacy):
+    from backend.app.models import DeepAuditResultV2
+    store = parsed_store(tmp_path)
+    version, bundle, evidence, _ = save_generated_and_quick_checked(store, tmp_path)
+    audit = mock_audit_service(tmp_path)
+    context = ComplianceContext(rights_or_license_confirmed=True,
+        source_disclosure_status="present", ai_assistance_disclosure_status="present",
+        generated_content_label_applicability="not_applicable", generated_content_label_status="not_applicable")
+    if legacy:
+        result = DeepAuditResultV2.model_validate_json((FIXTURES / "deep_audit_valid.json").read_text(encoding="utf-8"))
+        report = audit.score_legacy_v2(bundle, evidence.evidence_records, result, context)
+    else:
+        _, report = audit.run_deep_audit(bundle, evidence.evidence_records, context)
+    store.save_deep_audit(project_id="project-001", version_id=version, report=report,
+        metadata=success_metadata(), usage=empty_usage(), started_at=NOW, ended_at=NOW)
+    restored = ProjectStore(tmp_path).get_project_view("project-001", model_mode="mock")
+    assert bool(restored.audit_report == report), "PERSISTED_REPORT_MISMATCH"
+    assert bool(restored.document == bundle.document), "DOCUMENT_CHANGED"
+    assert len(restored.audit_report.dimensions) == 8
+
+
 def save_deep_audited(
     store: ProjectStore,
     tmp_path: Path,

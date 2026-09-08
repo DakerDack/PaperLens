@@ -268,7 +268,100 @@ def verified_claim_evidence_pairs() -> list[tuple[AtomicClaim, EvidenceRecord]]:
 
 
 def valid_deep_audit_json() -> str:
-    return (FIXTURES / "deep_audit_valid.json").read_text(encoding="utf-8")
+    return (FIXTURES / "deep_audit_v3_valid.json").read_text(encoding="utf-8")
+
+
+def test_document_expression_contract_dispatch_requires_expression_schema():
+    client = FakeClient([valid_deep_audit_json()])
+    service = Hy3Service(settings=live_settings(), client=client)
+    service.deep_audit(document=generated_bundle().document,
+                       claim_evidence_pairs=verified_claim_evidence_pairs())
+    request = client.completions.calls[0]
+    schema = request["response_format"]["json_schema"]["schema"]
+    assert "expression_findings" in schema["required"], "DISPATCH_EXPRESSION_REQUIRED"
+
+
+@pytest.mark.parametrize("damage,code", [
+    ("missing", "SCHEMA_INVALID"), ("status", "SCHEMA_INVALID"),
+    ("duplicate", "AUDIT_INCOMPLETE"), ("empty", "AUDIT_INCOMPLETE"),
+    ("wrong_sentence", "AUDIT_INCOMPLETE"), ("wrong_excerpt", "AUDIT_INCOMPLETE"),
+    ("document_location", "AUDIT_INCOMPLETE"), ("unexpected_location", "AUDIT_INCOMPLETE"),
+])
+def test_document_expression_contract_invalid_response_is_bounded(damage, code):
+    payload = json.loads(valid_deep_audit_json())
+    item = payload["expression_findings"][0]
+    sentence = generated_bundle().document.sections[0].sentences[0]
+    location = {"location_type": "sentence", "sentence_id": sentence.sentence_id,
+                "evidence_excerpt": sentence.text[:100]}
+    if damage == "missing":
+        del payload["expression_findings"]
+    elif damage == "status":
+        item["status"] = "INVALID"
+    elif damage == "duplicate":
+        payload["expression_findings"][1] = item.copy()
+    elif damage == "empty":
+        item["status"] = "detected"
+    else:
+        item.update(status="detected", locations=[location])
+        if damage == "wrong_sentence": location["sentence_id"] = "unknown-sentence"
+        if damage == "wrong_excerpt": location["evidence_excerpt"] = "UNRELATED_SYNTHETIC_TEXT"
+        if damage == "document_location": location["location_type"] = "document"
+        if damage == "unexpected_location": item["status"] = "not_detected"
+    client = FakeClient([json.dumps(payload)] * 3)
+    service = Hy3Service(settings=live_settings(), client=client)
+    with pytest.raises(Hy3ServiceError) as caught:
+        service.deep_audit(document=generated_bundle().document,
+                           claim_evidence_pairs=verified_claim_evidence_pairs())
+    assert caught.value.error_code == code
+    assert len(client.completions.calls) == 3
+
+
+@pytest.mark.parametrize("risk_only", [False, True])
+def test_document_expression_contract_actual_payload_and_unclear_not_retried(risk_only):
+    bundle = generated_bundle()
+    payload = json.loads(valid_deep_audit_json())
+    pairs = [] if risk_only else verified_claim_evidence_pairs()
+    if risk_only: payload["semantic_judgments"] = []
+    payload["expression_findings"][0]["status"] = "unclear"
+    client = FakeClient([json.dumps(payload)])
+    service = Hy3Service(settings=live_settings(), client=client)
+    result = service.deep_audit(document=bundle.document, claim_evidence_pairs=pairs)
+    assert result.expression_findings[0].status.value == "unclear"
+    assert len(client.completions.calls) == 1
+    request = client.completions.calls[0]
+    pair_region, document_region = _deep_audit_prompt_input_regions(request)
+    assert bool(bundle.document.model_dump_json() in document_region), "FULL_DOCUMENT_REQUIRED"
+    user_text = request["messages"][1]["content"]
+    for marker in ("redundancy_or_off_topic", "unexplained_terminology", "sensitive_information", "author_impersonation", "academic_integrity", "必要复述", "合法长句", "上下文已解释"):
+        assert bool(marker in user_text), "DISPATCH_CONTRACT_MISSING"
+    assert bool("任务一" not in document_region), "PAIR_REGION_INDEPENDENT"
+    assert not any(label in user_text for label in ('"quality_label"', '"case_id"', '"paper_id"', '"known_error_type"'))
+    assert request["temperature"] == 0 and request["stream"] is False
+    assert request["response_format"]["json_schema"]["name"] == "paperlens_deep_audit_result_v3"
+
+
+def test_document_expression_contract_detected_flows_from_client_to_score():
+    from backend.app.audit_service import AuditService
+    from backend.app.models import ComplianceContext
+    bundle = generated_bundle()
+    payload = json.loads(valid_deep_audit_json())
+    sentence = bundle.document.sections[0].sentences[0]
+    for finding in payload["expression_findings"]:
+        finding.update(status="detected", locations=[{
+            "location_type": "sentence", "sentence_id": sentence.sentence_id,
+            "evidence_excerpt": sentence.text[:100],
+        }])
+    client = FakeClient([json.dumps(payload)])
+    audit = AuditService(hy3_service=Hy3Service(settings=live_settings(), client=client))
+    evidence = [record for _, record in verified_claim_evidence_pairs()]
+    context = ComplianceContext(rights_or_license_confirmed=True,
+        source_disclosure_status="present", ai_assistance_disclosure_status="present",
+        generated_content_label_applicability="not_applicable", generated_content_label_status="not_applicable")
+    result, report = audit.run_deep_audit(bundle, evidence, context)
+    reader = next(d for d in report.dimensions if d.dimension_id.value == "reader_adaptation")
+    assert reader.raw_metrics["checks_passed"] == 3
+    assert len(client.completions.calls) == 1
+    assert all(f.status.value == "detected" for f in result.expression_findings)
 
 
 def risk_only_deep_audit_with_extra_finding_field(
@@ -956,9 +1049,9 @@ def test_deep_audit_prompt_centralizes_v2_document_contract() -> None:
         )
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v6"
-    assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
-    assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v2"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v7"
+    assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v3"
+    assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v3"
     assert "逐条判断" in prompt
     assert "insufficient" in prompt
     assert "sensitive_information" in prompt
@@ -981,8 +1074,8 @@ def test_deep_audit_prompt_defines_non_hedging_semantic_contract() -> None:
         ),
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v6"
-    assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v7"
+    assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v3"
     assert "relation=supports：仅当 evidence 直接蕴含 claim 的全部实质事实时选择。" in prompt
     assert "relation=contradicts：当数字、方向、因果、比较或结论冲突时选择。" in prompt
     assert "relation=insufficient：仅当给定 evidence 缺少对 claim 的直接支持时选择。" in prompt
@@ -1035,9 +1128,9 @@ def test_deep_audit_prompt_closes_severity_decision_contract() -> None:
         ),
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v6"
-    assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v2"
-    assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v2"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v7"
+    assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v3"
+    assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v3"
     assert (
         "severity=major：错误会实质改变对一个主张的理解，例如重要范围、因果、数值、比较"
         "或方向发生变化，但尚未推翻核心或关键结论。"
@@ -1186,7 +1279,7 @@ def test_deep_audit_prompt_isolates_claim_scope() -> None:
         for rule, category in (
             (
                 "任务一的局部事实与范围判断只能使用当前 item 的 claim 和 evidence；"
-                "完整 document 仅供任务二文档风险检查，不得为当前配对补充边界或借入其他句子的问题。",
+                "完整 document 仅供任务二文档风险及任务三表达检查，不得为当前配对补充边界或借入其他句子的问题。",
                 "LOCAL_SCOPE_INPUT_BOUNDARY_MISSING",
             ),
             (
@@ -1492,7 +1585,7 @@ def test_deep_audit_prompt_dispatches_pairs_before_complete_risk_document(
     assert request["stream"] is False
     schema = request["response_format"]["json_schema"]
     assert request["response_format"]["type"] == "json_schema"
-    assert schema["name"] == "paperlens_deep_audit_result_v2"
+    assert schema["name"] == "paperlens_deep_audit_result_v3"
     assert schema["strict"] is True
     assert request["response_format"] == Hy3Service._deep_audit_response_format()
     assert_closed_objects(schema["schema"])
@@ -1713,8 +1806,8 @@ def test_live_deep_audit_schema_error_retries_and_logs_safely(caplog) -> None:
     retry_prompt = client.completions.calls[1]["messages"][1]["content"]
     assert retry_prompt.count("字段错误摘要：") == 1
     assert invalid not in retry_prompt
-    assert "prompt_version=audit-v6" in caplog.text
-    assert "schema_version=deep-audit-result-v2" in caplog.text
+    assert "prompt_version=audit-v7" in caplog.text
+    assert "schema_version=deep-audit-result-v3" in caplog.text
     assert "retries=1" in caplog.text
     assert invalid not in caplog.text
     assert source_secret not in caplog.text
@@ -1745,10 +1838,11 @@ def test_live_deep_audit_extra_field_uses_actionable_safe_retry(
     def track_validation(
         raw_response: Any,
         expected_pairs: set[tuple[str, str]],
+        document=None,
     ) -> DeepAuditResult:
         validation_inputs.append(raw_response)
         try:
-            return original_validate(raw_response, expected_pairs)
+            return original_validate(raw_response, expected_pairs, document)
         except Hy3ServiceError as exc:
             rejected_summaries.append(exc.field_error_summary or "")
             raise
@@ -1961,8 +2055,9 @@ def test_live_risk_only_deep_audit_retries_invalid_categories_then_succeeds(
     def track_valid_result(
         raw_response: Any,
         expected_pairs: set[tuple[str, str]],
+        document=None,
     ) -> DeepAuditResult:
-        result = original_validate(raw_response, expected_pairs)
+        result = original_validate(raw_response, expected_pairs, document)
         accepted_results.append(result)
         return result
 
@@ -3367,8 +3462,9 @@ def test_live_deep_audit_huge_usage_does_not_mask_valid_result(
     def track_valid_result(
         raw_response: Any,
         expected_pairs: set[tuple[str, str]],
+        document=None,
     ) -> DeepAuditResult:
-        result = original_validator(raw_response, expected_pairs)
+        result = original_validator(raw_response, expected_pairs, document)
         accepted.append(result)
         return result
 

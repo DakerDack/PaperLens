@@ -235,6 +235,8 @@ def deep_result(
     risk_findings: list[RiskFinding] | None = None,
 ) -> DeepAuditResult:
     return DeepAuditResult(
+        expression_findings=[{"category": category, "status": "not_detected", "locations": []}
+                             for category in ("redundancy_or_off_topic", "unexplained_terminology")],
         semantic_judgments=judgments,
         risk_findings=(
             clear_risk_findings() if risk_findings is None else risk_findings
@@ -279,6 +281,77 @@ class RecordingDeepAudit:
             ],
             risk_findings=self.risk_findings,
         )
+
+
+@pytest.mark.parametrize("category", ["redundancy_or_off_topic", "unexplained_terminology"])
+def test_document_expression_contract_scoring_counts_category_once(category):
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    service = RecordingDeepAudit()
+    result = service.deep_audit(document=bundle.document, claim_evidence_pairs=AuditService().semantic_pairs(bundle, records))
+    baseline = AuditService().score(bundle, records, result, compliance_context())
+    payload = result.model_dump(mode="json")
+    finding = next(item for item in payload["expression_findings"] if item["category"] == category)
+    sentence = bundle.document.sections[0].sentences[0]
+    location = {"location_type": "sentence", "sentence_id": sentence.sentence_id, "evidence_excerpt": sentence.text[:100]}
+    finding.update(status="detected", locations=[location, location.copy()])
+    result = DeepAuditResult.model_validate(payload)
+    report = AuditService().score(bundle, records, result, compliance_context())
+    for before, after in zip(baseline.dimensions, report.dimensions):
+        if before.dimension_id.value == "reader_adaptation":
+            assert after.raw_metrics["checks_passed"] == before.raw_metrics["checks_passed"] - 1
+        else:
+            assert before == after
+    assert report.hard_failures == baseline.hard_failures
+
+
+def test_document_expression_contract_unclear_preserves_observed_fact_alert():
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    result = RecordingDeepAudit().deep_audit(document=bundle.document, claim_evidence_pairs=AuditService().semantic_pairs(bundle, records))
+    payload = result.model_dump(mode="json")
+    payload["expression_findings"][0]["status"] = "unclear"
+    payload["semantic_judgments"][0].update(relation="contradicts", severity="critical")
+    with pytest.raises(AuditServiceError) as caught:
+        AuditService().score(bundle, records, DeepAuditResult.model_validate(payload), compliance_context())
+    assert caught.value.error_code == "AUDIT_INCOMPLETE"
+    assert caught.value.retryable is False
+    assert caught.value.safe_metrics["observed_factual_issue_codes"]
+    assert "overall_score" not in caught.value.safe_metrics
+
+    payload["semantic_judgments"][0].update(relation="supports", scope_status="expanded", severity="minor")
+    with pytest.raises(AuditServiceError) as minor:
+        AuditService().score(bundle, records, DeepAuditResult.model_validate(payload), compliance_context())
+    assert minor.value.safe_metrics.get("observed_factual_alert_count", 0) > 0
+
+
+def test_document_expression_contract_legacy_score_is_explicit():
+    from backend.app.models import DeepAuditResultV2
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    old = DeepAuditResultV2.model_validate_json((FIXTURES / "deep_audit_valid.json").read_text(encoding="utf-8"))
+    report = AuditService().score_legacy_v2(bundle, records, old, compliance_context())
+    assert report.audit_status == AuditStatus.DEEP_COMPLETE
+    with pytest.raises(AuditServiceError):
+        AuditService().score(bundle, records, old, compliance_context())
+
+
+@pytest.mark.parametrize("text", [
+    "Keep the sample sealed during handling. This reminder repeats the handling instruction for safety.",
+    "Luma denotes the indicator color in this explanation; the Luma label is used consistently below.",
+    "The descriptive guide follows the arrangement of the components along the edge of the container and names each part in the same order as the accompanying overview for readers who are inspecting the setup for the first time.",
+])
+def test_document_expression_contract_negative_controls_keep_existing_checks(text):
+    bundle = generated_bundle()
+    records, _ = AuditService().quick_check(bundle, source_blocks_fixture())
+    provider = RecordingDeepAudit()
+    audit = AuditService(hy3_service=provider)
+    _, baseline = audit.run_deep_audit(bundle, records, compliance_context())
+    sentence = bundle.document.sections[0].sentences[0].model_copy(update={"sentence_id": "expression-control", "text": text})
+    bundle.document.sections[0].sentences.append(sentence)
+    _, after = audit.run_deep_audit(bundle, records, compliance_context())
+    assert after.dimensions == baseline.dimensions
+    assert bool(provider.documents[-1] == bundle.document), "FULL_DOCUMENT_REQUIRED"
 
 
 def test_evidence_correct_model_block_and_quote_copy_source_location() -> None:
@@ -2660,6 +2733,7 @@ def test_audit_diagnostic_classifies_deep_audit_result_validation(
         {
             "semantic_judgments": [],
             "risk_findings": "PYDANTIC_INPUT_SENTINEL",
+            "expression_findings": [],
         }
     )
 

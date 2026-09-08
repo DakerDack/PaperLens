@@ -4,9 +4,9 @@ from backend.app.models import ClaimPolicy
 GENERATION_PROMPT_VERSION = "gen-v4"
 GENERATION_SCHEMA_VERSION = "generated-bundle-v1"
 GENERATION_SCHEMA_NAME = "paperlens_generated_bundle_v1"
-DEEP_AUDIT_PROMPT_VERSION = "audit-v6"
-DEEP_AUDIT_SCHEMA_VERSION = "deep-audit-result-v2"
-DEEP_AUDIT_SCHEMA_NAME = "paperlens_deep_audit_result_v2"
+DEEP_AUDIT_PROMPT_VERSION = "audit-v7"
+DEEP_AUDIT_SCHEMA_VERSION = "deep-audit-result-v3"
+DEEP_AUDIT_SCHEMA_NAME = "paperlens_deep_audit_result_v3"
 REVISION_PROMPT_VERSION = "revision-v2"
 REVISION_SCHEMA_VERSION = "edit-patch-v1"
 REVISION_SCHEMA_NAME = "paperlens_edit_patch_v1"
@@ -79,7 +79,7 @@ DEEP_AUDIT_USER_PROMPT_TEMPLATE = """任务一：逐条判断 claim 是否被给
 
 每个输出必须保留对应输入的 claim_id 和 evidence.block_id，且每个输入项恰好返回一次判断。
 不得参考分数、预设质量档位、攻击标签或其他 claim 的最终判断。
-任务一的局部事实与范围判断只能使用当前 item 的 claim 和 evidence；完整 document 仅供任务二文档风险检查，不得为当前配对补充边界或借入其他句子的问题。
+任务一的局部事实与范围判断只能使用当前 item 的 claim 和 evidence；完整 document 仅供任务二文档风险及任务三表达检查，不得为当前配对补充边界或借入其他句子的问题。
 不得根据其他句子的问题数量、文档整体质量、其他配对或排列顺序改变当前 relation、scope_status、terminology_status、severity。
 判 expanded 前，必须能在当前 claim/evidence 中指出本断言实际丢失或改变的必要条件、数值精度或比较基准；不能用文档级印象代替局部证据。
 逐项检查顺序：
@@ -128,6 +128,16 @@ risk_findings 必须仍为长度恰好为 3 的数组，并使用以下固定顺
 - risk_findings[1].category 必须为 author_impersonation
 - risk_findings[2].category 必须为 academic_integrity
 禁止缺失、重复、增加类别或返回空 risk_findings。
+
+任务三：独立检查完整 document（包括没有 claim 的句子）的表达，不改变任务一事实配对和任务二三类风险判断。
+expression_findings 必填且恰好两项，每类一次；每项仅有 category、status、locations：
+- redundancy_or_off_topic：没有信息增量的重复或偏离当前主题、影响表达组织。
+- unexplained_terminology：影响理解且当前上下文没有解释的术语；术语含义错误仍由任务一 terminology_status 判断。
+status 必须明确选择 not_detected、detected 或 unclear。无法判断使用 unclear，不得猜测为未发现。
+detected 必须提供至少一个句子位置；每个位置只含 location_type=sentence、当前文档实际存在的 sentence_id、与该句匹配的非空短摘录 evidence_excerpt（最多 160 字符）。不得用 document 或 title 位置。
+not_detected 和 unclear 的 locations 必须为空。不返回 reason、severity、分数或完整覆盖句子 ID 清单。
+必要复述、上下文已解释的术语、合法长句不能仅因长度或关键词判为问题；检查信息增量、主题关联和理解所需解释。
+即使 items 为空也必须完成两类表达检查；只定位实际发现的问题，不为凑覆盖制造位置。
 每个 RiskFinding 对象只能且必须包含 category、status、locations、reason、remediation。
 每个 RiskLocation 对象只能且必须包含 location_type、sentence_id、evidence_excerpt。
 evidence_excerpt 只能存在于 locations 数组的 RiskLocation 对象中；evidence_excerpt 不得成为 RiskFinding 顶层字段。
@@ -140,7 +150,7 @@ sensitive_information 的 evidence_excerpt 必须为 null，reason 和 remediati
 不得判断许可、来源披露、AI 辅助披露或生成内容标识是否适用和存在。
 不得返回风险等级、分数、权重、硬失败、decision、页码或 bbox。
 
-输出：严格符合 DeepAuditResult v2 JSON Schema 的单个 JSON 对象。"""
+输出：严格符合 DeepAuditResult v3 JSON Schema 的单个 JSON 对象。"""
 
 
 SENTENCE_REVISION_USER_PROMPT_TEMPLATE = """任务：根据用户意图生成一个句子级待确认 EditPatch，不直接修改文档。

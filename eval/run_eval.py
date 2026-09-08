@@ -34,6 +34,7 @@ from backend.app.models import (
     CORE_DIMENSION_GATES,
     ComplianceContext,
     DeepAuditResult,
+    DeepAuditResultV2,
     DIMENSION_WEIGHTS,
     EditPatch,
     GeneratedBundle,
@@ -54,6 +55,7 @@ from backend.app.prompts import (
 
 SUPPORTED_MODES = ("smoke", "calibrate", "final", "stability")
 RESULT_VERSION = "paperlens-eval-result-v1"
+EVALUATION_METHOD_VERSION = "paperlens-stage7-method-v2"
 ResultStatus = Literal["succeeded", "failed", "timeout", "unsupported"]
 _REQUIRED_RESULT_FIELDS = (
     "result_version",
@@ -1013,12 +1015,15 @@ def _evaluation_case_error(
     if not isinstance(error_code, str) or not _ERROR_CODE_PATTERN.fullmatch(error_code):
         error_code = "EVALUATION_FAILED"
     provider_calls, usage = _aggregate_observations(observations)
-    return EvaluationCaseError(
+    error = EvaluationCaseError(
         status="timeout" if error_code == "TIMEOUT" else "failed",
         error_code=error_code,
         provider_calls=provider_calls,
         usage=usage,
     )
+    error.safe_metrics = {"evaluation_method_version": EVALUATION_METHOD_VERSION,
+                          **getattr(exc, "safe_metrics", {})}
+    return error
 
 
 def _find_sentence(bundle: GeneratedBundle, sentence_id: str) -> Any:
@@ -1053,6 +1058,64 @@ def _replace_revised_sentence_claims(
     return GeneratedBundle.model_validate(data)
 
 
+def _expression_metrics(result: DeepAuditResult) -> list[dict[str, Any]]:
+    return [
+        {"category": finding.category.value, "status": finding.status.value,
+         "sentence_ids": sorted({location.sentence_id for location in finding.locations})}
+        for finding in sorted(result.expression_findings, key=lambda item: item.category.value)
+    ]
+
+
+def validate_expression_metrics(record: Mapping[str, Any]) -> bool:
+    """Validate new method provenance; absent historical signals stay absent."""
+    metrics = record.get("metrics", {})
+    current = record.get("schema_version") == "deep-audit-result-v3" or (
+        isinstance(metrics, dict) and "evaluation_method_version" in metrics
+    )
+    if not current:
+        return False
+    invalid = ValueError("invalid expression metrics")
+    if not isinstance(metrics, dict):
+        raise invalid
+    if "observed_factual_alert_count" in metrics:
+        count = metrics["observed_factual_alert_count"]
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise invalid
+    if "observed_factual_issue_codes" in metrics:
+        codes = metrics["observed_factual_issue_codes"]
+        if not isinstance(codes, list) or any(
+            not isinstance(code, str) or not _ERROR_CODE_PATTERN.fullmatch(code)
+            for code in codes
+        ):
+            raise invalid
+    if record.get("status") == "succeeded" and metrics.get("evaluation_method_version") != EVALUATION_METHOD_VERSION:
+        raise invalid
+    if "expression_findings" not in metrics:
+        if record.get("status") == "succeeded":
+            raise invalid
+        return False
+    findings = metrics["expression_findings"]
+    if not isinstance(findings, list) or len(findings) != 2:
+        raise invalid
+    categories = set()
+    for finding in findings:
+        if not isinstance(finding, dict) or set(finding) != {"category", "status", "sentence_ids"}:
+            raise invalid
+        category, status, ids = finding["category"], finding["status"], finding["sentence_ids"]
+        if not isinstance(category, str) or category not in {"redundancy_or_off_topic", "unexplained_terminology"} or category in categories:
+            raise invalid
+        categories.add(category)
+        if not isinstance(status, str) or status not in {"detected", "not_detected", "unclear"} or not isinstance(ids, list):
+            raise invalid
+        if any(not isinstance(sid, str) or not _CONTEXT_IDENTIFIER.fullmatch(sid) for sid in ids):
+            raise invalid
+        if len(ids) != len(set(ids)) or (bool(ids) != (status == "detected")):
+            raise invalid
+        if record.get("status") == "succeeded" and status == "unclear":
+            raise invalid
+    return record.get("status") == "succeeded"
+
+
 def _live_report_metrics(
     *,
     case: EvaluationCase,
@@ -1064,6 +1127,8 @@ def _live_report_metrics(
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "provider_mode": "live",
+        "evaluation_method_version": EVALUATION_METHOD_VERSION,
+        "expression_findings": _expression_metrics(deep_result),
         "paper_id": case.payload.get("paper_id"),
         "case_group": case.payload.get("case_group"),
         "dimension_count": len(report.dimensions),
@@ -1379,11 +1444,20 @@ def _attack_detected(
         if judgment.severity.value in {"major", "critical"}:
             return True
     if not target_claim_ids:
+        expression_category = {
+            "length_padding": "redundancy_or_off_topic",
+            "terminology_stuffing": "unexplained_terminology",
+        }.get(attack.get("attack_type"))
+        if expression_category is not None:
+            return any(
+                finding.category.value == expression_category
+                and finding.status.value == "detected"
+                and any(location.sentence_id == target_sentence_id for location in finding.locations)
+                for finding in deep_result.expression_findings
+            )
         dimension_ids = {
             "limitation_deletion": "conclusion_limitations",
-            "terminology_stuffing": "terminology",
             "rubric_prompt_injection": "risk_compliance",
-            "length_padding": "reader_adaptation",
         }
         dimension_id = dimension_ids.get(attack.get("attack_type"))
         if dimension_id is not None:
@@ -1595,6 +1669,8 @@ def _revision_metrics(
         evidence_records=after_evidence,
         deep_result=after_result,
     )
+    metrics["evaluation_method_version"] = EVALUATION_METHOD_VERSION
+    metrics["expression_findings"] = _expression_metrics(after_result)
     return metrics
 
 
@@ -1648,7 +1724,7 @@ def evaluate_smoke_case(case: EvaluationCase) -> dict[str, object]:
         raise ValueError("smoke source blocks must be an array")
     source_blocks = [SourceBlock.model_validate(item) for item in source_data]
     bundle = GeneratedBundle.model_validate(bundle_data)
-    deep_audit_result = DeepAuditResult.model_validate(audit_data)
+    deep_audit_result = DeepAuditResultV2.model_validate(audit_data)
     compliance_context = ComplianceContext(
         rights_or_license_confirmed=True,
         source_disclosure_status="present",
@@ -1658,7 +1734,7 @@ def evaluate_smoke_case(case: EvaluationCase) -> dict[str, object]:
     )
     audit_service = AuditService()
     evidence_records, _ = audit_service.quick_check(bundle, source_blocks)
-    report = audit_service.score(
+    report = audit_service.score_legacy_v2(
         bundle,
         evidence_records,
         deep_audit_result,
@@ -1817,7 +1893,7 @@ def _run_cases_unlocked(
         except EvaluationCaseError as exc:
             provider_calls = exc.provider_calls
             normalized_usage = exc.usage
-            normalized_metrics = {}
+            normalized_metrics = _normalize_metrics(getattr(exc, "safe_metrics", {}))
             status = exc.status
             error_code = exc.error_code
             if diagnostic_plan is not None and hasattr(exc, "context_diagnostic"):
@@ -1971,6 +2047,7 @@ def _validate_existing_result(
             raise ValueError("usage must be an object")
         _normalize_usage(usage)
         _normalize_metrics(record["metrics"])
+        validate_expression_metrics(record)
     except Exception:
         raise ValueError(f"invalid existing result at line {line_number}") from None
 
@@ -2326,6 +2403,7 @@ def _freeze_payload() -> dict[str, Any]:
     settings = Hy3Service().settings
     return {
         "freeze_version": FREEZE_VERSION,
+        "evaluation_method_version": EVALUATION_METHOD_VERSION,
         "manifest_version": manifest["manifest_version"],
         "data_version": manifest["data_version"],
         "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
@@ -2590,8 +2668,8 @@ def main() -> int:
         manifest = _load_smoke_manifest()
         versions = VersionInfo(
             model="hy3-reference-replay",
-            prompt_version=DEEP_AUDIT_PROMPT_VERSION,
-            schema_version=DEEP_AUDIT_SCHEMA_VERSION,
+            prompt_version="audit-v2",
+            schema_version="deep-audit-result-v2",
             data_version=manifest["data_version"],
             code_version=_code_version(),
         )

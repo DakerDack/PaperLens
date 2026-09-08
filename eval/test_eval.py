@@ -279,7 +279,7 @@ def test_context_diagnostic_fingerprint_matches_actual_provider_request(monkeypa
         pairs = audit.semantic_pairs(bundle, records)
         prompt = Hy3Service._build_deep_audit_prompt(bundle.document, pairs)
         with pytest.raises(Captured):
-            service._deep_audit_live(prompt, {(c.claim_id, e.block_id) for c, e in pairs})
+            service._deep_audit_live(prompt, {(c.claim_id, e.block_id) for c, e in pairs}, bundle.document)
         assert captured[-1] == context["request_sha256"]
     assert len(captured) == 3
     assert reference.calls == []
@@ -2693,6 +2693,8 @@ class _FakeLiveService:
         self.calls.append("deep_audit")
         self._observe("deep_audit")
         return DeepAuditResult(
+            expression_findings=[{"category": category, "status": "not_detected", "locations": []}
+                                 for category in ("redundancy_or_off_topic", "unexplained_terminology")],
             semantic_judgments=[
                 SemanticJudgment(
                     claim_id=claim.claim_id,
@@ -3087,7 +3089,7 @@ def _attack_attribution_contract_inputs(*, has_target=True, signal=None, points=
         attack={"target_sentence_id": "synthetic-target" if has_target else "synthetic-absent-target",
                 "attack_type": "numeric_tampering"},
         bundle=bundle, source_blocks=sources, evidence_records=evidence,
-        deep_result=DeepAuditResult(semantic_judgments=judgments, risk_findings=[]),
+        deep_result=DeepAuditResult(expression_findings=[{"category": category, "status": "not_detected", "locations": []} for category in ("redundancy_or_off_topic", "unexplained_terminology")], semantic_judgments=judgments, risk_findings=[]),
         report=SimpleNamespace(dimensions=dimensions),
     )
 
@@ -3098,6 +3100,124 @@ _ATTRIBUTION_NON_TARGET_ANOMALIES = [
     {"terminology_status": "misused"}, {"terminology_status": "unclear"},
     {"relation": "contradicts", "scope_status": "expanded", "terminology_status": "misused"},
 ]
+
+
+@pytest.mark.parametrize(("attack_type", "dimension"), [
+    ("length_padding", "reader_adaptation"),
+    ("terminology_stuffing", "terminology"),
+])
+def test_document_expression_contract_global_dimension_is_not_target_evidence(attack_type, dimension):
+    import eval.run_eval as runner
+    inputs = _attack_attribution_contract_inputs(has_target=False, points={dimension: 0})
+    inputs["attack"]["attack_type"] = attack_type
+    detected = runner._attack_detected(**inputs)
+    assert detected is False, "TARGET_EXPRESSION_REQUIRED"
+
+
+@pytest.mark.parametrize("attack_type,category", [
+    ("length_padding", "redundancy_or_off_topic"),
+    ("terminology_stuffing", "unexplained_terminology"),
+])
+@pytest.mark.parametrize("position", ["target", "unrelated", "wrong_category"])
+def test_document_expression_contract_attack_requires_matching_category_and_sentence(attack_type, category, position):
+    from backend.app.models import ExpressionFinding
+    import eval.run_eval as runner
+    inputs = _attack_attribution_contract_inputs(has_target=False)
+    sentence = inputs["bundle"].document.sections[0].sentences[0]
+    inputs["attack"].update(attack_type=attack_type, target_sentence_id=sentence.sentence_id)
+    assert not any(c.sentence_id == sentence.sentence_id for c in inputs["bundle"].claims)
+    findings = inputs["deep_result"].expression_findings
+    if position == "wrong_category":
+        category = next(f.category.value for f in findings if f.category.value != category)
+    sid = sentence.sentence_id if position != "unrelated" else "synthetic-background"
+    for index, finding in enumerate(findings):
+        if finding.category.value == category:
+            findings[index] = ExpressionFinding(category=category, status="detected", locations=[
+                {"location_type": "sentence", "sentence_id": sid, "evidence_excerpt": "Synthetic background."}])
+    result = runner._attack_detected(**inputs)
+    assert result is (position == "target")
+
+
+def test_document_expression_contract_unknown_keeps_usage_and_failed_jsonl(tmp_path, monkeypatch):
+    import eval.run_eval as runner
+    import eval.build_report as report_module
+    revision, sources = _revision_metrics_fixture()
+    bundle = revision["after_bundle"]
+    monkeypatch.setattr(runner, "materialize_live_case", lambda _: (sources, bundle))
+    monkeypatch.setattr(report_module, "DEFAULT_FREEZE_PATH", tmp_path / "absent.json")
+    class UnknownService(_FakeLiveService):
+        def deep_audit(self, **kwargs):
+            result = super().deep_audit(**kwargs)
+            payload = result.model_dump(mode="json")
+            payload["expression_findings"][0]["status"] = "unclear"
+            return DeepAuditResult.model_validate(payload)
+    service = UnknownService()
+    case = EvaluationCase(case_id="quality:synthetic:good", run_index=0,
+        payload={"case_group": "quality", "paper_id": "synthetic", "quality_label": "good"})
+    versions = VersionInfo(model="hy3", prompt_version="audit-v7", schema_version="deep-audit-result-v3",
+        data_version="synthetic", code_version="synthetic")
+    path, output = tmp_path / "results.jsonl", tmp_path / "report.md"
+    run_cases(mode="calibrate", cases=[case], output_path=path, versions=versions,
+        evaluate=lambda c: evaluate_live_case(c, hy3_service=service))
+    record = _read_jsonl(path)[0]
+    assert record["status"] == "failed" and record["error_code"] == "AUDIT_INCOMPLETE"
+    assert record["provider_calls"] == 1 and record["usage"]["total_tokens"] == 140
+    assert len(service.calls) == 1
+    assert "overall_score" not in record["metrics"] and "attack_detected" not in record["metrics"]
+    summary = report_module.build_report(input_path=path, output_path=output)
+    assert all(g["status"] == "not_available" and g["observed"] is None for g in summary["acceptance_gates"]["gates"].values())
+    serialized = path.read_text(encoding="utf-8") + output.read_text(encoding="utf-8")
+    assert not any(word in serialized for word in ("evidence_excerpt", "Sensor A", "Synthetic background", '"reason"', '"prompt"'))
+
+
+@pytest.mark.parametrize("damage", ["missing_method", "missing_findings", "duplicate", "unclear", "excerpt", "bad_ids", "bad_count", "bad_codes"])
+def test_document_expression_contract_report_rejects_new_success_gaps(tmp_path, damage):
+    import eval.build_report as report_module
+    import eval.run_eval as runner
+    record = _existing_result()
+    record.update(prompt_version="audit-v7", schema_version="deep-audit-result-v3")
+    record["metrics"] = {"evaluation_method_version": runner.EVALUATION_METHOD_VERSION,
+        "expression_findings": [{"category": c, "status": "not_detected", "sentence_ids": []}
+            for c in ("redundancy_or_off_topic", "unexplained_terminology")]}
+    metrics = record["metrics"]
+    if damage == "missing_method": del metrics["evaluation_method_version"]
+    elif damage == "missing_findings": del metrics["expression_findings"]
+    elif damage == "duplicate": metrics["expression_findings"][1] = metrics["expression_findings"][0].copy()
+    elif damage == "unclear": metrics["expression_findings"][0]["status"] = "unclear"
+    elif damage == "excerpt": metrics["expression_findings"][0]["excerpt"] = "PRIVATE_SENTINEL"
+    elif damage == "bad_count": metrics["observed_factual_alert_count"] = {"private": "PRIVATE_SENTINEL"}
+    elif damage == "bad_codes": metrics["observed_factual_issue_codes"] = ["PRIVATE free text"]
+    else: metrics["expression_findings"][0]["sentence_ids"] = [123]
+    path, output = tmp_path / "input.jsonl", tmp_path / "output.md"
+    path.write_text(json.dumps(record)+"\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="^invalid expression metrics$"):
+        report_module.build_report(input_path=path, output_path=output)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("variant", ["current", "mixed", "failed", "legacy", "missing_freeze_method"])
+def test_document_expression_contract_stability_requires_current_complete_method(tmp_path, monkeypatch, variant):
+    import eval.run_eval as runner
+    records, freeze_path = _stability_coverage_contract_fixture(tmp_path, monkeypatch)
+    freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+    freeze["evaluation_method_version"] = runner.EVALUATION_METHOD_VERSION
+    if variant == "missing_freeze_method": del freeze["evaluation_method_version"]
+    freeze_path.write_text(json.dumps(freeze), encoding="utf-8")
+    for record in records:
+        if variant == "legacy" or (variant == "mixed" and record is records[0]):
+            continue
+        record.update(prompt_version="audit-v7", schema_version="deep-audit-result-v3")
+        record["metrics"].update(evaluation_method_version=runner.EVALUATION_METHOD_VERSION,
+            expression_findings=[{"category": c, "status": "not_detected", "sentence_ids": []}
+                for c in ("redundancy_or_off_topic", "unexplained_terminology")])
+    if variant == "failed":
+        records[0].update(status="failed", error_code="AUDIT_INCOMPLETE")
+        records[0]["metrics"].pop("overall_score")
+    summary = build_report_module.summarize_results(records)
+    for name in ("stability_mean_score_sd", "stability_dimension_consistency"):
+        gate = summary["acceptance_gates"]["gates"][name]
+        assert gate["status"] == ("passed" if variant == "current" else "not_available")
+        if variant != "current": assert gate["observed"] is None
 
 
 @pytest.mark.parametrize("has_target", [True, False])
@@ -3168,7 +3288,7 @@ def test_attack_detection_attribution_contract_dimension_fallback_keeps_boundari
         signal={"scope_status": "expanded", "severity": "minor"},
     )
     inputs["attack"]["attack_type"] = attack_type
-    assert runner._attack_detected(**inputs) is (not has_target and level < 4)
+    assert runner._attack_detected(**inputs) is (not has_target and level < 4 and attack_type in {"limitation_deletion", "rubric_prompt_injection"})
 
 
 @pytest.mark.parametrize("attack_type", [
@@ -3597,7 +3717,7 @@ def _revision_metrics_fixture(
     after = bundle((after_a, after_b), "-rebuilt")
 
     def result(candidate, severe_names):
-        return DeepAuditResult(semantic_judgments=[SemanticJudgment(
+        return DeepAuditResult(expression_findings=[{"category": category, "status": "not_detected", "locations": []} for category in ("redundancy_or_off_topic", "unexplained_terminology")], semantic_judgments=[SemanticJudgment(
             claim_id=claim.claim_id, block_id=claim.candidate_block_ids[0],
             relation="contradicts" if name in severe_names else "supports",
             scope_status="preserved", terminology_status="correct",
@@ -3826,7 +3946,7 @@ def test_revision_metrics_fail_closed_failed_jsonl_cannot_complete_revision_gate
     assert records[-1]["error_code"] == "EVALUATION_FAILED"
     assert records[-1]["provider_calls"] == 4
     assert records[-1]["usage"] == {"prompt_tokens": 400, "completion_tokens": 160, "total_tokens": 560}
-    assert records[-1]["metrics"] == {}
+    assert records[-1]["metrics"] == {"evaluation_method_version": "paperlens-stage7-method-v2"}
     summary = build_report(input_path=path, output_path=report_path)
     assert summary["revisions"]["completed"] == 4
     assert summary["status_counts"] == {"failed": 1, "succeeded": 4}
@@ -3953,7 +4073,8 @@ def test_revision_metrics_fail_closed_evidence_reanchor_jsonl_cannot_complete_ga
                      evaluate=lambda case: runner.evaluate_live_case(case, hy3_service=services[case.case_id]))
     records = _read_jsonl(path)
     failed = records[-1]
-    assert (failed["status"], failed["error_code"], failed["metrics"]) == ("failed", "EVALUATION_FAILED", {})
+    assert (failed["status"], failed["error_code"], failed["metrics"]) == (
+        "failed", "EVALUATION_FAILED", {"evaluation_method_version": "paperlens-stage7-method-v2"})
     assert failed["provider_calls"] == 4
     assert failed["usage"] == {"prompt_tokens": 400, "completion_tokens": 160, "total_tokens": 560}
     summary = build_report(input_path=path, output_path=output)
@@ -4032,19 +4153,19 @@ def test_freeze_configuration_records_manifest_and_model_contract_without_key(
     assert frozen["data_version"] == "paperlens-plos-abstracts-v1"
     assert len(frozen["manifest_sha256"]) == 64
     assert frozen["model"] == "hy3"
-    assert frozen["prompt_versions"]["deep_audit"] == "audit-v6"
-    assert frozen["schema_versions"]["deep_audit"] == "deep-audit-result-v2"
+    assert frozen["prompt_versions"]["deep_audit"] == "audit-v7"
+    assert frozen["schema_versions"]["deep_audit"] == "deep-audit-result-v3"
     assert frozen["overall_score_threshold"] == 75
     assert frozen["dimension_weights"]["factual_consistency"] == 0.20
     assert frozen["core_dimension_gates"]["risk_compliance"] == 3
     assert "api_key" not in json.dumps(frozen).casefold()
 
 
-def test_stage7_freeze_payload_tracks_audit_v6_without_schema_change() -> None:
+def test_stage7_freeze_payload_tracks_audit_v7_with_expression_schema() -> None:
     payload = _freeze_payload()
 
-    assert payload["prompt_versions"]["deep_audit"] == "audit-v6"
-    assert payload["schema_versions"]["deep_audit"] == "deep-audit-result-v2"
+    assert payload["prompt_versions"]["deep_audit"] == "audit-v7"
+    assert payload["schema_versions"]["deep_audit"] == "deep-audit-result-v3"
 
 
 def test_stage7_freeze_rejects_previous_prompt_version_without_rewriting(
@@ -4061,7 +4182,7 @@ def test_stage7_freeze_rejects_previous_prompt_version_without_rewriting(
         runner.freeze_configuration(output_path=freeze_path)
     original_hash = hashlib.sha256(freeze_path.read_bytes()).hexdigest()
 
-    assert runner.DEEP_AUDIT_PROMPT_VERSION == "audit-v6"
+    assert runner.DEEP_AUDIT_PROMPT_VERSION == "audit-v7"
     with pytest.raises(ValueError, match="^CONFIG_DRIFT$"):
         runner._require_frozen_configuration()
 

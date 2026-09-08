@@ -743,7 +743,7 @@ class RiskOnlyDeepAuditProvider:
         del document
         self.calls.append(claim_evidence_pairs)
         payload = json.loads(
-            (FIXTURES / "deep_audit_valid.json").read_text(encoding="utf-8")
+            (FIXTURES / "deep_audit_v3_valid.json").read_text(encoding="utf-8")
         )
         payload["semantic_judgments"] = []
         return DeepAuditResult.model_validate(payload)
@@ -2938,12 +2938,12 @@ def test_zero_claim_live_provider_retries_invalid_risk_categories_and_completes_
     )
     generation_payload["claims"] = []
     invalid_audit = json.loads(
-        (FIXTURES / "deep_audit_valid.json").read_text(encoding="utf-8")
+        (FIXTURES / "deep_audit_v3_valid.json").read_text(encoding="utf-8")
     )
     invalid_audit["semantic_judgments"] = []
     invalid_audit["risk_findings"] = invalid_audit["risk_findings"][:2]
     valid_audit = json.loads(
-        (FIXTURES / "deep_audit_valid.json").read_text(encoding="utf-8")
+        (FIXTURES / "deep_audit_v3_valid.json").read_text(encoding="utf-8")
     )
     valid_audit["semantic_judgments"] = []
     live_client = SequencedLiveClient(
@@ -3706,6 +3706,25 @@ class FailOnSecondDeepAudit:
                 usage=(13, 8, 21),
             )
         return self.delegate.run_deep_audit(*args)
+
+
+def test_document_expression_contract_unclear_does_not_overwrite_stable_snapshot(tmp_path, monkeypatch):
+    audit = explicit_mock_audit_service(tmp_path)
+    payload = json.loads((FIXTURES / "deep_audit_v3_valid.json").read_text(encoding="utf-8"))
+    with api_client(tmp_path, audit_service=audit) as (client, store, _):
+        upload_parsed_project(client)
+        assert generate_project(client).status_code == 200
+        assert client.post("/api/projects/project-001/audit", json=VALID_AUDIT_REQUEST).status_code == 200
+        stable = client.get("/api/projects/project-001").json()
+        payload["expression_findings"][0]["status"] = "unclear"
+        monkeypatch.setattr(audit.hy3_service, "_load_mock_deep_audit_response", lambda: json.dumps(payload))
+        response = client.post("/api/projects/project-001/audit", json=VALID_AUDIT_REQUEST)
+        assert response.status_code == 502
+        assert response.json()["error_code"] == "AUDIT_INCOMPLETE"
+        current = client.get("/api/projects/project-001").json()
+        for field in ("current_version_id", "document", "claims", "evidence_records", "audit_report"):
+            assert bool(current[field] == stable[field]), "STABLE_SNAPSHOT_CHANGED"
+        assert store.row_counts()["audits"] == 2
 
 
 def test_failed_reaudit_keeps_last_complete_audit_and_evidence(

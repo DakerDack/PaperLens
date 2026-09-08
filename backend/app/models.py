@@ -466,9 +466,25 @@ def fixed_risk_hard_failures(risk_findings: list[RiskFinding]) -> list[str]:
     ]
 
 
-class DeepAuditResult(StrictModel):
+class ExpressionCategory(str, Enum):
+    REDUNDANCY_OR_OFF_TOPIC = "redundancy_or_off_topic"
+    UNEXPLAINED_TERMINOLOGY = "unexplained_terminology"
+
+
+class ExpressionFinding(StrictModel):
+    category: ExpressionCategory
+    status: RiskStatus
+    locations: list[RiskLocation]
+
+
+class DeepAuditResultV2(StrictModel):
+    """Explicit historical reader; never the current provider contract."""
     semantic_judgments: list[SemanticJudgment]
     risk_findings: list[RiskFinding]
+
+
+class DeepAuditResult(DeepAuditResultV2):
+    expression_findings: list[ExpressionFinding]
 
 
 class RiskAssessment(StrictModel):

@@ -22,6 +22,8 @@ from eval.run_eval import (
     validate_context_diagnostic_record,
     DEFAULT_FREEZE_PATH,
     FREEZE_VERSION,
+    EVALUATION_METHOD_VERSION,
+    validate_expression_metrics,
     load_mode_cases,
     RESULT_VERSION,
     STAGE7_ACCEPTANCE_TARGETS,
@@ -81,11 +83,14 @@ def load_results(input_path: Path) -> list[dict[str, Any]]:
             if key in keys:
                 raise ValueError(f"duplicate result key at line {line_number}")
             keys.add(key)
+            validate_expression_metrics(record)
             records.append(record)
     return records
 
 
 def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
+    for record in records:
+        validate_expression_metrics(record)
     if any(isinstance(record.get("metrics"), dict) and "context_diagnostic" in record["metrics"] for record in records):
         return _summarize_context_diagnostic(records)
     status_counts = dict(sorted(Counter(record["status"] for record in records).items()))
@@ -142,6 +147,7 @@ def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
     revisions = _summarize_revisions(records)
     citation = _summarize_citation(records)
     freeze = _load_freeze_state(records)
+    expression_coverage = _expression_method_coverage(records, freeze)
     return {
         "attempted": len(records),
         "status_counts": status_counts,
@@ -171,6 +177,7 @@ def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
         "stability": stability,
         "revisions": revisions,
         "freeze": freeze,
+        "expression_audit": expression_coverage,
         "acceptance_gates": _summarize_acceptance_gates(
             quality=quality,
             known_error_detection=known_error_detection,
@@ -180,6 +187,7 @@ def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
             stability_coverage_complete=_stability_coverage_complete(records),
             revisions=revisions,
             freeze=freeze,
+            expression_coverage=expression_coverage,
         ),
     }
 
@@ -1160,6 +1168,33 @@ def _summarize_revisions(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _expression_method_coverage(records: list[dict[str, Any]], freeze: dict[str, Any]) -> dict[str, Any]:
+    relevant = [r for r in records if r.get("mode") != "smoke"]
+    current = any(r.get("schema_version") == "deep-audit-result-v3" or "evaluation_method_version" in r.get("metrics", {}) for r in relevant)
+    required = current or freeze.get("evaluation_method_version") == EVALUATION_METHOD_VERSION
+    groups = {name: [] for name in ("quality", "attack", "revision", "stability")}
+    for record in relevant:
+        group = record.get("case_id", "").split(":", 1)[0]
+        group = group if group in groups else record.get("metrics", {}).get("case_group")
+        if group in groups:
+            groups[group].append(record)
+    valid = lambda r: (validate_expression_metrics(r)
+                       and r.get("schema_version") == "deep-audit-result-v3"
+                       and r.get("prompt_version") == "audit-v7")
+    return {
+        "status": ("present" if relevant and all(valid(r) for r in relevant) else "partial") if current else "not_available",
+        "evaluation_method_version": EVALUATION_METHOD_VERSION if current else None,
+        "required": required,
+        "complete_groups": {name: bool(rows) and all(valid(r) for r in rows) for name, rows in groups.items()},
+        "rows": [
+            {"case_id": r["case_id"], "status": r["status"],
+             "findings": r.get("metrics", {}).get("expression_findings"),
+             "observed_factual_alert_count": r.get("metrics", {}).get("observed_factual_alert_count")}
+            for r in relevant
+        ] if current else [],
+    }
+
+
 def _summarize_acceptance_gates(
     *,
     quality: dict[str, Any],
@@ -1170,6 +1205,7 @@ def _summarize_acceptance_gates(
     stability_coverage_complete: bool,
     revisions: dict[str, Any],
     freeze: dict[str, Any],
+    expression_coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if freeze.get("status") == "invalid":
         return {
@@ -1295,6 +1331,13 @@ def _summarize_acceptance_gates(
             operator="<=",
         ),
     }
+    if expression_coverage and expression_coverage["required"]:
+        for name, gate in gates.items():
+            group = ("stability" if name.startswith("stability_") else
+                     "revision" if name.startswith("revision_") else
+                     "attack" if name in {"attack_detection", "clean_false_positives"} else "quality")
+            if not expression_coverage["complete_groups"][group] or freeze.get("evaluation_method_version") != EVALUATION_METHOD_VERSION:
+                gate.update(status="not_available", observed=None)
     statuses = [gate["status"] for gate in gates.values()]
     if all(status == "passed" for status in statuses):
         overall_status = "passed"
@@ -1357,6 +1400,7 @@ def _load_freeze_state(records: list[dict[str, Any]]) -> dict[str, Any]:
         return {
             "status": "present",
             "freeze_version": payload.get("freeze_version"),
+            "evaluation_method_version": payload.get("evaluation_method_version"),
             "code_version": payload.get("code_version"),
             "matches_result_code_version": (
                 len(code_versions) == 1
@@ -1516,6 +1560,7 @@ def _render_markdown(
             "",
             "## Sample scale rebuilt from JSONL",
             "",
+            f"- Expression diagnostics: {summary['expression_audit']['status']}",
             f"- Quality records/papers: {summary['sample_scale']['quality_records']}/"
             f"{summary['sample_scale']['quality_paper_count']}",
             f"- Attack pair records/attack IDs: {summary['sample_scale']['attack_records']}/"
@@ -1528,6 +1573,20 @@ def _render_markdown(
             "",
         ]
     )
+    expression = summary["expression_audit"]
+    if expression["rows"]:
+        lines.extend(["", "## Document expression diagnostics", "",
+                      "| Case | Status | Category | Signal | Sentence IDs | Observed factual alerts |",
+                      "| --- | --- | --- | --- | --- | --- |"])
+        for row in expression["rows"]:
+            for finding in row["findings"] or [None]:
+                cells = [row["case_id"], row["status"],
+                         finding["category"] if finding else "not_available",
+                         finding["status"] if finding else "not_available",
+                         ", ".join(finding["sentence_ids"]) if finding else None,
+                         (str(row["observed_factual_alert_count"])
+                          if row["observed_factual_alert_count"] is not None else None)]
+                lines.append("| " + " | ".join(_markdown_cell(value) for value in cells) + " |")
     acceptance = summary["acceptance_gates"]
     lines.extend(
         [
