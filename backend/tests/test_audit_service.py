@@ -485,6 +485,85 @@ def test_evidence_detects_changed_number_with_claim_location() -> None:
     assert "NUMBER_MISMATCH:70" in record.rule_flags
 
 
+@pytest.mark.parametrize("name", ["COVID-19", "ABC-12"])
+@pytest.mark.parametrize("metadata", [False, True])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_numeric_token_boundary_name_is_not_a_quantity(name, metadata, fallback):
+    quote = "The study assessed infection outcomes."
+    claim = atomic_claim(
+        f"The {name} study assessed infection outcomes.",
+        candidate_block_ids=["p01-b001"],
+        candidate_quote=None if fallback else quote,
+        numeric_entities=[name] if metadata else [],
+    )
+    record = only_record(AuditService().verify_claim_evidence(
+        claim, [source_block("p01-b001", quote)]
+    ))
+    assert record.quote_verified is True
+    assert record.match_method == ("bm25_fallback" if fallback else "model_candidate")
+    assert not any(flag.startswith("NUMBER_MISMATCH:") for flag in record.rule_flags)
+
+
+@pytest.mark.parametrize("quantity", [
+    "19", "19%", "3.14", "-19", "+19", "1e-3", "-1.2e+3",
+    "3-5", "3–5", "19-year", "X-19", "covid-19", "COVID -19",
+    "ABC-19%", "ABC-19.5", "ABC-19e-3", "ABC-19kg", "ABC-19 kg",
+    "ABC-19-21", "ABC-19–21", "ABC-19 - 21",
+])
+@pytest.mark.parametrize("metadata_only", [False, True])
+def test_numeric_token_boundary_quantities_remain_checked(quantity, metadata_only):
+    quote = "The study reported a measurement."
+    claim = atomic_claim(
+        quote if metadata_only else f"The study reported {quantity}.",
+        candidate_block_ids=["p01-b001"], candidate_quote=quote,
+        numeric_entities=[quantity] if metadata_only else [],
+    )
+    record = only_record(AuditService().verify_claim_evidence(
+        claim, [source_block("p01-b001", quote)]
+    ))
+    assert record.quote_verified is True
+    assert any(flag.startswith("NUMBER_MISMATCH:") for flag in record.rule_flags)
+
+
+@pytest.mark.parametrize("text,entities", [
+    ("The COVID-19 study enrolled 19 participants.", []),
+    ("The COVID-19 study enrolled participants.", ["19"]),
+    ("The COVID-19 study enrolled participants.", ["COVID-19", "19"]),
+])
+def test_numeric_token_boundary_name_does_not_hide_same_value_quantity(text, entities):
+    quote = "The COVID-19 study enrolled participants."
+    record = only_record(AuditService().verify_claim_evidence(
+        atomic_claim(text, candidate_block_ids=["p01-b001"],
+                     candidate_quote=quote, numeric_entities=entities),
+        [source_block("p01-b001", quote)],
+    ))
+    assert "NUMBER_MISMATCH:19" in record.rule_flags
+
+
+@pytest.mark.parametrize("quantity", ["19%", "3.14", "-19", "+19", "1e-3", "-1.2e+3", "3-5", "3–5"])
+def test_numeric_token_boundary_matching_quantities_remain_valid(quantity):
+    quote = f"The study reported {quantity}."
+    record = only_record(AuditService().verify_claim_evidence(
+        atomic_claim(quote, candidate_block_ids=["p01-b001"],
+                     candidate_quote=quote, numeric_entities=[quantity]),
+        [source_block("p01-b001", quote)],
+    ))
+    assert record.quote_verified is True
+    assert not any(flag.startswith("NUMBER_MISMATCH:") for flag in record.rule_flags)
+
+
+def test_numeric_token_boundary_wrong_percentage_and_unit_still_rejected():
+    quote = "The COVID-19 study reported 10% with a 5 mg dose."
+    record = only_record(AuditService().verify_claim_evidence(
+        atomic_claim("The COVID-19 study reported 20% with a 5 kg dose.",
+                     candidate_block_ids=["p01-b001"], candidate_quote=quote,
+                     numeric_entities=["COVID-19", "20%", "5"]),
+        [source_block("p01-b001", quote)],
+    ))
+    assert "NUMBER_MISMATCH:20%" in record.rule_flags
+    assert "UNIT_MISMATCH:kg" in record.rule_flags
+
+
 def test_evidence_detects_changed_unit_with_claim_location() -> None:
     block = source_block("p01-b001", "Participants received a 5 mg dose.")
     claim = atomic_claim(

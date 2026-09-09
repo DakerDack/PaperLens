@@ -77,6 +77,10 @@ _TOKEN = re.compile(r"[^\W_]+(?:['’][^\W_]+)?|[<>≤≥=]+", re.UNICODE)
 _NUMBER = re.compile(
     r"(?<![\w.])[-+]?(?:\d+(?:[.,]\d+)*|\.\d+)(?:[eE][-+]?\d+)?%?"
 )
+_NAME_NUMBER = re.compile(
+    r"(?<![\w-])[A-Z]{2,}-(?P<number>[0-9]+)"
+    r"(?![\w%\-–—]|[.,]\d|\s+[-–—]\s*[-+]?\d)"
+)
 _UNIT_TERMS = (
     "%",
     "percentage",
@@ -901,7 +905,18 @@ def _evidence_fragments(text: str) -> list[str]:
 
 def _numbers(text: str) -> set[str]:
     normalized = unicodedata.normalize("NFKC", text)
-    return {_canonical_number(match.group(0)) for match in _NUMBER.finditer(normalized)}
+    # Exclude only the integer occurrence inside a narrow name token, never
+    # the same value elsewhere. A following recognized unit keeps it numeric.
+    name_number_starts = {
+        match.start("number")
+        for match in _NAME_NUMBER.finditer(normalized)
+        if _UNIT.match(normalized, match.start("number")) is None
+    }
+    return {
+        _canonical_number(match.group(0))
+        for match in _NUMBER.finditer(normalized)
+        if match.start() not in name_number_starts
+    }
 
 
 def _claim_numbers(claim: AtomicClaim) -> set[str]:
