@@ -3684,6 +3684,589 @@ def test_live_citation_metrics_separate_bm25_accuracy_and_completeness(
     assert metrics["key_claim_citation_completeness_denominator"] == 4
 
 
+def test_revision_three_case_diagnostic_records_conditions_and_steps(monkeypatch):
+    import inspect
+    import eval.run_eval as runner
+
+    inputs, sources = _revision_metrics_fixture()
+    runner = _isolate_revision_metrics_evaluation(monkeypatch, inputs, sources)
+    # Exercise the old public chain too: absence of the opt-in is a capability
+    # gap, not a collection/fixture failure masquerading as a red test.
+    options = {}
+    if "revision_diagnostic" in inspect.signature(runner.evaluate_live_case).parameters:
+        options["revision_diagnostic"] = runner.RevisionDiagnostic("synthetic-diagnostic")
+        inputs["case"] = EvaluationCase(case_id=runner.REVISION_DIAGNOSTIC_CASE_IDS[0], run_index=0, payload=inputs["case"].payload)
+    result = runner.evaluate_live_case(inputs["case"], hy3_service=_SyntheticRevisionMetricsService(inputs), **options)
+    diagnostic = result["metrics"].get("revision_diagnostic")
+    assert diagnostic is not None, "MISSING_REVISION_STEP_AND_COVERAGE_DIAGNOSTICS"
+    assert diagnostic["conditions"]["resolved"] is True
+    assert diagnostic["coverage"]["target_claim_count"] == 2
+    assert [s["provider_calls"] for s in diagnostic["steps"]] == [1, 1, 1, 1]
+    assert diagnostic["evidence_capture_status"] == "not_authorized"
+    assert diagnostic["evidence_ref"] is None
+    assert "SYNTHETIC_PRIVATE_REASON" not in json.dumps(result)
+
+
+def test_revision_three_case_diagnostic_cli_plan_is_not_full_final(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(sys, "argv", ["run_eval.py", "--mode", "calibrate",
+        "--revision-diagnostic", "--diagnostic-id", "synthetic-diagnostic",
+        "--output", str(tmp_path / "diagnostic.jsonl")])
+    try:
+        exit_code = main()
+    except SystemExit as exc:
+        exit_code = exc.code
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "SLOTS=3" in captured.out, "MISSING_FIXED_THREE_SLOT_PLAN"
+    assert "LOGICAL_REQUESTS=12" in captured.out
+    assert "COST_CONFIRMATION_REQUIRED=True" in captured.out
+    assert not (tmp_path / "diagnostic.jsonl").exists()
+
+
+def _three_diagnostic_setup(monkeypatch):
+    inputs, sources = _revision_metrics_fixture()
+    runner = _isolate_revision_metrics_evaluation(monkeypatch, inputs, sources)
+    cases = [EvaluationCase(case_id=key, run_index=0, payload=inputs["case"].payload)
+             for key in runner.REVISION_DIAGNOSTIC_CASE_IDS]
+    inputs["case"] = cases[0]
+    monkeypatch.setattr(runner, "revision_diagnostic_cases", lambda: cases)
+    class ThreeSlotService(_SyntheticRevisionMetricsService):
+        def deep_audit(self, *, document, claim_evidence_pairs):
+            before = len(self.calls) % 4 == 0
+            result = _FakeLiveService.deep_audit(self, document=document, claim_evidence_pairs=claim_evidence_pairs)
+            result.semantic_judgments = self.inputs["before_result" if before else "after_result"].semantic_judgments
+            return result
+    service = ThreeSlotService(inputs)
+    service.settings = SimpleNamespace(paperlens_model_mode="live", hy3_max_retries=2,
+        hy3_model="hy3", hy3_base_url="https://offline.invalid/v1", hy3_timeout_seconds=120)
+    return runner, inputs, cases, service
+
+
+def _three_diagnostic_authorization(runner):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    return {"authorization_id": "synthetic-authorization", "diagnostic_id": "synthetic-diagnostic",
+            "case_ids": list(runner.REVISION_DIAGNOSTIC_CASE_IDS), "readers": ["S-1-5-21-123"],
+            "issued_at": (now-timedelta(minutes=1)).isoformat(), "expires_at": (now+timedelta(days=6)).isoformat(),
+            "scope": "target_sentence_claims_used_evidence"}
+
+
+def test_revision_three_case_diagnostic_runner_report_and_resume(monkeypatch, tmp_path):
+    runner, _, cases, service = _three_diagnostic_setup(monkeypatch)
+    output = tmp_path / "diagnostic.jsonl"
+    kwargs = dict(output_path=output, versions=VERSIONS, diagnostic_id="synthetic-diagnostic", hy3_service=service, confirm_cost=True)
+    assert runner.run_revision_diagnostic(**kwargs) == 0
+    records = _read_jsonl(output)
+    assert [r["case_id"] for r in records] == [c.case_id for c in cases]
+    assert [r["provider_calls"] for r in records] == [4, 4, 4]
+    assert len(service.calls) == 12
+    assert runner.run_revision_diagnostic(**kwargs) == 0
+    assert len(service.calls) == 12
+    summary = build_report(input_path=output, output_path=tmp_path / "diagnostic.md")
+    assert summary["acceptance_gates"]["status"] == "not_available"
+    assert summary["acceptance_gates"]["gates"] == {}
+    assert "Sensor A" not in output.read_text(encoding="utf-8")
+    assert "SYNTHETIC_PRIVATE_REASON" not in (tmp_path / "diagnostic.md").read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid revision diagnostic"):
+        summarize_results([records[0], {**records[1], "metrics": {}}])
+    with pytest.raises(ValueError, match="invalid revision diagnostic output"):
+        build_report(input_path=output, output_path=tmp_path / "diagnostic.md")
+
+
+@pytest.mark.parametrize("step", ["before_audit", "revision", "claim_rebuild", "after_audit", "link"])
+def test_revision_three_case_diagnostic_private_write_failure_stops(monkeypatch, tmp_path, step):
+    runner, _, _, service = _three_diagnostic_setup(monkeypatch)
+    monkeypatch.setattr(runner, "_check_private_evidence_path", lambda *_: None)
+    original = runner.RevisionDiagnostic._write_private
+    def write(self, suffix, content):
+        if suffix == step:
+            raise OSError("SYNTHETIC_PRIVATE_IO_DETAIL")
+        return original(self, suffix, content)
+    monkeypatch.setattr(runner.RevisionDiagnostic, "_write_private", write)
+    private = tmp_path / "private"
+    private.mkdir()
+    output = tmp_path / "diagnostic.jsonl"
+    assert runner.run_revision_diagnostic(output_path=output, versions=VERSIONS, diagnostic_id="synthetic-diagnostic",
+        hy3_service=service, confirm_cost=True, authorization=_three_diagnostic_authorization(runner), evidence_dir=private) == 2
+    rows = _read_jsonl(output)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["error_code"] == "EVALUATION_FAILED"
+    expected = min(4, ["before_audit", "revision", "claim_rebuild", "after_audit", "link"].index(step)+1)
+    assert len(service.calls) == rows[0]["provider_calls"] == expected
+    assert rows[0]["usage"]["total_tokens"] == 140 * expected
+    assert "SYNTHETIC_PRIVATE_IO_DETAIL" not in output.read_text(encoding="utf-8")
+
+
+def test_revision_three_case_diagnostic_private_association_and_tamper(monkeypatch, tmp_path):
+    runner, _, _, service = _three_diagnostic_setup(monkeypatch)
+    monkeypatch.setattr(runner, "_check_private_evidence_path", lambda *_: None)
+    private = tmp_path / "private"
+    private.mkdir()
+    output = tmp_path / "diagnostic.jsonl"
+    kwargs = dict(output_path=output, versions=VERSIONS, diagnostic_id="synthetic-diagnostic", hy3_service=service,
+        confirm_cost=True, authorization=_three_diagnostic_authorization(runner), evidence_dir=private)
+    assert runner.run_revision_diagnostic(**kwargs) == 0
+    record = _read_jsonl(output)[0]
+    d = record["metrics"]["revision_diagnostic"]
+    assert d["evidence_capture_status"] == "complete"
+    link = json.loads((private / f"{d['evidence_ref']}.link.json").read_text(encoding="utf-8"))
+    assert link["content"]["result_sha256"] == runner._sha256_json(record)
+    assert len(link["content"]["packages"]) == 4
+    captured = "".join(p.read_text(encoding="utf-8") for p in private.iterdir())
+    assert "Sensor A measured" in captured
+    assert "Synthetic background" not in captured
+    assert "SYNTHETIC_PRIVATE_REASON" not in captured
+    assert str(private) not in output.read_text(encoding="utf-8")
+    assert runner.run_revision_diagnostic(**kwargs) == 0
+    package = private / f"{d['evidence_ref']}.revision.json"
+    package.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid revision evidence association"):
+        runner.run_revision_diagnostic(**kwargs)
+    assert len(service.calls) == 12
+    assert len(_read_jsonl(output)) == 3
+
+
+@pytest.mark.parametrize("damage", ["empty", "missing_step", "wrong_identity"])
+def test_revision_three_case_diagnostic_complete_evidence_packages_fail_closed(
+    monkeypatch, tmp_path, damage
+):
+    runner, _, _, service = _three_diagnostic_setup(monkeypatch)
+    monkeypatch.setattr(runner, "_check_private_evidence_path", lambda *_: None)
+    private = tmp_path / "private"
+    private.mkdir()
+    output = tmp_path / "diagnostic.jsonl"
+    kwargs = dict(
+        output_path=output,
+        versions=VERSIONS,
+        diagnostic_id="synthetic-diagnostic",
+        hy3_service=service,
+        confirm_cost=True,
+        authorization=_three_diagnostic_authorization(runner),
+        evidence_dir=private,
+    )
+    assert runner.run_revision_diagnostic(**kwargs) == 0
+    record = _read_jsonl(output)[0]
+    diagnostic = record["metrics"]["revision_diagnostic"]
+    link_path = private / f"{diagnostic['evidence_ref']}.link.json"
+    link = json.loads(link_path.read_text(encoding="utf-8"))
+    if damage == "empty":
+        link["content"]["packages"] = {}
+    elif damage == "missing_step":
+        link["content"]["packages"].pop("revision")
+    else:
+        link["case_id"] = "revision:holdout-02:bad"
+    link_path.write_text(json.dumps(link, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid revision evidence association"):
+        runner.run_revision_diagnostic(**kwargs)
+    assert len(service.calls) == 12
+    assert len(_read_jsonl(output)) == 3
+
+
+def test_revision_three_case_diagnostic_partial_evidence_checks_completed_steps(
+    monkeypatch, tmp_path
+):
+    runner, _, _, service = _three_diagnostic_setup(monkeypatch)
+    monkeypatch.setattr(runner, "_check_private_evidence_path", lambda *_: None)
+    private = tmp_path / "private"
+    private.mkdir()
+    output = tmp_path / "diagnostic.jsonl"
+    kwargs = dict(
+        output_path=output,
+        versions=VERSIONS,
+        diagnostic_id="synthetic-diagnostic",
+        hy3_service=service,
+        confirm_cost=True,
+        authorization=_three_diagnostic_authorization(runner),
+        evidence_dir=private,
+    )
+    assert runner.run_revision_diagnostic(**kwargs) == 0
+    record = _read_jsonl(output)[0]
+    diagnostic = copy.deepcopy(record["metrics"]["revision_diagnostic"])
+    diagnostic["evidence_capture_status"] = "partial"
+    for step in diagnostic["steps"][2:]:
+        step.update(
+            status="not_executed",
+            error_code="NONE",
+            provider_calls=0,
+            input_tokens=None,
+            output_tokens=None,
+            total_tokens=None,
+        )
+    record.update(
+        status="failed",
+        error_code="EVALUATION_FAILED",
+        provider_calls=2,
+        usage={"prompt_tokens": 200, "completion_tokens": 80, "total_tokens": 280},
+        metrics={"revision_diagnostic": diagnostic},
+    )
+    output.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    progress_path = output.with_name(output.name + ".progress.jsonl")
+    progress_path.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    pending_path = pending_path_for(output)
+    pending = [row for row in _read_jsonl(pending_path)
+               if (row["case_id"], row["run_index"]) == (record["case_id"], record["run_index"])]
+    assert len(pending) == 1
+    pending_path.write_text(json.dumps(pending[0], sort_keys=True) + "\n", encoding="utf-8")
+    for suffix in ("revision", "claim_rebuild", "after_audit"):
+        (private / f"{diagnostic['evidence_ref']}.{suffix}.json").unlink()
+    link_path = private / f"{diagnostic['evidence_ref']}.link.json"
+    link = json.loads(link_path.read_text(encoding="utf-8"))
+    link["content"]["result_sha256"] = runner._sha256_json(record)
+    link["content"]["result"] = record
+    link["content"]["packages"] = {
+        "before_audit": link["content"]["packages"]["before_audit"]
+    }
+    link_path.write_text(json.dumps(link, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid revision evidence association"):
+        runner.run_revision_diagnostic(**kwargs)
+    assert len(service.calls) == 12
+    assert len(_read_jsonl(output)) == 1
+
+
+def test_revision_three_case_diagnostic_valid_partial_evidence_association(
+    monkeypatch, tmp_path
+):
+    runner, _, _, service = _three_diagnostic_setup(monkeypatch)
+    monkeypatch.setattr(runner, "_check_private_evidence_path", lambda *_: None)
+    private = tmp_path / "private"
+    private.mkdir()
+    output = tmp_path / "diagnostic.jsonl"
+    kwargs = dict(
+        output_path=output,
+        versions=VERSIONS,
+        diagnostic_id="synthetic-diagnostic",
+        hy3_service=service,
+        confirm_cost=True,
+        authorization=_three_diagnostic_authorization(runner),
+        evidence_dir=private,
+    )
+    assert runner.run_revision_diagnostic(**kwargs) == 0
+    record = _read_jsonl(output)[0]
+    diagnostic = copy.deepcopy(record["metrics"]["revision_diagnostic"])
+    diagnostic["evidence_capture_status"] = "partial"
+    for step in diagnostic["steps"][2:]:
+        step.update(
+            status="not_executed",
+            error_code="NONE",
+            provider_calls=0,
+            input_tokens=None,
+            output_tokens=None,
+            total_tokens=None,
+        )
+    record.update(
+        status="failed",
+        error_code="EVALUATION_FAILED",
+        provider_calls=2,
+        usage={"prompt_tokens": 200, "completion_tokens": 80, "total_tokens": 280},
+        metrics={"revision_diagnostic": diagnostic},
+    )
+    output.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    progress_path = output.with_name(output.name + ".progress.jsonl")
+    progress_path.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    pending_path = pending_path_for(output)
+    pending = [row for row in _read_jsonl(pending_path)
+               if (row["case_id"], row["run_index"]) == (record["case_id"], record["run_index"])]
+    assert len(pending) == 1
+    pending_path.write_text(json.dumps(pending[0], sort_keys=True) + "\n", encoding="utf-8")
+    for suffix in ("claim_rebuild", "after_audit"):
+        (private / f"{diagnostic['evidence_ref']}.{suffix}.json").unlink()
+    link_path = private / f"{diagnostic['evidence_ref']}.link.json"
+    link = json.loads(link_path.read_text(encoding="utf-8"))
+    link["content"]["result_sha256"] = runner._sha256_json(record)
+    link["content"]["result"] = record
+    link["content"]["packages"] = {
+        "before_audit": link["content"]["packages"]["before_audit"],
+        "revision": link["content"]["packages"]["revision"],
+    }
+    link_path.write_text(json.dumps(link, sort_keys=True), encoding="utf-8")
+
+    assert runner.run_revision_diagnostic(**kwargs) == 2
+    assert len(service.calls) == 12
+    assert _read_jsonl(output) == [record]
+
+
+def test_revision_three_case_diagnostic_unknown_usage_stops_without_replay(
+    monkeypatch, tmp_path
+):
+    runner, _, _, service = _three_diagnostic_setup(monkeypatch)
+    monkeypatch.setattr(
+        runner,
+        "_read_revision_run_observation",
+        lambda _: {
+            "provider_calls": 1,
+            "retries": 0,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "error_code": "NONE",
+        },
+    )
+    output = tmp_path / "diagnostic.jsonl"
+    assert runner.run_revision_diagnostic(
+        output_path=output,
+        versions=VERSIONS,
+        diagnostic_id="synthetic-diagnostic",
+        hy3_service=service,
+        confirm_cost=True,
+    ) == 2
+    rows = _read_jsonl(output)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["error_code"] == "EVALUATION_FAILED"
+    assert rows[0]["provider_calls"] == 1
+    assert rows[0]["usage"] == {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+    }
+    assert service.calls == ["deep_audit"]
+
+
+@pytest.mark.parametrize("damage", ["expired", "scope", "cases", "readers", "extra"])
+def test_revision_three_case_diagnostic_authorization_rejected_before_calls(monkeypatch, tmp_path, damage):
+    runner, _, _, service = _three_diagnostic_setup(monkeypatch)
+    authorization = _three_diagnostic_authorization(runner)
+    if damage == "expired":
+        authorization["expires_at"] = authorization["issued_at"]
+    elif damage == "cases":
+        authorization["case_ids"] = ["revision:holdout-02:bad"]
+    elif damage == "readers":
+        authorization["readers"] = []
+    elif damage == "extra":
+        authorization["unknown"] = "unsafe"
+    else:
+        authorization["scope"] = "whole_document"
+    with pytest.raises(ValueError, match="invalid revision evidence authorization"):
+        runner.run_revision_diagnostic(output_path=tmp_path / "diagnostic.jsonl", versions=VERSIONS,
+            diagnostic_id="synthetic-diagnostic", hy3_service=service, confirm_cost=True,
+            authorization=authorization, evidence_dir=tmp_path)
+    assert service.calls == []
+    assert not (tmp_path / "diagnostic.jsonl").exists()
+
+
+def test_revision_three_case_diagnostic_permission_failure_is_not_authorization(monkeypatch, tmp_path):
+    runner, _, _, service = _three_diagnostic_setup(monkeypatch)
+    with pytest.raises(ValueError, match="invalid revision evidence authorization"):
+        runner.RevisionDiagnostic("synthetic-diagnostic", authorization=_three_diagnostic_authorization(runner), evidence_dir=tmp_path)
+    assert service.calls == []
+
+
+def test_revision_three_case_diagnostic_pending_unknown_no_replay(monkeypatch, tmp_path):
+    runner, _, cases, service = _three_diagnostic_setup(monkeypatch)
+    output = tmp_path / "diagnostic.jsonl"
+    plan = runner._revision_diagnostic_plan_id(VERSIONS, "synthetic-diagnostic", None, service.settings)
+    d = runner.RevisionDiagnostic("synthetic-diagnostic", plan_sha256=plan).data
+    runner._append_jsonl(pending_path_for(output), {"case_id": cases[0].case_id, "run_index": 0,
+        "mode": "calibrate", "revision_diagnostic": d})
+    assert runner.run_revision_diagnostic(output_path=output, versions=VERSIONS, diagnostic_id="synthetic-diagnostic", hy3_service=service) == 2
+    assert service.calls == []
+    row = _read_jsonl(output)[0]
+    assert row["error_code"] == "RUN_INTERRUPTED"
+    assert row["provider_calls"] is None
+    assert all(s["status"] == "unknown" and s["provider_calls"] is None for s in row["metrics"]["revision_diagnostic"]["steps"])
+    assert build_report(input_path=output, output_path=tmp_path / "report.md")["acceptance_gates"]["status"] == "not_available"
+
+
+@pytest.mark.parametrize("change", ["scope", "evidence", "judgment"])
+def test_revision_three_case_diagnostic_coverage_gap_never_resolved(monkeypatch, change):
+    runner, inputs, _, service = _three_diagnostic_setup(monkeypatch)
+    if change == "scope":
+        for j in inputs["after_result"].semantic_judgments:
+            j.scope_status = type(j.scope_status)("expanded")
+            j.severity = type(j.severity)("minor")
+    elif change == "judgment":
+        inputs["after_result"].semantic_judgments = []
+    else:
+        for c in inputs["after_bundle"].claims:
+            c.candidate_block_ids = ["missing-block"]
+            c.candidate_quote = "no available match"
+            c.text = "Entirely unrelated proposition."
+        inputs["after_result"].semantic_judgments = []
+    if change == "judgment":
+        with pytest.raises(EvaluationCaseError) as raised:
+            runner.evaluate_live_case(inputs["case"], hy3_service=service,
+                revision_diagnostic=runner.RevisionDiagnostic("synthetic-diagnostic"))
+        assert raised.value.error_code == "AUDIT_INCOMPLETE"
+        assert raised.value.provider_calls == 4
+        return
+    result = runner.evaluate_live_case(inputs["case"], hy3_service=service,
+        revision_diagnostic=runner.RevisionDiagnostic("synthetic-diagnostic"))
+    d = result["metrics"]["revision_diagnostic"]
+    assert d["conditions"]["resolved"] is False
+    assert d["conditions"]["all_preserved"] is False
+
+
+def test_revision_three_case_diagnostic_real_private_acl(monkeypatch, tmp_path):
+    import os
+    import eval.run_eval as runner
+    private = tmp_path / "private-acl"
+    private.mkdir()
+    if os.name == "nt":
+        path_literal = str(private).replace("'", "''")
+        script = ("$ErrorActionPreference='Stop';$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User;"
+                  "$acl=New-Object System.Security.AccessControl.DirectorySecurity;"
+                  "$acl.SetOwner($sid);$acl.SetAccessRuleProtection($true,$false);"
+                  "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow');"
+                  "$acl.AddAccessRule($rule);[System.IO.Directory]::SetAccessControl('" + path_literal + "',$acl);$sid.Value")
+        completed = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                                   capture_output=True, text=True)
+        assert completed.returncode == 0, completed.stderr
+        readers = [completed.stdout.strip()]
+    else:
+        private.chmod(0o700)
+        readers = [str(os.getuid())]
+    runner._check_private_evidence_path(private, readers)
+    with pytest.raises(ValueError, match="invalid revision evidence authorization"):
+        runner._check_private_evidence_path(private, ["S-1-5-21-999"])
+
+
+def test_revision_three_case_diagnostic_missing_observation_stays_unknown(monkeypatch, tmp_path):
+    runner, _, _, service = _three_diagnostic_setup(monkeypatch)
+    monkeypatch.setattr(runner, "_read_revision_run_observation", lambda _: None)
+    output = tmp_path / "diagnostic.jsonl"
+    assert runner.run_revision_diagnostic(output_path=output, versions=VERSIONS, diagnostic_id="synthetic-diagnostic",
+        hy3_service=service, confirm_cost=True) == 2
+    row = _read_jsonl(output)[0]
+    assert row["provider_calls"] is None
+    assert row["usage"]["total_tokens"] is None
+    assert len(service.calls) == 1
+
+
+@pytest.mark.parametrize("damage", ["private_text", "step_field", "condition_type", "wrong_slot", "plan_drift"])
+def test_revision_three_case_diagnostic_malformed_resume_refused(monkeypatch, tmp_path, damage):
+    runner, _, _, service = _three_diagnostic_setup(monkeypatch)
+    output = tmp_path / "diagnostic.jsonl"
+    kwargs = dict(output_path=output, versions=VERSIONS, diagnostic_id="synthetic-diagnostic", hy3_service=service, confirm_cost=True)
+    assert runner.run_revision_diagnostic(**kwargs) == 0
+    rows = _read_jsonl(output)
+    d = rows[0]["metrics"]["revision_diagnostic"]
+    if damage == "private_text":
+        d["private_text"] = "SYNTHETIC_PRIVATE"
+    elif damage == "step_field":
+        d["steps"][0]["extra"] = "SYNTHETIC_PRIVATE"
+    elif damage == "condition_type":
+        d["conditions"]["resolved"] = "yes"
+    elif damage == "wrong_slot":
+        rows[0]["case_id"] = "revision:holdout-02:bad"
+    else:
+        service.settings.hy3_timeout_seconds = 121
+    output.write_text("\n".join(json.dumps(r) for r in rows)+"\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid revision diagnostic"):
+        runner.run_revision_diagnostic(**kwargs)
+    assert len(service.calls) == 12
+    if damage != "plan_drift":
+        report = tmp_path / "report.md"
+        with pytest.raises(ValueError, match="invalid revision diagnostic"):
+            build_report(input_path=output, output_path=report)
+        assert not report.exists()
+
+
+def test_revision_three_case_diagnostic_cannot_resume_as_ordinary_calibrate(monkeypatch, tmp_path):
+    runner, _, cases, service = _three_diagnostic_setup(monkeypatch)
+    output = tmp_path / "diagnostic.jsonl"
+    assert runner.run_revision_diagnostic(output_path=output, versions=VERSIONS, diagnostic_id="synthetic-diagnostic",
+        hy3_service=service, confirm_cost=True) == 0
+    with pytest.raises(ValueError, match="invalid revision diagnostic"):
+        runner.run_cases(mode="calibrate", cases=cases, output_path=output, versions=VERSIONS,
+                         evaluate=lambda _: pytest.fail("PROVIDER_MUST_NOT_RUN"))
+
+
+@pytest.mark.parametrize("case_id,index", [("revision:holdout-02:bad", 0), ("quality:holdout-01:bad", 0), ("revision:holdout-01:bad", 1)])
+def test_revision_three_case_diagnostic_rejects_unapproved_object(monkeypatch, case_id, index):
+    runner, inputs, _, service = _three_diagnostic_setup(monkeypatch)
+    case = EvaluationCase(case_id=case_id, run_index=index, payload=inputs["case"].payload)
+    with pytest.raises(ValueError, match="invalid revision diagnostic"):
+        runner.evaluate_live_case(case, hy3_service=service, revision_diagnostic=runner.RevisionDiagnostic("synthetic-diagnostic"))
+    assert service.calls == []
+
+
+def test_revision_three_case_diagnostic_result_write_failure_preserves_accounting(monkeypatch, tmp_path):
+    runner, _, _, service = _three_diagnostic_setup(monkeypatch)
+    output = tmp_path / "diagnostic.jsonl"
+    kwargs = dict(output_path=output, versions=VERSIONS, diagnostic_id="synthetic-diagnostic", hy3_service=service, confirm_cost=True)
+    append = runner._append_jsonl
+    def fail_result(path, record):
+        if path == output:
+            raise OSError("SYNTHETIC_RESULT_WRITE_FAILURE")
+        append(path, record)
+    monkeypatch.setattr(runner, "_append_jsonl", fail_result)
+    with pytest.raises(OSError):
+        runner.run_revision_diagnostic(**kwargs)
+    assert len(service.calls) == 4
+    monkeypatch.setattr(runner, "_append_jsonl", append)
+    assert runner.run_revision_diagnostic(**kwargs) == 2
+    record = _read_jsonl(output)[0]
+    assert record["error_code"] == "RUN_INTERRUPTED"
+    assert record["provider_calls"] == 4, "OBSERVED_CALLS_MUST_SURVIVE_RESULT_WRITE_FAILURE"
+    assert record["usage"]["total_tokens"] == 560
+    assert len(service.calls) == 4
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("retry", [False, True])
+def test_revision_three_case_diagnostic_actual_client_same_call_capture(monkeypatch, tmp_path, capture, retry):
+    from backend.app.hy3_service import Hy3Service
+    from backend.app.settings import Settings
+    from backend.app.models import SentenceClaimRegenerationResult
+    runner, inputs, _, _ = _three_diagnostic_setup(monkeypatch)
+
+    class Client:
+        def __init__(self):
+            self.chat = self.completions = self
+            self.calls = 0
+            self.response = None
+
+        def create(self, **kwargs):
+            self.calls += 1
+            encoded = json.dumps(kwargs)
+            assert not any(marker in encoded for marker in (
+                "synthetic-diagnostic", "synthetic-authorization", '"quality_label"',
+                '"paper_id"', '"case_id"', '"known_error_type"', "evidence_ref",
+            )), "DIAGNOSTIC_METADATA_REACHED_PROVIDER"
+            payload = copy.deepcopy(self.response)
+            schema = kwargs["response_format"]["json_schema"]["schema"]
+            if "patch_id" in schema["properties"]:
+                payload["patch_id"] = schema["properties"]["patch_id"]["const"]
+            return SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop",
+                message=SimpleNamespace(content="{}" if retry and self.calls == 1 else json.dumps(payload)))],
+                usage=SimpleNamespace(prompt_tokens=100, completion_tokens=40, total_tokens=140))
+
+    client = Client()
+    class Service(Hy3Service):
+        def deep_audit(self, *, document, claim_evidence_pairs):
+            result = _FakeLiveService().deep_audit(document=document, claim_evidence_pairs=claim_evidence_pairs)
+            result.semantic_judgments = inputs["before_result" if client.calls == 0 else "after_result"].semantic_judgments
+            client.response = result.model_dump(mode="json")
+            return super().deep_audit(document=document, claim_evidence_pairs=claim_evidence_pairs)
+
+        def revise_sentence(self, **kwargs):
+            client.response = _FakeLiveService().revise_sentence(**kwargs).model_dump(mode="json")
+            return super().revise_sentence(**kwargs)
+
+        def regenerate_sentence_claims(self, **kwargs):
+            client.response = SentenceClaimRegenerationResult(claims=inputs["after_bundle"].claims).model_dump(mode="json")
+            return super().regenerate_sentence_claims(**kwargs)
+
+    service = Service(settings=Settings(_env_file=None, paperlens_model_mode="live", hy3_api_key="offline-placeholder",
+        hy3_base_url="https://offline.invalid/v1", hy3_max_retries=2), client=client)
+    private = tmp_path / "private"
+    options = {}
+    if capture:
+        private.mkdir()
+        monkeypatch.setattr(runner, "_check_private_evidence_path", lambda *_: None)
+        options = {"evidence_dir": private, "authorization": _three_diagnostic_authorization(runner)}
+    result = runner.evaluate_live_case(inputs["case"], hy3_service=service,
+        revision_diagnostic=runner.RevisionDiagnostic("synthetic-diagnostic", **options))
+    assert client.calls == result["provider_calls"] == 4 + int(retry)
+    assert result["usage"]["total_tokens"] == 140 * (4 + int(retry))
+    assert result["metrics"]["revision_diagnostic"]["conditions"]["resolved"] is True
+    assert len(list(private.glob("*.json"))) == (4 if capture else 0)
+    assert "Sensor A measured" not in json.dumps(result)
+
+
 def _revision_metrics_fixture(
     *, after_a="Sensor A measured 10 units.", after_b="Sensor B measured 30 units.",
     severe_before=("a",), severe_after=(),

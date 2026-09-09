@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -56,6 +57,10 @@ from backend.app.prompts import (
 SUPPORTED_MODES = ("smoke", "calibrate", "final", "stability")
 RESULT_VERSION = "paperlens-eval-result-v1"
 EVALUATION_METHOD_VERSION = "paperlens-stage7-method-v2"
+REVISION_DIAGNOSTIC_VERSION = "paperlens-revision-diagnostic-v1"
+REVISION_DIAGNOSTIC_BASELINE = "bb317e6a912b2b4e72848704dacb51ede36bf49e"
+REVISION_DIAGNOSTIC_CASE_IDS = tuple(f"revision:holdout-{i:02d}:bad" for i in (1, 3, 4))
+_REVISION_STEPS = ("before_audit", "revision", "claim_rebuild", "after_audit")
 ResultStatus = Literal["succeeded", "failed", "timeout", "unsupported"]
 _REQUIRED_RESULT_FIELDS = (
     "result_version",
@@ -771,19 +776,338 @@ def materialize_live_case(
     return source_blocks, GeneratedBundle.model_validate(bundle_data)
 
 
+class _RevisionDiagnosticFailure(RuntimeError):
+    def __init__(self):
+        super().__init__("EVALUATION_FAILED")
+
+
+def _revision_private_package_digests(
+    diagnostic: Mapping[str, Any],
+    evidence_dir: Path,
+    *,
+    case_id: str,
+    run_index: int,
+) -> dict[str, str]:
+    """Validate the private package set for the steps actually captured.
+
+    A complete capture is an all-or-nothing four-package publication.  A
+    partial capture must contain every successful step's package, may contain
+    a package for a step that failed after capture, and may not contain a
+    package for a step that never started.  The package payload identity is
+    checked independently of the link digest so a self-consistent but wrongly
+    associated directory cannot be accepted.
+    """
+    if not isinstance(evidence_dir, Path) or not evidence_dir.is_dir():
+        raise ValueError()
+    evidence_ref = diagnostic.get("evidence_ref")
+    diagnostic_id = diagnostic.get("diagnostic_id")
+    plan_sha256 = diagnostic.get("plan_sha256")
+    capture_status = diagnostic.get("evidence_capture_status")
+    steps = diagnostic.get("steps")
+    if (not isinstance(evidence_ref, str) or not re.fullmatch(r"[0-9a-f]{32}", evidence_ref)
+        or not isinstance(diagnostic_id, str) or not isinstance(plan_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", plan_sha256) or not isinstance(steps, list)
+        or len(steps) != len(_REVISION_STEPS)):
+        raise ValueError()
+    by_step = {}
+    for step in steps:
+        if (not isinstance(step, dict) or step.get("step") not in _REVISION_STEPS
+            or step["step"] in by_step or step.get("status") not in {"not_executed", "succeeded", "failed", "unknown"}):
+            raise ValueError()
+        by_step[step["step"]] = step
+    if set(by_step) != set(_REVISION_STEPS):
+        raise ValueError()
+    if capture_status == "complete":
+        if any(by_step[name]["status"] != "succeeded" for name in _REVISION_STEPS):
+            raise ValueError()
+        required = allowed = set(_REVISION_STEPS)
+    elif capture_status in {"partial", "failed"}:
+        required = {name for name in _REVISION_STEPS if by_step[name]["status"] == "succeeded"}
+        allowed = {name for name in _REVISION_STEPS if by_step[name]["status"] in {"succeeded", "failed", "unknown"}}
+    else:
+        raise ValueError()
+
+    digests: dict[str, str] = {}
+    for name in _REVISION_STEPS:
+        path = evidence_dir / f"{evidence_ref}.{name}.json"
+        exists = path.exists()
+        if exists:
+            if (path.is_symlink() or path.is_junction() or not path.is_file()
+                or name not in allowed):
+                raise ValueError()
+            try:
+                package = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError):
+                raise ValueError() from None
+            if (not isinstance(package, dict)
+                or package.get("evidence_ref") != evidence_ref
+                or package.get("diagnostic_id") != diagnostic_id
+                or package.get("case_id") != case_id
+                or package.get("run_index") != run_index
+                or package.get("plan_sha256") != plan_sha256
+                or not isinstance(package.get("content"), dict)
+                or package["content"].get("step") != name):
+                raise ValueError()
+            digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        elif name in required:
+            raise ValueError()
+    return digests
+
+
+def _revision_diagnostic_id(value: Any) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", value):
+        raise ValueError("invalid revision diagnostic")
+    return value
+
+
+def revision_diagnostic_cases() -> list[EvaluationCase]:
+    selected = {c.case_id: c for c in load_mode_cases("final") if c.case_id in REVISION_DIAGNOSTIC_CASE_IDS}
+    if set(selected) != set(REVISION_DIAGNOSTIC_CASE_IDS):
+        raise ValueError("invalid revision diagnostic")
+    return [selected[key] for key in REVISION_DIAGNOSTIC_CASE_IDS]
+
+
+def _check_private_evidence_path(path: Path, readers: list[str]) -> None:
+    # Read-only ACL verification: provisioning and identity approval stay outside
+    # this runner. Reject links, inherited/public grants, and unverifiable ACLs.
+    if (not path.is_absolute() or not path.is_dir() or path.resolve().is_relative_to(_PROJECT_ROOT)
+        or any(p.is_symlink() or p.is_junction() for p in (path, *path.parents))):
+        raise ValueError("invalid revision evidence authorization")
+    if os.name != "nt":
+        if readers != [str(os.getuid())] or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
+            raise ValueError("invalid revision evidence authorization")
+        return
+    script = "$ErrorActionPreference='Stop';$a=[System.IO.Directory]::GetAccessControl('" + str(path).replace("'", "''") + "'); @{protected=$a.AreAccessRulesProtected;owner=$a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;rules=@($a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])|ForEach-Object {@{sid=$_.IdentityReference.Value;allow=($_.AccessControlType -eq 'Allow')}})}|ConvertTo-Json -Depth 4 -Compress"
+    try:
+        completed = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                                   capture_output=True, text=True, check=True, timeout=10)
+        acl = json.loads(completed.stdout)
+        allowed = set(readers) | {"S-1-5-18"}
+        if not acl["protected"] or acl["owner"] not in readers or not acl["rules"] or any(
+            rule["allow"] and rule["sid"] not in allowed for rule in acl["rules"]
+        ):
+            raise ValueError()
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        raise ValueError("invalid revision evidence authorization") from None
+
+
+class RevisionDiagnostic:
+    """One four-step observation, with optional explicitly authorized local text."""
+
+    def __init__(self, diagnostic_id: str, *, authorization: Mapping[str, Any] | None = None,
+                 evidence_dir: Path | None = None, plan_sha256: str | None = None):
+        self.authorization = dict(authorization) if authorization is not None else None
+        self.evidence_dir = evidence_dir
+        self.case_id: str | None = None
+        self.last_result = None
+        self.checkpoint: Callable[[], None] = lambda: None
+        self.data = {
+            "version": REVISION_DIAGNOSTIC_VERSION, "diagnostic_id": _revision_diagnostic_id(diagnostic_id),
+            "diagnostic_only": True, "baseline_commit": REVISION_DIAGNOSTIC_BASELINE,
+            "plan_sha256": plan_sha256 or "0" * 64,
+            "evidence_capture_status": "not_authorized" if authorization is None else "partial",
+            "evidence_ref": None if authorization is None else uuid.uuid4().hex,
+            "steps": [{"step": step, "status": "not_executed", "error_code": "NONE",
+                       "provider_calls": 0, "input_tokens": None, "output_tokens": None, "total_tokens": None} for step in _REVISION_STEPS],
+            "conditions": {}, "coverage": {}, "claims": [], "pairs": [], "evidence": [],
+        }
+        self.check_authorization()
+
+    def check_authorization(self) -> None:
+        if self.authorization is None:
+            if self.evidence_dir is not None:
+                raise ValueError("invalid revision evidence authorization")
+            return
+        a = self.authorization
+        try:
+            if set(a) != {"authorization_id", "diagnostic_id", "case_ids", "readers", "issued_at", "expires_at", "scope"}:
+                raise ValueError()
+            _revision_diagnostic_id(a["authorization_id"])
+            issued, expires = (datetime.fromisoformat(a[k]) for k in ("issued_at", "expires_at"))
+            if (a["diagnostic_id"] != self.data["diagnostic_id"] or a["case_ids"] != list(REVISION_DIAGNOSTIC_CASE_IDS)
+                or a["scope"] != "target_sentence_claims_used_evidence" or not issued.tzinfo or not expires.tzinfo
+                or not issued <= datetime.now(timezone.utc) < expires or not 0 < (expires-issued).total_seconds() <= 7*86400
+                or not isinstance(a["readers"], list) or not a["readers"] or len(set(a["readers"])) != len(a["readers"])
+                or any(not isinstance(r, str) or not re.fullmatch(r"S-1-5-21-[0-9-]+|S-1-12-1-[0-9-]+|[0-9]+", r) for r in a["readers"])
+                or self.evidence_dir is None):
+                raise ValueError()
+            _check_private_evidence_path(self.evidence_dir, a["readers"])
+        except (ValueError, TypeError, KeyError, OSError):
+            raise ValueError("invalid revision evidence authorization") from None
+
+    def capture(self, step: str, *, bundle=None, target=None, claims=None, evidence=None, text=None) -> None:
+        if self.authorization is None:
+            return
+        try:
+            self.check_authorization()
+            selected = claims if claims is not None else [c for c in bundle.claims if c.sentence_id == target]
+            ids = {c.claim_id for c in selected}
+            content = {"step": step, "sentence_id": target,
+                       "sentence_text": text if text is not None else _find_sentence(bundle, target).text,
+                       "claims": [{"claim_id": c.claim_id, "sentence_id": c.sentence_id, "text": c.text,
+                                   "qualifiers": c.qualifiers, "numeric_entities": c.numeric_entities} for c in selected],
+                       "evidence": [{"claim_id": r.claim_id, "block_id": r.block_id, "page_index": r.page_index,
+                                     "quote": r.quote} for r in (evidence or []) if r.claim_id in ids and r.quote_verified]}
+            self._write_private(step, content)
+            self.save_progress()
+        except (ValueError, OSError, TypeError):
+            self.data["evidence_capture_status"] = "failed"
+            raise _RevisionDiagnosticFailure() from None
+
+    def save_progress(self) -> None:
+        try:
+            self.checkpoint()
+        except (ValueError, OSError, TypeError):
+            raise _RevisionDiagnosticFailure() from None
+
+    def _write_private(self, suffix: str, content: Mapping[str, Any]) -> None:
+        assert self.evidence_dir is not None
+        path = self.evidence_dir / f"{self.data['evidence_ref']}.{suffix}.json"
+        payload = {"evidence_ref": self.data["evidence_ref"], "diagnostic_id": self.data["diagnostic_id"],
+                   "case_id": self.case_id, "run_index": 0, "plan_sha256": self.data["plan_sha256"],
+                   "authorization": self.authorization,
+                   "recorded_at": datetime.now(timezone.utc).isoformat(), "content": content}
+        with path.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def link(self, record: Mapping[str, Any]) -> None:
+        if self.authorization is None:
+            return
+        try:
+            self.check_authorization()
+            packages = _revision_private_package_digests(
+                self.data,
+                self.evidence_dir,
+                case_id=self.case_id,
+                run_index=record["run_index"],
+            )
+            self._write_private("link", {"result_sha256": _sha256_json(record), "result": record, "packages": packages})
+        except (ValueError, OSError, TypeError):
+            raise _RevisionDiagnosticFailure() from None
+
+    def observe(self, step: str, operation: Callable[[], Any], service: Any, observations: list) -> Any:
+        try:
+            self.check_authorization()
+        except ValueError:
+            self.data["evidence_capture_status"] = "failed"
+            raise _RevisionDiagnosticFailure() from None
+        index = _REVISION_STEPS.index(step)
+        slot = self.data["steps"][index]
+        slot["status"] = "unknown"
+        slot["provider_calls"] = None
+        self.save_progress()
+        previous = service.last_run_observation
+        completed = False
+        try:
+            result = operation()
+        except (Hy3ServiceError, AuditServiceError) as exc:
+            slot["status"] = "failed"
+            slot["error_code"] = getattr(exc, "error_code", "EVALUATION_FAILED")
+            raise
+        else:
+            completed = True
+            return result
+        finally:
+            observation = None if service.last_run_observation is previous else _read_revision_run_observation(service)
+            observation = observation or {}
+            slot.update({"provider_calls": observation.get("provider_calls"),
+                         "input_tokens": observation.get("prompt_tokens"),
+                         "output_tokens": observation.get("completion_tokens"),
+                         "total_tokens": observation.get("total_tokens")})
+            unknown_accounting = any(
+                slot[field] is None
+                for field in ("provider_calls", "input_tokens", "output_tokens", "total_tokens")
+            )
+            if completed and unknown_accounting:
+                slot["status"] = "unknown"
+                slot["error_code"] = "EVALUATION_FAILED"
+            elif completed:
+                slot["status"] = "succeeded"
+            self.save_progress()
+            if completed and unknown_accounting:
+                raise _RevisionDiagnosticFailure() from None
+
+    def complete(self, inputs: Mapping[str, Any], metrics: Mapping[str, Any]) -> None:
+        target = inputs["target_sentence_id"]
+        claims = [c for c in inputs["after_bundle"].claims if c.sentence_id == target]
+        ids = {c.claim_id for c in claims}
+        records = [r for r in inputs["after_evidence"] if r.claim_id in ids]
+        judgments = [j for j in inputs["after_result"].semantic_judgments if j.claim_id in ids]
+        valid = {(r.claim_id, r.block_id) for r in records if r.quote_verified and r.block_id and r.quote}
+        judged = {(j.claim_id, j.block_id) for j in judgments}
+        covered = _revision_covered_pairs(claims, records, inputs["after_result"])
+        self.data["claims"] = [{"claim_id": c.claim_id, "sentence_id": c.sentence_id,
+                               "target_member": c.sentence_id == target, "auditable": c.auditability.value == "auditable"} for c in claims]
+        self.data["evidence"] = [{"claim_id": r.claim_id, "block_id": r.block_id,
+            "verified": r.quote_verified, "has_excerpt": bool(r.quote), "match_method": r.match_method.value,
+            "rule_codes": sorted({flag.split(":", 1)[0] for flag in r.rule_flags})}
+            for r in records]
+        self.data["coverage"] = {"target_claim_count": len(claims), "valid_pair_count": len(valid),
+            "judgment_pair_count": len(judged), "missing_evidence_claim_ids": sorted(ids-{p[0] for p in valid}),
+            "missing_judgment_claim_ids": sorted({p[0] for p in valid-judged}),
+            "extra_judgment_claim_ids": sorted({p[0] for p in judged-valid}), "complete": covered is not None,
+            "evidence_record_count": len(records), "judgment_record_count": len(judgments)}
+        self.data["pairs"] = [{"claim_id": j.claim_id, "block_id": j.block_id,
+            "relation": j.relation.value, "scope_status": j.scope_status.value,
+            "terminology_status": j.terminology_status.value, "severity": j.severity.value,
+            "verified": (j.claim_id, j.block_id) in valid,
+            "deterministic_issue_codes": sorted({flag.split(":", 1)[0] for r in records
+                if (r.claim_id, r.block_id) == (j.claim_id, j.block_id) for flag in r.rule_flags
+                if flag.startswith(_CITATION_DETERMINISTIC_FLAG_PREFIXES)})} for j in judgments]
+        self.data["conditions"].update({"target_claims_present": bool(claims), "coverage_complete": covered is not None,
+            "all_supports": bool(judgments) and all(j.relation.value == "supports" for j in judgments),
+            "all_preserved": bool(judgments) and all(j.scope_status.value == "preserved" for j in judgments),
+            "no_severe": bool(judgments) and all(j.severity.value not in {"major", "critical"} for j in judgments),
+            "no_deterministic_conflict": not any(_has_citation_deterministic_issue(r) for r in records),
+            "resolved": bool(metrics["resolved_issue_count"])})
+        if self.authorization is not None and all(s["status"] == "succeeded" for s in self.data["steps"]):
+            self.data["evidence_capture_status"] = "complete"
+
+    def accounting(self) -> tuple[int | None, dict[str, int | None]]:
+        steps = [s for s in self.data["steps"] if s["status"] != "not_executed"]
+        calls = None if any(s["provider_calls"] is None for s in steps) else sum(s["provider_calls"] for s in steps)
+        usage = {field: None if not steps or any(s[key] is None for s in steps) else sum(s[key] for s in steps)
+                 for field, key in (("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens"), ("total_tokens", "total_tokens"))}
+        return calls, usage
+
+
+class _RevisionAuditObserver:
+    """Keep the typed result of the same call even if local scoring rejects it."""
+    def __init__(self, service, diagnostic):
+        self.service, self.diagnostic = service, diagnostic
+
+    def __getattr__(self, name):
+        return getattr(self.service, name)
+
+    def deep_audit(self, **kwargs):
+        self.diagnostic.last_result = None
+        result = self.service.deep_audit(**kwargs)
+        self.diagnostic.last_result = result
+        return result
+
+
 def evaluate_live_case(
     case: EvaluationCase,
     *,
     hy3_service: Any | None = None,
     diagnostic_plan: dict[str, Any] | None = None,
+    revision_diagnostic: RevisionDiagnostic | None = None,
 ) -> dict[str, object]:
     service = hy3_service or Hy3Service()
     if diagnostic_plan is not None:
         if case not in context_diagnostic_cases(diagnostic_plan):
             _invalid_context_diagnostic()
         service = _ContextDiagnosticService(service, diagnostic_plan, case)
-    audit_service = AuditService(hy3_service=service)
+    audit_service = AuditService(hy3_service=_RevisionAuditObserver(service, revision_diagnostic) if revision_diagnostic is not None else service)
     observations: list[Mapping[str, Any]] = []
+    if revision_diagnostic is not None:
+        if (diagnostic_plan is not None or case.payload.get("case_group") != "revision"
+            or case.case_id not in REVISION_DIAGNOSTIC_CASE_IDS or case.run_index != 0):
+            raise ValueError("invalid revision diagnostic")
+        revision_diagnostic.check_authorization()
+        revision_diagnostic.case_id = case.case_id
     source_blocks, bundle = materialize_live_case(case)
     compliance_context = ComplianceContext(
         rights_or_license_confirmed=True,
@@ -800,7 +1124,7 @@ def evaluate_live_case(
             candidate_bundle,
             source_blocks,
         )
-        result, report = _call_and_capture(
+        operation = lambda: _call_and_capture(
             lambda: audit_service.run_deep_audit(
                 candidate_bundle,
                 evidence_records,
@@ -809,6 +1133,16 @@ def evaluate_live_case(
             service=service,
             observations=observations,
         )
+        try:
+            result, report = (revision_diagnostic.observe(
+                "before_audit" if candidate_bundle is bundle else "after_audit", operation, service, observations
+            ) if revision_diagnostic is not None else operation())
+        except (Hy3ServiceError, AuditServiceError):
+            if revision_diagnostic is not None and candidate_bundle is not bundle and revision_diagnostic.last_result is not None:
+                revision_diagnostic.complete({"target_sentence_id": target_sentence_id, "after_bundle": candidate_bundle,
+                    "after_evidence": evidence_records, "after_result": revision_diagnostic.last_result}, {"resolved_issue_count": 0})
+                revision_diagnostic.capture("after_audit", bundle=candidate_bundle, target=target_sentence_id, evidence=evidence_records)
+            raise
         return evidence_records, result, report
 
     try:
@@ -837,6 +1171,14 @@ def evaluate_live_case(
         )
         mutation = paper["quality_mutations"]["bad"]
         target_sentence_id = _required_string(mutation, "target_sentence_id")
+        if revision_diagnostic is not None:
+            revision_diagnostic.data["conditions"] = {"original_target_exists": False, "original_target_matches": False}
+            try:
+                original_target = _find_sentence(bundle, target_sentence_id)
+            except ValueError:
+                raise _RevisionDiagnosticFailure() from None
+            revision_diagnostic.data["conditions"].update(original_target_exists=True,
+                original_target_matches=original_target.text == mutation["replacement_text"])
         evidence_records, before_result, before_report = audited(bundle)
         target_sentence = _find_sentence(bundle, target_sentence_id)
         target_claims = [
@@ -847,7 +1189,9 @@ def evaluate_live_case(
             for record in evidence_records
             if any(claim.claim_id == record.claim_id for claim in target_claims)
         ]
-        patch = _call_and_capture(
+        if revision_diagnostic is not None:
+            revision_diagnostic.capture("before_audit", bundle=bundle, target=target_sentence_id, evidence=target_evidence)
+        operation = lambda: _call_and_capture(
             lambda: service.revise_sentence(
                 base_version=1,
                 sentence_id=target_sentence_id,
@@ -861,9 +1205,17 @@ def evaluate_live_case(
             service=service,
             observations=observations,
         )
+        patch = (revision_diagnostic.observe("revision", operation, service, observations)
+                 if revision_diagnostic is not None else operation())
         if not isinstance(patch, EditPatch):
             raise ValueError("revision service returned an invalid patch object")
-        regenerated = _call_and_capture(
+        if revision_diagnostic is not None:
+            revision_diagnostic.data["conditions"].update({"patch_target_matches": patch.target_sentence_ids == [target_sentence_id],
+                "target_changed": patch.after_text != target_sentence.text})
+            if patch.target_sentence_ids != [target_sentence_id]:
+                raise _RevisionDiagnosticFailure()
+            revision_diagnostic.capture("revision", bundle=bundle, target=target_sentence_id, text=patch.after_text, evidence=target_evidence)
+        operation = lambda: _call_and_capture(
             lambda: service.regenerate_sentence_claims(
                 target_sentence_id=target_sentence_id,
                 accepted_after_text=patch.after_text,
@@ -882,16 +1234,27 @@ def evaluate_live_case(
             service=service,
             observations=observations,
         )
+        regenerated = (revision_diagnostic.observe("claim_rebuild", operation, service, observations)
+                       if revision_diagnostic is not None else operation())
         if not isinstance(regenerated, SentenceClaimRegenerationResult):
             raise ValueError("claim regeneration returned an invalid result object")
+        if revision_diagnostic is not None:
+            revision_diagnostic.data["claims"] = [{"claim_id": c.claim_id, "sentence_id": c.sentence_id,
+                "target_member": c.sentence_id == target_sentence_id, "auditable": c.auditability.value == "auditable"}
+                for c in regenerated.claims]
+            revision_diagnostic.data["conditions"]["rebuild_target_membership"] = all(c.sentence_id == target_sentence_id for c in regenerated.claims)
+            if not revision_diagnostic.data["conditions"]["rebuild_target_membership"]:
+                raise _RevisionDiagnosticFailure()
         revised_bundle = _replace_revised_sentence_claims(
             bundle=bundle,
             target_sentence_id=target_sentence_id,
             after_text=patch.after_text,
             regenerated=regenerated,
         )
+        if revision_diagnostic is not None:
+            revision_diagnostic.capture("claim_rebuild", bundle=revised_bundle, target=target_sentence_id)
         after_evidence, after_result, after_report = audited(revised_bundle)
-        metrics = _revision_metrics(
+        metric_inputs = dict(
             case=case,
             before_bundle=bundle,
             after_bundle=revised_bundle,
@@ -904,18 +1267,34 @@ def evaluate_live_case(
             before_evidence=evidence_records,
             after_evidence=after_evidence,
         )
+        if revision_diagnostic is not None:
+            revision_diagnostic.capture("after_audit", bundle=revised_bundle, target=target_sentence_id, evidence=after_evidence)
+            revision_diagnostic.complete(metric_inputs, {"resolved_issue_count": 0})
+        metrics = _revision_metrics(**metric_inputs)
+        if revision_diagnostic is not None:
+            revision_diagnostic.complete(metric_inputs, metrics)
+            metrics["revision_diagnostic"] = revision_diagnostic.data
+            calls, usage = revision_diagnostic.accounting()
+            return {"provider_calls": calls, "usage": usage, "metrics": metrics}
         return _live_evaluation_result(
             observations=observations,
             metrics=metrics,
         )
     except EvaluationCaseError:
         raise
-    except _RevisionMetricsIndeterminate as exc:
-        raise _evaluation_case_error(exc, observations) from None
+    except (_RevisionMetricsIndeterminate, _RevisionDiagnosticFailure) as exc:
+        error = _evaluation_case_error(exc, observations)
+        if revision_diagnostic is not None:
+            error.safe_metrics["revision_diagnostic"] = revision_diagnostic.data
+            error.provider_calls, error.usage = revision_diagnostic.accounting()
+        raise error from None
     except (Hy3ServiceError, AuditServiceError) as exc:
         error = _evaluation_case_error(exc, observations)
         if diagnostic_plan is not None:
             error.context_diagnostic = service.diagnostic_metadata()
+        if revision_diagnostic is not None:
+            error.safe_metrics["revision_diagnostic"] = revision_diagnostic.data
+            error.provider_calls, error.usage = revision_diagnostic.accounting()
         raise error from None
 
 
@@ -983,6 +1362,31 @@ def _read_run_observation(service: Any) -> Mapping[str, Any] | None:
             not isinstance(value, int) or isinstance(value, bool) or value < 0
         ):
             return None
+    return values
+
+
+def _read_revision_run_observation(service: Any) -> Mapping[str, Any] | None:
+    """Retain each valid observed field when another accounting field is unknown."""
+    observation = getattr(service, "last_run_observation", None)
+    if observation is None:
+        return None
+    provider_calls = getattr(observation, "provider_calls", None)
+    values: dict[str, Any] = {
+        "provider_calls": provider_calls if (
+            isinstance(provider_calls, int)
+            and not isinstance(provider_calls, bool)
+            and provider_calls >= 0
+        ) else None,
+        "prompt_tokens": getattr(observation, "prompt_tokens", None),
+        "completion_tokens": getattr(observation, "completion_tokens", None),
+        "total_tokens": getattr(observation, "total_tokens", None),
+    }
+    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = values[field]
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            values[field] = None
     return values
 
 
@@ -1830,6 +2234,9 @@ def _run_cases_unlocked(
         raise ValueError("duplicate case_id and run_index in evaluation input")
 
     existing_keys = _load_existing_keys(output_path=output_path, mode=mode)
+    for path, is_pending in ((output_path, False), (pending_path_for(output_path), True)):
+        if path.exists() and any("revision_diagnostic" in (r if is_pending else r.get("metrics", {})) for _, r in _read_jsonl(path)):
+            raise ValueError("invalid revision diagnostic")
     pending_keys = _load_pending_keys(
         pending_path=pending_path_for(output_path),
         mode=mode,
@@ -2619,6 +3026,299 @@ def _git_code_version() -> str:
     return version
 
 
+def validate_revision_diagnostic_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        _validate_existing_result(record=record, mode="calibrate", line_number=1)
+        data = record["metrics"]["revision_diagnostic"]
+        template = RevisionDiagnostic(data["diagnostic_id"]).data
+        if (set(data) != set(template) or record["case_id"] not in REVISION_DIAGNOSTIC_CASE_IDS
+            or record["run_index"] != 0 or data["version"] != REVISION_DIAGNOSTIC_VERSION
+            or data["baseline_commit"] != REVISION_DIAGNOSTIC_BASELINE or data["diagnostic_only"] is not True
+            or not re.fullmatch(r"[0-9a-f]{64}", data["plan_sha256"])):
+            raise ValueError()
+        if data["evidence_capture_status"] not in {"not_authorized", "complete", "partial", "failed"}:
+            raise ValueError()
+        if data["evidence_capture_status"] == "not_authorized":
+            if data["evidence_ref"] is not None:
+                raise ValueError()
+        elif not isinstance(data["evidence_ref"], str) or not re.fullmatch(r"[0-9a-f]{32}", data["evidence_ref"]):
+            raise ValueError()
+        if len(data["steps"]) != 4:
+            raise ValueError()
+        for actual, expected in zip(data["steps"], template["steps"]):
+            if (set(actual) != set(expected) or actual["step"] != expected["step"]
+                or actual["status"] not in {"not_executed", "succeeded", "failed", "unknown"}
+                or not _ERROR_CODE_PATTERN.fullmatch(actual["error_code"])):
+                raise ValueError()
+            _validate_provider_calls(actual["provider_calls"])
+            _normalize_usage({"prompt_tokens": actual["input_tokens"], "completion_tokens": actual["output_tokens"], "total_tokens": actual["total_tokens"]})
+            if actual["status"] == "not_executed" and actual["provider_calls"] != 0:
+                raise ValueError()
+        if data["evidence_capture_status"] == "complete" and any(
+            actual["status"] != "succeeded" for actual in data["steps"]
+        ):
+            raise ValueError()
+        conditions = {"original_target_exists", "original_target_matches", "patch_target_matches", "target_changed",
+                      "target_claims_present", "coverage_complete", "all_supports", "all_preserved", "no_severe",
+                      "no_deterministic_conflict", "resolved", "rebuild_target_membership"}
+        if not isinstance(data["conditions"], dict) or not set(data["conditions"]) <= conditions or any(type(v) is not bool for v in data["conditions"].values()):
+            raise ValueError()
+        if record["status"] == "succeeded" and (set(data["conditions"]) != conditions or any(s["status"] != "succeeded" for s in data["steps"])):
+            raise ValueError()
+        coverage_fields = {"target_claim_count", "valid_pair_count", "judgment_pair_count", "missing_evidence_claim_ids",
+                           "missing_judgment_claim_ids", "extra_judgment_claim_ids", "complete", "evidence_record_count", "judgment_record_count"}
+        if data["coverage"]:
+            if set(data["coverage"]) != coverage_fields or type(data["coverage"]["complete"]) is not bool:
+                raise ValueError()
+            for key in coverage_fields - {"complete"}:
+                v = data["coverage"][key]
+                if key.endswith("count"):
+                    if type(v) is not int or v < 0:
+                        raise ValueError()
+                elif not isinstance(v, list) or any(not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", x) for x in v):
+                    raise ValueError()
+        elif record["status"] == "succeeded":
+            raise ValueError()
+        for claim in data["claims"]:
+            if set(claim) != {"claim_id", "sentence_id", "target_member", "auditable"} or any(type(claim[k]) is not bool for k in ("target_member", "auditable")):
+                raise ValueError()
+            for k in ("claim_id", "sentence_id"):
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", claim[k]):
+                    raise ValueError()
+        for pair in data["pairs"]:
+            if set(pair) != {"claim_id", "block_id", "relation", "scope_status", "terminology_status", "severity", "verified", "deterministic_issue_codes"}:
+                raise ValueError()
+            for k in ("claim_id", "block_id"):
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", pair[k]):
+                    raise ValueError()
+            if (pair["relation"] not in {"supports", "contradicts", "insufficient"} or pair["scope_status"] not in {"preserved", "expanded", "unclear"}
+                or pair["terminology_status"] not in {"correct", "misused", "unclear"} or pair["severity"] not in {"none", "minor", "major", "critical"}
+                or type(pair["verified"]) is not bool or not isinstance(pair["deterministic_issue_codes"], list)
+                or any(not _ERROR_CODE_PATTERN.fullmatch(code) for code in pair["deterministic_issue_codes"])):
+                raise ValueError()
+        for evidence in data["evidence"]:
+            if (set(evidence) != {"claim_id", "block_id", "verified", "has_excerpt", "match_method", "rule_codes"}
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", evidence["claim_id"])
+                or (evidence["block_id"] is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", evidence["block_id"]))
+                or type(evidence["verified"]) is not bool or type(evidence["has_excerpt"]) is not bool
+                or evidence["match_method"] not in {"model_candidate", "bm25_fallback", "none"}
+                or not isinstance(evidence["rule_codes"], list)
+                or any(not _ERROR_CODE_PATTERN.fullmatch(code) for code in evidence["rule_codes"])):
+                raise ValueError()
+        if data["coverage"]:
+            valid = {(e["claim_id"], e["block_id"]) for e in data["evidence"] if e["verified"] and e["block_id"] and e["has_excerpt"]}
+            judged = {(p["claim_id"], p["block_id"]) for p in data["pairs"]}
+            if (data["coverage"]["target_claim_count"] != len(data["claims"])
+                or data["coverage"]["valid_pair_count"] != len(valid)
+                or data["coverage"]["judgment_pair_count"] != len(judged)
+                or data["coverage"]["evidence_record_count"] != len(data["evidence"])
+                or data["coverage"]["judgment_record_count"] != len(data["pairs"])):
+                raise ValueError()
+        steps = [s for s in data["steps"] if s["status"] != "not_executed"]
+        calls = None if any(s["provider_calls"] is None for s in steps) else sum(s["provider_calls"] for s in steps)
+        if record["provider_calls"] != calls:
+            raise ValueError()
+        for field, key in (("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens"), ("total_tokens", "total_tokens")):
+            expected = None if not steps or any(s[key] is None for s in steps) else sum(s[key] for s in steps)
+            if record["usage"][field] != expected:
+                raise ValueError()
+        return data
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise ValueError("invalid revision diagnostic") from None
+
+
+def _revision_diagnostic_plan_id(versions: VersionInfo, diagnostic_id: str, authorization: Mapping | None, settings: Any) -> str:
+    return _sha256_json({"versions": versions.__dict__, "diagnostic_id": _revision_diagnostic_id(diagnostic_id),
+        "case_ids": REVISION_DIAGNOSTIC_CASE_IDS, "version": REVISION_DIAGNOSTIC_VERSION,
+        "authorization": authorization, "manifest_sha256": _sha256_json(_load_live_manifest()),
+        "provider_config": {"base_url_sha256": hashlib.sha256(settings.hy3_base_url.encode("utf-8")).hexdigest(),
+                            "timeout_seconds": settings.hy3_timeout_seconds, "max_retries": settings.hy3_max_retries}})
+
+
+def run_revision_diagnostic(*, output_path: Path, versions: VersionInfo, diagnostic_id: str,
+                            hy3_service: Any, confirm_cost: bool = False,
+                            authorization: Mapping | None = None, evidence_dir: Path | None = None) -> int:
+    if output_path.suffix != ".jsonl" or output_path.resolve() in {p.resolve() for p in DEFAULT_RESULT_PATHS.values()}:
+        raise ValueError("invalid revision diagnostic")
+    if type(hy3_service.settings.hy3_max_retries) is not int or not 0 <= hy3_service.settings.hy3_max_retries <= 2:
+        raise ValueError("invalid revision diagnostic")
+    plan_id = _revision_diagnostic_plan_id(versions, diagnostic_id, authorization, hy3_service.settings)
+    # Authorization/permissions checked even when all slots are already complete.
+    RevisionDiagnostic(diagnostic_id, authorization=authorization, evidence_dir=evidence_dir)
+    cases = revision_diagnostic_cases()
+    if [(c.case_id, c.run_index) for c in cases] != [(key, 0) for key in REVISION_DIAGNOSTIC_CASE_IDS]:
+        raise ValueError("invalid revision diagnostic")
+    with _evaluation_run_lock(output_path):
+        existing = _load_existing_keys(output_path=output_path, mode="calibrate")
+        pending = _load_pending_keys(pending_path=pending_path_for(output_path), mode="calibrate")
+        planned = {(c.case_id, 0) for c in cases}
+        if not (existing | pending) <= planned:
+            raise ValueError("invalid revision diagnostic")
+        prior_failure = False
+        for _, record in _read_jsonl(output_path) if output_path.exists() else []:
+            d = validate_revision_diagnostic_record(record)
+            if d["plan_sha256"] != plan_id:
+                raise ValueError("invalid revision diagnostic")
+            if d["evidence_ref"] is not None:
+                if evidence_dir is None:
+                    raise ValueError("invalid revision diagnostic")
+                try:
+                    link_path = evidence_dir / f"{d['evidence_ref']}.link.json"
+                    if link_path.is_symlink() or link_path.is_junction() or not link_path.is_file():
+                        raise ValueError()
+                    link = json.loads(link_path.read_text(encoding="utf-8"))
+                    if (not isinstance(link, dict)
+                        or link.get("evidence_ref") != d["evidence_ref"]
+                        or link.get("diagnostic_id") != d["diagnostic_id"]
+                        or link.get("case_id") != record["case_id"]
+                        or link.get("run_index") != record["run_index"]
+                        or link.get("plan_sha256") != d["plan_sha256"]
+                        or not isinstance(link.get("content"), dict)
+                        or link["content"].get("result_sha256") != _sha256_json(record)
+                        or not isinstance(link["content"].get("packages"), dict)):
+                        raise ValueError()
+                    packages = link["content"]["packages"]
+                    if (any(not isinstance(step, str) or step not in _REVISION_STEPS for step in packages)
+                        or any(not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                               for digest in packages.values())):
+                        raise ValueError()
+                    expected = _revision_private_package_digests(
+                        d, evidence_dir, case_id=record["case_id"], run_index=record["run_index"]
+                    )
+                    if packages != expected:
+                        raise ValueError()
+                except (OSError, ValueError, KeyError, TypeError):
+                    raise ValueError("invalid revision evidence association") from None
+            prior_failure |= record["status"] != "succeeded"
+        pending_metadata = {}
+        for _, record in _read_jsonl(pending_path_for(output_path)) if pending_path_for(output_path).exists() else []:
+            d = record.get("revision_diagnostic")
+            if not isinstance(d, dict) or d.get("plan_sha256") != plan_id or d.get("diagnostic_id") != diagnostic_id:
+                raise ValueError("invalid revision diagnostic")
+            candidate = _result_record(case=next(c for c in cases if c.case_id == record["case_id"]), mode="calibrate",
+                versions=versions, status="failed", error_code="RUN_INTERRUPTED", provider_calls=0,
+                usage=None, metrics={"revision_diagnostic": d}, elapsed_ms=None)
+            validate_revision_diagnostic_record(candidate)
+            if any(s["status"] != "not_executed" for s in d["steps"]):
+                raise ValueError("invalid revision diagnostic")
+            if d["evidence_ref"] is not None and (record["case_id"], record["run_index"]) not in existing:
+                if evidence_dir is None:
+                    raise ValueError("invalid revision diagnostic")
+                try:
+                    _revision_private_package_digests(
+                        d, evidence_dir, case_id=record["case_id"], run_index=record["run_index"]
+                    )
+                except (OSError, ValueError, KeyError, TypeError):
+                    raise ValueError("invalid revision evidence association") from None
+            pending_metadata[(record["case_id"], record["run_index"])] = d
+        progress_path = output_path.with_name(output_path.name + ".progress.jsonl")
+        progress = {}
+        for _, snapshot in _read_jsonl(progress_path) if progress_path.exists() else []:
+            d = validate_revision_diagnostic_record(snapshot)
+            key = (snapshot["case_id"], snapshot["run_index"])
+            if (d["plan_sha256"] != plan_id or key not in pending
+                or d["evidence_ref"] != pending_metadata[key]["evidence_ref"]):
+                raise ValueError("invalid revision diagnostic")
+            progress[key] = snapshot
+        for key, snapshot in progress.items():
+            d = snapshot["metrics"]["revision_diagnostic"]
+            if d["evidence_ref"] is not None:
+                if evidence_dir is None:
+                    raise ValueError("invalid revision diagnostic")
+                try:
+                    _revision_private_package_digests(
+                        d, evidence_dir, case_id=snapshot["case_id"], run_index=snapshot["run_index"]
+                    )
+                except (OSError, ValueError, KeyError, TypeError):
+                    raise ValueError("invalid revision evidence association") from None
+        remaining = planned - existing - pending
+        attempts = 4 * len(remaining) * (hy3_service.settings.hy3_max_retries + 1)
+        print(f"DIAGNOSTIC_ONLY=True SLOTS=3 RESUME_COMPLETE={len(existing)} PENDING={len(remaining)} LOGICAL_REQUESTS={4*len(remaining)} PROVIDER_ATTEMPTS_UPPER={attempts}")
+        if prior_failure:
+            return 2
+        # Recover interrupted slots without any provider operation; never start
+        # another slot in the same invocation after this unknown state.
+        interrupted = [c for c in cases if (c.case_id, 0) in pending-existing]
+        if interrupted:
+            for case in interrupted:
+                d = copy.deepcopy(pending_metadata[(case.case_id, 0)])
+                if d.get("evidence_ref") is not None:
+                    # Never guess across the two-file publication boundary. An
+                    # orphan link may contain observed accounting: preserve it
+                    # for independent recovery, without reading private text.
+                    if evidence_dir is None or (evidence_dir / f"{d['evidence_ref']}.link.json").exists():
+                        raise ValueError("invalid revision evidence association")
+                snapshot = progress.get((case.case_id, 0))
+                if snapshot is None:
+                    for step in d["steps"]:
+                        step.update(status="unknown", provider_calls=None)
+                else:
+                    d = copy.deepcopy(snapshot["metrics"]["revision_diagnostic"])
+                if d["evidence_capture_status"] == "complete":
+                    d["evidence_capture_status"] = "partial"
+                record = _result_record(case=case, mode="calibrate", versions=versions, status="failed",
+                    error_code="RUN_INTERRUPTED", provider_calls=snapshot["provider_calls"] if snapshot else None,
+                    usage=snapshot["usage"] if snapshot else None,
+                    metrics={"revision_diagnostic": d}, elapsed_ms=None)
+                validate_revision_diagnostic_record(record)
+                _append_jsonl(output_path, record)
+            return 2
+        if remaining and not confirm_cost:
+            print("COST_CONFIRMATION_REQUIRED=True")
+            return 2
+        if remaining and hy3_service.settings.paperlens_model_mode != "live":
+            print("EVAL_REFUSED=LIVE_MODE_REQUIRED")
+            return 2
+        for case in cases:
+            if (case.case_id, 0) in existing:
+                continue
+            diagnostic = RevisionDiagnostic(diagnostic_id, authorization=authorization, evidence_dir=evidence_dir, plan_sha256=plan_id)
+            diagnostic.case_id = case.case_id
+            _append_jsonl(pending_path_for(output_path), {"case_id": case.case_id, "run_index": 0,
+                "mode": "calibrate", "revision_diagnostic": diagnostic.data})
+            def checkpoint():
+                calls, usage = diagnostic.accounting()
+                snapshot = _result_record(case=case, mode="calibrate", versions=versions, status="failed",
+                    error_code="RUN_INTERRUPTED", provider_calls=calls, usage=usage,
+                    metrics={"revision_diagnostic": diagnostic.data}, elapsed_ms=None)
+                validate_revision_diagnostic_record(snapshot)
+                _append_jsonl(progress_path, snapshot)
+            diagnostic.checkpoint = checkpoint
+            start = time.perf_counter()
+            try:
+                value = evaluate_live_case(case, hy3_service=hy3_service, revision_diagnostic=diagnostic)
+                status, code = "succeeded", "NONE"
+                if value["provider_calls"] is None:
+                    status, code = "failed", "EVALUATION_FAILED"
+                    value["metrics"] = {"revision_diagnostic": diagnostic.data}
+            except EvaluationCaseError as exc:
+                value = {"metrics": exc.safe_metrics, "provider_calls": exc.provider_calls, "usage": exc.usage}
+                status, code = exc.status, exc.error_code
+            record = _result_record(case=case, mode="calibrate", versions=versions, status=status, error_code=code,
+                provider_calls=value["provider_calls"], usage=value["usage"], metrics=value["metrics"],
+                elapsed_ms=max(0, round((time.perf_counter()-start)*1000)))
+            validate_revision_diagnostic_record(record)
+            try:
+                diagnostic.save_progress()
+            except _RevisionDiagnosticFailure:
+                record["status"], record["error_code"] = "failed", "EVALUATION_FAILED"
+                record["metrics"] = {"revision_diagnostic": diagnostic.data}
+                _append_jsonl(output_path, record)
+                return 2
+            try:
+                diagnostic.link(record)
+            except _RevisionDiagnosticFailure:
+                record["status"], record["error_code"] = "failed", "EVALUATION_FAILED"
+                record["metrics"] = {"revision_diagnostic": diagnostic.data}
+                record["metrics"]["revision_diagnostic"]["evidence_capture_status"] = "failed"
+                _append_jsonl(output_path, record)
+                return 2
+            _append_jsonl(output_path, record)
+            if status != "succeeded":
+                return 2
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run PaperLens stage 7 evaluation.")
     parser.add_argument("--mode", required=True, choices=SUPPORTED_MODES)
@@ -2634,11 +3334,33 @@ def main() -> int:
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--diagnostic-id")
+    parser.add_argument("--revision-diagnostic", action="store_true")
+    parser.add_argument("--evidence-authorization", type=Path)
+    parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--case-id", action="append")
     parser.add_argument("--target-claim-id")
     parser.add_argument("--target-block-id")
     parser.add_argument("--repeat-count", type=int, choices=(3,))
     args = parser.parse_args()
+    if args.revision_diagnostic:
+        if (args.mode != "calibrate" or args.freeze_config or args.output is None or not args.diagnostic_id
+            or any(v is not None for v in (args.case_id, args.target_claim_id, args.target_block_id, args.repeat_count))
+            or (args.evidence_authorization is None) != (args.evidence_dir is None)):
+            parser.error("invalid revision diagnostic")
+        try:
+            authorization = None
+            if args.evidence_authorization is not None:
+                authorization = json.loads(args.evidence_authorization.read_text(encoding="utf-8"))
+            service = Hy3Service()
+            versions = VersionInfo(model=service.settings.hy3_model, prompt_version=DEEP_AUDIT_PROMPT_VERSION,
+                schema_version=DEEP_AUDIT_SCHEMA_VERSION, data_version=_load_live_manifest()["data_version"], code_version=_code_version())
+            return run_revision_diagnostic(output_path=args.output, versions=versions, diagnostic_id=args.diagnostic_id,
+                hy3_service=service, confirm_cost=args.confirm_cost, authorization=authorization, evidence_dir=args.evidence_dir)
+        except (ValueError, OSError):
+            print("EVAL_REFUSED=invalid revision diagnostic")
+            return 2
+    if args.evidence_authorization is not None or args.evidence_dir is not None:
+        parser.error("invalid revision diagnostic")
     diagnostic_requested = any(value is not None for value in (
         args.diagnostic_id, args.case_id, args.target_claim_id,
         args.target_block_id, args.repeat_count,

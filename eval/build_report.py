@@ -89,6 +89,26 @@ def load_results(input_path: Path) -> list[dict[str, Any]]:
 
 
 def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
+    if any("revision_diagnostic" in r.get("metrics", {}) for r in records):
+        from eval.run_eval import REVISION_DIAGNOSTIC_CASE_IDS, validate_revision_diagnostic_record
+
+        rows = []
+        plans, keys = set(), set()
+        for record in records:
+            d = validate_revision_diagnostic_record(record)
+            key = (record["case_id"], record["run_index"])
+            if key in keys:
+                raise ValueError("invalid revision diagnostic")
+            keys.add(key)
+            plans.add((d["plan_sha256"], record["code_version"], d["diagnostic_id"]))
+            rows.append({"case_id": record["case_id"], "status": record["status"],
+                         "error_code": record["error_code"], "provider_calls": record["provider_calls"],
+                         "usage": record["usage"], **d})
+        if len(plans) != 1:
+            raise ValueError("invalid revision diagnostic")
+        return {"revision_diagnostic": sorted(rows, key=lambda row: row["case_id"]),
+                "missing_slots": sorted(set(REVISION_DIAGNOSTIC_CASE_IDS) - {row["case_id"] for row in rows}),
+                "acceptance_gates": {"status": "not_available", "target_source": "diagnostic_only", "targets": {}, "gates": {}}}
     for record in records:
         validate_expression_metrics(record)
     if any(isinstance(record.get("metrics"), dict) and "context_diagnostic" in record["metrics"] for record in records):
@@ -1443,6 +1463,8 @@ def _metric_number(metrics: dict[str, Any], field: str) -> float:
 def build_report(*, input_path: Path, output_path: Path) -> dict[str, Any]:
     records = load_results(input_path)
     summary = summarize_results(records)
+    if "revision_diagnostic" in summary and (input_path.resolve() == output_path.resolve() or output_path.exists()):
+        raise ValueError("invalid revision diagnostic output")
     if "context_diagnostic" in summary and input_path.resolve() == output_path.resolve():
         raise ValueError("invalid context diagnostic output")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1459,6 +1481,25 @@ def _render_markdown(
     summary: dict[str, Any],
     records: list[dict[str, Any]],
 ) -> str:
+    if "revision_diagnostic" in summary:
+        lines = ["# Revision three-case diagnostic", "", "Diagnostic only; no formal acceptance gates.",
+                 "Structured conditions do not establish semantic truth. Private evidence is not read by this report.",
+                 "Missing slots: " + (", ".join(summary["missing_slots"]) or "none"), ""]
+        for row in summary["revision_diagnostic"]:
+            lines.extend([f"## {_markdown_cell(row['case_id'])}", "",
+                f"Status: {row['status']} / {row['error_code']}",
+                f"Evidence capture: {row['evidence_capture_status']}; reference: {row['evidence_ref'] or '-'}", "",
+                "| Step | Status | Error | Calls | Input | Output | Total |",
+                "| --- | --- | --- | ---: | ---: | ---: | ---: |"])
+            for step in row["steps"]:
+                cells = [step[k] for k in ("step", "status", "error_code", "provider_calls", "input_tokens", "output_tokens", "total_tokens")]
+                lines.append("| " + " | ".join("-" if c is None else str(c) for c in cells) + " |")
+            lines.extend(["", "| Condition | Value |", "| --- | --- |"])
+            for key, value in sorted(row["conditions"].items()):
+                lines.append(f"| {key} | {str(value).lower()} |")
+            lines.extend(["", "```json", json.dumps({k: row[k] for k in ("coverage", "claims", "pairs", "evidence")},
+                ensure_ascii=False, sort_keys=True, indent=2), "```", ""])
+        return "\n".join(lines)
     if "context_diagnostic" in summary:
         return _render_context_diagnostic(summary)
     lines = [
