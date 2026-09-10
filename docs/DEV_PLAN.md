@@ -1183,6 +1183,8 @@ npx playwright test
 
 ### 阶段 7：评测脚本和结果报告
 
+**最终收尾状态（2026-09-10）：`STAGE_7=PASS_FIXED_SAMPLE`。** 本节后续的 HOLD、待实施和待授权描述是历史决策记录，不覆盖本次最终验收。最终评测代码基线为 `b625ec75a9fffbde430ed4fdba3db938e818a096`；calibrate 15 槽、final 52 槽和 stability 36 槽均完整执行。final 与 stability 的 88 条正式结果满足全部冻结门槛，报告重建一致。证据位置、摘要、限制及基线区分见 [阶段7收尾记录](stage7_closeout.md)。该结论仅适用于已批准且已查看的固定样本，不是盲测、泛化验证或生产就绪声明。
+
 **允许修改**：`eval/`、`reports/`、评测调用所需的只读服务接口。
 
 **已批准原子任务：文档与实验口径对齐（2026-09-06）。** 用户在集中决策表后确认“按风险最小改动最小的最优方案执行”。本任务仅修改 `docs/DEV_PLAN.md`、`docs/paperlens_project_proposal.md`，将以下四项口径同步到文档，不改变代码、样本、数值门槛或历史产物：
@@ -1285,6 +1287,8 @@ python eval/build_report.py --input reports/smoke_results.jsonl
 - 最终保留集开始前冻结配置；运行后不得按结果移动门槛。
 
 ### 阶段 8：发布检查
+
+**入口状态（2026-09-10）：阶段7实验与文档收尾完成后开始发布检查；`STAGE_8=IN_PROGRESS`、`PRODUCTION_READY=NO`。** 阶段8检查不能改变阶段7冻结、阈值或历史结果；付费调用和真实 MinerU 集成仍需明确授权。全新环境、发布材料与演示等下列项目需逐项留下实际证据。
 
 任务：
 
