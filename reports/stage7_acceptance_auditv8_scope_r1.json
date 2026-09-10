@@ -1,0 +1,145 @@
+{
+  "stage7": "PASS_FIXED_SAMPLE",
+  "stage8": "NOT_STARTED",
+  "production_ready": false,
+  "commit": "b625ec75a9fffbde430ed4fdba3db938e818a096",
+  "formal_rows": 88,
+  "formal_calls": 103,
+  "stability_rows": 36,
+  "stability_calls": 36,
+  "dimension_consistency_numerator": 85,
+  "dimension_consistency_denominator": 96,
+  "mean_score_standard_deviation": 1.1993288533809268,
+  "gates": {
+    "status": "passed",
+    "target_source": "frozen",
+    "targets": {
+      "attack_detection_min": 13,
+      "clean_false_positives_max": 1,
+      "key_citation_accuracy_min": 0.9,
+      "key_citation_completeness_min": 0.8,
+      "quality_pairwise_min": 13,
+      "quality_strict_order_min": 4,
+      "revision_error_resolution_min": 0.7,
+      "revision_irrelevant_change_rate_max": 0.05,
+      "revision_new_severe_errors_max": 0,
+      "severe_error_detection_min": 0.9,
+      "stability_dimension_consistency_min": 0.8,
+      "stability_mean_score_sd_max": 5.0
+    },
+    "gates": {
+      "quality_strict_order": {
+        "status": "passed",
+        "observed": 5,
+        "target": 4,
+        "denominator": 5,
+        "operator": ">="
+      },
+      "quality_pairwise": {
+        "status": "passed",
+        "observed": 15,
+        "target": 13,
+        "denominator": 15,
+        "operator": ">="
+      },
+      "severe_error_detection": {
+        "status": "passed",
+        "observed": 1.0,
+        "target": 0.9,
+        "denominator": 5,
+        "operator": ">="
+      },
+      "key_citation_accuracy": {
+        "status": "passed",
+        "observed": 0.9,
+        "target": 0.9,
+        "denominator": 60,
+        "operator": ">="
+      },
+      "key_citation_completeness": {
+        "status": "passed",
+        "observed": 0.9,
+        "target": 0.8,
+        "denominator": 60,
+        "operator": ">="
+      },
+      "stability_mean_score_sd": {
+        "status": "passed",
+        "observed": 1.1993,
+        "target": 5.0,
+        "denominator": 36,
+        "operator": "<="
+      },
+      "stability_dimension_consistency": {
+        "status": "passed",
+        "observed": 0.8854,
+        "target": 0.8,
+        "denominator": 36,
+        "operator": ">="
+      },
+      "attack_detection": {
+        "status": "passed",
+        "observed": 16,
+        "target": 13,
+        "denominator": 16,
+        "operator": ">="
+      },
+      "clean_false_positives": {
+        "status": "passed",
+        "observed": 0,
+        "target": 1,
+        "denominator": 16,
+        "operator": "<="
+      },
+      "revision_error_resolution": {
+        "status": "passed",
+        "observed": 0.8,
+        "target": 0.7,
+        "denominator": 5,
+        "operator": ">="
+      },
+      "revision_new_severe_errors": {
+        "status": "passed",
+        "observed": 0,
+        "target": 0,
+        "denominator": 5,
+        "operator": "<="
+      },
+      "revision_irrelevant_change_rate": {
+        "status": "passed",
+        "observed": 0.0,
+        "target": 0.05,
+        "denominator": 5,
+        "operator": "<="
+      }
+    }
+  },
+  "report_rebuild_identical": true,
+  "protected_hashes_match": true,
+  "offline_regression_evidence": "Independently rerun 1137 passed, 1 skipped before commit; source unchanged.",
+  "limitations": [
+    "Previously viewed fixed samples; not a blind or generalization result.",
+    "Revision holdout-02 unresolved; aggregate 4/5 meets frozen threshold.",
+    "Human-reviewed cross-block scope applies only to revision:holdout-04:bad.",
+    "Stage8 release checks not performed.",
+    "Costs estimated from recorded usage, not verified provider bill."
+  ],
+  "artifacts": {
+    "calibrate_report_auditv8_scope_r1_postfreeze.md": "5deb3d52a8b2d457825a18209f2570b4d6254013fc9c832d3b4cb9747dd7c0cb",
+    "calibrate_report_auditv8_scope_r1_prefreeze.md": "ac50f36bbb27c89d8a009e97478708e6309ae70c3b07a5ffeb1cb3e7eb9a8268",
+    "calibrate_results_auditv8_scope_r1.jsonl": "c9abcdf9027ce15fde7816929f12bb3840649507fb7ec00a37c931bad9839048",
+    "calibrate_results_auditv8_scope_r1.jsonl.lock": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+    "calibrate_results_auditv8_scope_r1.jsonl.pending.jsonl": "b4bb981841cd16da8efe6de566aae4811bc53198a272bdfbb95897e28024f3c1",
+    "final_report_auditv8_scope_r1.md": "a4f2f41a56274a3005c094a7e5f01006a3f6db9d45f7b7f0de5ad4cfa1f718ad",
+    "final_results_auditv8_scope_r1.jsonl": "fd1f4ff03f6d26f9f5ae2a1a5934a773967a0ee85f13d9d27eeec267c3f03bd0",
+    "final_results_auditv8_scope_r1.jsonl.lock": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+    "final_results_auditv8_scope_r1.jsonl.pending.jsonl": "72890e7eca5a7ff25af81623fbf2b920dcacf8a23d5c9590070eff485be28ed4",
+    "stability_report_auditv8_scope_r1.md": "13020214b6f663f312a58a3eeaada5dcefd92fdf3995dff1beb5dc91c24b2c1b",
+    "stability_results_auditv8_scope_r1.jsonl": "07c4f26fabfd3efb56723d1315ef8dfbc8dbec573f879eeca1520d31244ce2d8",
+    "stability_results_auditv8_scope_r1.jsonl.lock": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+    "stability_results_auditv8_scope_r1.jsonl.pending.jsonl": "d9f55e298274e6080e51a2763d3bd3321c8d74b63c35631298c389b7c89fcc6d",
+    "stage7_frozen_config.json": "64198896fa0ec6398a4b66de5108d0bfc144ca56d0ff1a34eac64de228a8a955",
+    "stage7_report_auditv8_scope_r1.md": "9c1c0c16dc7a144ebb6299c5e1cef73490295930d5d401f2cf7d2db97b4dc8d2",
+    "stage7_results_auditv8_scope_r1.jsonl": "0e0ed06263cba254fb81d6b13aa4c4158821833caa2236e674b00ee24f37fe30"
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "acceptance_targets": {
+    "attack_detection_min": 13,
+    "clean_false_positives_max": 1,
+    "key_citation_accuracy_min": 0.9,
+    "key_citation_completeness_min": 0.8,
+    "quality_pairwise_min": 13,
+    "quality_strict_order_min": 4,
+    "revision_error_resolution_min": 0.7,
+    "revision_irrelevant_change_rate_max": 0.05,
+    "revision_new_severe_errors_max": 0,
+    "severe_error_detection_min": 0.9,
+    "stability_dimension_consistency_min": 0.8,
+    "stability_mean_score_sd_max": 5.0
+  },
+  "code_version": "workspace-content-35623d9b0da0b4ad7c1573b12a9c634980058b7248ad3b44187c14d4091dcbd1",
+  "core_dimension_gates": {
+    "citation_completeness": 3,
+    "citation_correctness": 3,
+    "conclusion_limitations": 3,
+    "factual_consistency": 3,
+    "method_scope": 3,
+    "reader_adaptation": 2,
+    "risk_compliance": 3,
+    "terminology": 2
+  },
+  "created_at": "2026-09-10T01:12:50.148076+00:00",
+  "data_version": "paperlens-plos-abstracts-v1",
+  "dimension_weights": {
+    "citation_completeness": 0.15,
+    "citation_correctness": 0.15,
+    "conclusion_limitations": 0.15,
+    "factual_consistency": 0.2,
+    "method_scope": 0.15,
+    "reader_adaptation": 0.08,
+    "risk_compliance": 0.05,
+    "terminology": 0.07
+  },
+  "evaluation_method_version": "paperlens-stage7-method-v3",
+  "freeze_version": "paperlens-stage7-freeze-v2",
+  "manifest_sha256": "9da351a6d8e9bf65e959c1c65be3cb41f33c5486211752085707339b2d00fa7d",
+  "manifest_version": "paperlens-live-manifest-v1",
+  "model": "hy3",
+  "overall_score_threshold": 75,
+  "prompt_versions": {
+    "deep_audit": "audit-v8",
+    "revision": "revision-v3",
+    "sentence_claims": "sentence-claims-v3"
+  },
+  "provider_config": {
+    "base_url_sha256": "55d8daa779c2677950284ca29b3592b00ba33aa642800c819b5a63f23675965d",
+    "max_retries": 2,
+    "timeout_seconds": 120
+  },
+  "reviewed_scope_sha256": "cea1410942cf1ccabff97f273e420d8b76d1ae9ebdc355fd856283997f4a51b6",
+  "schema_versions": {
+    "deep_audit": "deep-audit-result-v3",
+    "revision": "edit-patch-v1",
+    "sentence_claims": "sentence-claims-result-v1"
+  }
+}

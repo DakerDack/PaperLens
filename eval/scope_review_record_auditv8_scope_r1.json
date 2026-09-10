@@ -1,0 +1,14 @@
+{
+  "approval_state": "PENDING_USER_DIGEST_CONFIRMATION",
+  "basis": "User supplied bounded review of holdout-04 b01/b02/b03 in this conversation; block hashes rechecked. No new private evidence read.",
+  "conclusion": "Study design and recruited participant scope apply to the statistical result; no basis for whole-population generalization.",
+  "limitations": [
+    "Constructed page_index is not an original paper page.",
+    "Previously viewed fixed sample; not blind evaluation.",
+    "Only revision:holdout-04:bad is explicitly mapped; no automatic extension to other slots.",
+    "Draft manifest digest requires independent user confirmation before Live."
+  ],
+  "manifest_sha256": "e6c86a6218cd6e4c8adea8daaf7dfdc8de59b890b8c0aa5252414f38031c1d78",
+  "review_ref": "holdout04-scope-review-conversation-r1",
+  "source_sha256": "9da351a6d8e9bf65e959c1c65be3cb41f33c5486211752085707339b2d00fa7d"
+}

@@ -6,6 +6,20 @@ PaperLens 是一个基于 Hy3 的可信学术解读、主张级证据审计与�
 
 模型默认 **Mock（预置合成结果）**，不是实时 Hy3；Live 失败不会回退 Mock。Mock 只适合仓库合成 PDF 演练，不用于解读任意论文。快速检查不产生完整评分；完整审计仍可能出错，需人工核对原文。
 
+## 活动提交材料（任务一）
+
+本仓库选择“开放式场景：AI 应用与评判标准设计”。[任务一分析报告](docs/task1_analysis.md)集中说明场景、八维标准、样本、实验过程、失败模式与能力边界，并逐项对应活动 PDF 的产出要求。
+
+| 材料 | 入口 |
+|---|---|
+| 评测样本与方法 | [10 篇材料及变异清单](eval/live_cases.json)、[执行脚本](eval/run_eval.py)、[报告重建](eval/build_report.py) |
+| 完整结果 | [103 槽逐行结果表](reports/stage7_full_results_auditv8_scope_r1.md)、[正式报告](reports/stage7_report_auditv8_scope_r1.md)、[校准报告](reports/calibrate_report_auditv8_scope_r1_postfreeze.md) |
+| 原始数据与冻结 | [校准 15 条](reports/calibrate_results_auditv8_scope_r1.jsonl)、[正式 88 条](reports/stage7_results_auditv8_scope_r1.jsonl)、[本轮冻结](reports/stage7_frozen_auditv8_scope_r1.json) |
+| 实验分析与复核 | [分析、失败案例和离线重建命令](docs/task1_analysis.md)、[人工范围关联](eval/reviewed_scope_manifest_auditv8_scope_r1.json) |
+| 演示 | [50.04 秒视频](reports/stage8_demo.webm)，真实本地 API，模型明确为 Mock |
+
+正式结果为已查看固定样本上的通过：排序 5/5、攻击警报 16/16、修订解决 4/5；校准存在好中打平，篇幅攻击被检出后仍可能合格。结论不代表盲测或任意论文效果。下方说明安装和使用；仅复核实验数据时，运行分析报告中的零调用命令即可。
+
 ## 从零安装应用（Windows PowerShell）
 
 先安装 [Python 3.13](https://www.python.org/downloads/windows/) 和 [Node.js](https://nodejs.org/en/download)。本轮使用 Python 3.13.3、Node 24.13.0；不要使用全局 Python 业务包或全局 Vite。以下命令从仓库根目录运行，保留已有 `.env`：
@@ -65,7 +79,7 @@ try {
 
 页码和引文来自解析与代码核验；分数及门槛由代码计算，均不由 Hy3 直接决定。普通文本 PDF 支持 pdfplumber 降级。P1 文本查找高亮已实现，匹配失败时保留页码和摘录；P2 bbox 精确覆盖和复杂 OCR/表格没有正式验收，不宣称支持。
 
-阶段 7 仅在已查看的固定样本上通过，非盲测或泛化证明；holdout-02 的修订未解决。完整数据位置、哈希和失败限制见 [阶段 7 收尾](docs/stage7_closeout.md)。`eval/run_eval.py --mode smoke` 是参考回放，无供应商调用，不替代正式评测。
+阶段 7 仅在已查看的固定样本上通过，非盲测或泛化证明；holdout-02 的修订未解决。公开数据、哈希与离线复核见 [任务一分析报告](docs/task1_analysis.md)，历史验收过程见 [阶段 7 收尾](docs/stage7_closeout.md)。`eval/run_eval.py --mode smoke` 是参考回放，无供应商调用，不替代正式评测。
 
 ## 环境
 

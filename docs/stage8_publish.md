@@ -26,10 +26,22 @@
 
 本次承接本地实现历史和 GitHub 已有历史。已验收工作区基线为 `1e3a3c67fa47f68c97d742ad336bb9960adbeb96` 加阶段8交付；原阶段7评测代码基线仍为 `b625ec75a9fffbde430ed4fdba3db938e818a096`。发布合并不替换实验冻结的代码基线。
 
-包含应用源码、锁文件、MIT、第三方许可与归属、合成测试夹具、发布记录、明确标注的演示及参考 smoke 原始结果。`.env`、凭据、本地数据库、Python/Node 环境、历史临时报告、锁和 pending 文件、私有输入及阶段7外部证据目录不随本次源码发布上传。
+首次源码发布包含应用源码、锁文件、MIT、第三方许可与归属、合成测试夹具、发布记录、明确标注的演示及参考 smoke 原始结果。本次按下节补齐经核查的阶段 7 公开评测原件；外部证据目录未整体上传。`.env`、凭据、本地数据库、Python/Node 环境、历史临时报告、锁和 pending 文件及私有输入继续保留在本地。
 
 根目录 `paperlens_project_proposal.md` 是 GitHub 已有的原始方案，保留作为历史；当前开发契约见 `docs/DEV_PLAN.md`，阶段7实验结论见 `docs/stage7_closeout.md`。原阶段8开发报告及扫描 inventory 是发布前的证据快照，其中“尚未提交”“无 remote”和本机路径保留为当时事实，不代表 GitHub 发布后的状态，也不是克隆后所有文件的实时扫描结果。
 
-本次新增发布说明及 README 导航，不修改业务实现、测试断言、API、Schema、依赖、评分或错误码。未运行 Live 或真实 MinerU。
+首次发布新增了本说明与 README 导航。后续活动材料补齐范围及验证如下。
+
+## 活动任务一材料补齐
+
+本次在已发布基线 `3adfc67d044bd4c247e01c3e0e65b7bcfdfc5730` 上补齐公开评测材料。源产物经字段和高置信度密钥模式核查后，按原字节发布校准 JSONL / 报告、正式汇总 JSONL / 报告、冻结配置、人工范围关联、历史人工复核记录和阶段 7 验收记录。未公开论文全文、提示词、供应商原始回答或私有对话。
+
+新增 [任务一分析报告](task1_analysis.md)和 [103 槽逐行结果表](../reports/stage7_full_results_auditv8_scope_r1.md)，并补充 README 导航。正式 88 条为 final 52 + stability 36，calibrate 15 条另存；不把它们算成 103 篇论文，也不把校准数据混入正式门槛。
+
+本次材料验证：8 份复制原件的 SHA256 与实验留存一致；15 个校准槽及 52 个 final、12×3 个 stability 槽位逐项匹配；两份公开报告用对应冻结离线重建后逐字节一致；范围关联文件摘要和规范化指纹匹配；完整结果表对照全部 103 条原始行。整理前后 21 项阶段 7 源产物摘要一致。摘要和复核命令见分析报告。
+
+公开冻结另名为 `reports/stage7_frozen_auditv8_scope_r1.json`。旧默认冻结、历史状态字段和原验收记录均保留原样，须按分析报告选择本轮冻结，不能套用早期文件。Stage 7 验收记录中的 `stage8=NOT_STARTED` 和人工复核草稿的 `PENDING_USER_DIGEST_CONFIRMATION` 均为历史快照；后续批准与当前状态已单独说明。
+
+本次增加结果副本、说明文档及 3 个证据文件的 Git 换行保留规则；Windows/Linux 检出均核对原始摘要。没有业务代码、测试、依赖、API、Schema、错误码、评分或门槛变化。未执行 Live、真实 MinerU 或重新冻结；阶段 8 业务验证承接上表，不冒称本次重跑。`STAGE_7=PASS_FIXED_SAMPLE`、`STAGE_8=PASS`、`PRODUCTION_READY=NO` 保持其原有限定。
 
 安装、启动与合成演练按 [README](../README.md)；视频见 [stage8_demo.webm](../reports/stage8_demo.webm)。演示使用真实本地 API 与 pdfplumber，模型回答为显式 Mock。真实论文、外部 API 和对外部署仍须分别处理权限、费用及使用场景的验证。

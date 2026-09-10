@@ -18,3 +18,8 @@
 *.gif binary
 *.webp binary
 *.zip binary
+
+# Preserve byte-identical stage 7 evidence and its original line endings.
+/reports/calibrate_results_auditv8_scope_r1.jsonl -text
+/reports/stage7_results_auditv8_scope_r1.jsonl -text
+/reports/stage7_acceptance_auditv8_scope_r1.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

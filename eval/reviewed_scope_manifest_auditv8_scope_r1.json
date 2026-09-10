@@ -1,0 +1,49 @@
+{
+  "entries": [
+    {
+      "case_id": "revision:holdout-04:bad",
+      "links": [
+        {
+          "result": {
+            "block_id": "holdout-04-b03",
+            "end": 109,
+            "page_index": 0,
+            "reading_order": 2,
+            "sha256": "9a4f82231769f36606dec9245df819c21da5b2410a2db77ceac2e25d495ee319",
+            "start": 0
+          },
+          "source": {
+            "block_id": "holdout-04-b01",
+            "end": 79,
+            "page_index": 0,
+            "reading_order": 0,
+            "sha256": "a8be7b4c289e214aeffbf219442a212fae6ba7227ac105b9a45d6f19ede9e379",
+            "start": 0
+          }
+        },
+        {
+          "result": {
+            "block_id": "holdout-04-b03",
+            "end": 109,
+            "page_index": 0,
+            "reading_order": 2,
+            "sha256": "9a4f82231769f36606dec9245df819c21da5b2410a2db77ceac2e25d495ee319",
+            "start": 0
+          },
+          "source": {
+            "block_id": "holdout-04-b02",
+            "end": 94,
+            "page_index": 0,
+            "reading_order": 1,
+            "sha256": "7aed45ece6c3dac613fd3770cae7ac6eea3e2040d57e2e4c9452c20c496be825",
+            "start": 0
+          }
+        }
+      ],
+      "material_sha256": "1fedcec0ec0f2eaaae5aaf7889088c204428fd6660dddd7d11d8ed62f9dd1c10",
+      "review_ref": "holdout04-scope-review-conversation-r1",
+      "target_sentence_id": "holdout-04-s03"
+    }
+  ],
+  "version": "paperlens-reviewed-scope-v1"
+}
