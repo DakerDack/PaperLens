@@ -1,0 +1,13 @@
+{
+  "date": "2026-09-10T08:28:23.719Z",
+  "viewport": "390x844",
+  "real_backend": true,
+  "mode": "mock",
+  "pdf_ink": true,
+  "revision": true,
+  "reaudit": true,
+  "restore": true,
+  "export": true,
+  "horizontal_overflow": false,
+  "complete": true
+}

@@ -824,6 +824,8 @@ test("preset 1: upload and generate a five-section workbench at 1440x900", async
 
   await page.getByRole("button", { name: "运行完整审计" }).click();
   await expect(page.getByText("完整审计完成", { exact: true })).toBeVisible();
+  await expect(page.getByText("快速检查完成", { exact: true })).toBeVisible();
+  await expect(page.getByText("尚未完成", { exact: true })).toHaveCount(0);
   const dimensionRegion = page.getByRole("region", { name: "八维审计结果" });
   const riskRegion = page.getByRole("region", { name: "结构化风险状态" });
   for (const label of dimensionLabels) {

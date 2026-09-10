@@ -1,0 +1,23 @@
+{
+  "files": [
+    {
+      "file": "stage7_results_auditv8_scope_r1.jsonl",
+      "sha256": "0e0ed06263cba254fb81d6b13aa4c4158821833caa2236e674b00ee24f37fe30",
+      "configured_key_or_token_match": false,
+      "bytes": 216571
+    },
+    {
+      "file": "stage7_report_auditv8_scope_r1.md",
+      "sha256": "9c1c0c16dc7a144ebb6299c5e1cef73490295930d5d401f2cf7d2db97b4dc8d2",
+      "configured_key_or_token_match": false,
+      "bytes": 25259
+    },
+    {
+      "file": "stage7_acceptance_auditv8_scope_r1.json",
+      "sha256": "fd8056fc93aaa9e08a64df72eff43a5243c210ece2a11afaff1c5646bd844232",
+      "configured_key_or_token_match": false,
+      "bytes": 5643
+    }
+  ],
+  "scope": "Existing Stage 7 raw aggregate, report and acceptance; no new provider call or text copied."
+}

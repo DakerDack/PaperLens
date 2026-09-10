@@ -249,10 +249,10 @@ export function SidePanel({
 
       <section className="side-section" aria-labelledby="quick-heading">
         <h3 id="quick-heading">快速检查</h3>
-        {quickReport?.audit_status === "quick_complete" ? (
+        {quickReport?.audit_status === "quick_complete" || deepReport?.audit_status === "deep_complete" ? (
           <div className="status-line status-line--success">
             <strong>快速检查完成</strong>
-            <span>等待完整审计，当前仅显示规则结果</span>
+            <span>{deepReport?.audit_status === "deep_complete" ? "当前显示完整审计结果" : "等待完整审计，当前仅显示规则结果"}</span>
           </div>
         ) : (
           <div className="status-line">

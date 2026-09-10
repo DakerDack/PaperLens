@@ -429,7 +429,7 @@ class Hy3Service:
             )
             if self.settings.paperlens_model_mode == "mock":
                 result = self._validate_deep_audit_result(
-                    self._load_mock_deep_audit_response(),
+                    self._mock_fixture_audit_response(document, claim_evidence_pairs, source_blocks),
                     expected_pairs,
                     document,
                 )
@@ -1751,6 +1751,59 @@ class Hy3Service:
                 "The configured Mock deep-audit response could not be read.",
                 retryable=False,
             ) from exc
+
+    def _mock_fixture_audit_response(
+        self, document: ContentDraft, pairs: list[SemanticPair],
+        source_blocks: list[SourceBlock] | None,
+    ) -> str:
+        raw = self._load_mock_deep_audit_response()
+        if not source_blocks:
+            return raw
+        # Only the repository's synthetic pages may reuse these preset judgments.
+        fixture_blocks = json.loads(
+            (MOCK_GENERATION_FIXTURE.parent / "source_blocks.json").read_text(encoding="utf-8")
+        )
+        def page_texts(blocks):
+            pages = {}
+            for block in blocks:
+                pages.setdefault(block["page_index"], []).append(block["text"])
+            return {page: " ".join(" ".join(parts).split()) for page, parts in pages.items()}
+        if page_texts([block.model_dump() for block in source_blocks]) != page_texts(fixture_blocks):
+            return raw
+        baseline = GeneratedBundle.model_validate_json(self._load_mock_response())
+        reference_pairs = {
+            (claim.claim_id, block_id)
+            for claim in baseline.claims for block_id in claim.candidate_block_ids
+        }
+        # Validate the unmodified fixture first; malformed/mismatched fixtures still fail.
+        result = self._validate_deep_audit_result(raw, reference_pairs, baseline.document)
+        original_sentences = {
+            sentence.sentence_id: sentence.text
+            for section in baseline.document.sections for sentence in section.sentences
+        }
+        current_sentences = {
+            sentence.sentence_id: sentence.text
+            for section in document.sections for sentence in section.sentences
+        }
+        if document.title != baseline.document.title or current_sentences.keys() != original_sentences.keys() or any(
+            text not in {original_sentences[sid], original_sentences[sid] + "!",
+                original_sentences[sid] + "（Mock 修订预览）",
+                original_sentences[sid].rstrip("。.!！?？") + "（Mock 修订预览：已按确认意图更新表述）。"}
+            for sid, text in current_sentences.items()
+        ):
+            raise Hy3ServiceError("AUDIT_INCOMPLETE", "Mock audit only supports the synthetic fixture and its preset revisions.", retryable=False)
+        templates = {item.claim_id: item for item in result.semantic_judgments}
+        by_sentence = {claim.sentence_id: templates[claim.claim_id] for claim in baseline.claims if claim.claim_id in templates}
+        judgments = []
+        for claim, evidence in pairs:
+            if claim.sentence_id not in by_sentence or claim.text not in {
+                original_sentences[claim.sentence_id], current_sentences[claim.sentence_id]
+            }:
+                raise Hy3ServiceError("AUDIT_INCOMPLETE", "Mock audit claim is outside the synthetic fixture.", retryable=False)
+            judgments.append(by_sentence[claim.sentence_id].model_copy(update={
+                "claim_id": claim.claim_id, "block_id": evidence.block_id,
+            }))
+        return result.model_copy(update={"semantic_judgments": judgments}).model_dump_json()
 
     @staticmethod
     def validate_claim_policy(

@@ -1,0 +1,50 @@
+{
+  "mode": "mock_model_real_local_api",
+  "real_hy3": false,
+  "real_backend": true,
+  "parser": "pdfplumber",
+  "complete": true,
+  "duration_seconds": 6.239,
+  "steps": [
+    {
+      "step": "1 / 上传有权使用的合成 PDF，实际运行 pdfplumber 文本解析",
+      "elapsed_seconds": 0.213
+    },
+    {
+      "step": "2 / 联合生成五区解读，自动快速检查",
+      "elapsed_seconds": 1.529
+    },
+    {
+      "step": "3 / 完整审计：展示预置八维结果，不代表模型效果",
+      "elapsed_seconds": 1.989
+    },
+    {
+      "step": "4 / 点击句子，回到第 2 页并核对摘录",
+      "elapsed_seconds": 2.459
+    },
+    {
+      "step": "5 / 提出句子修改，预览前后差异；当前版本尚未改变",
+      "elapsed_seconds": 3.051
+    },
+    {
+      "step": "6 / 明确接受后才生成新版本，并自动快速复核",
+      "elapsed_seconds": 4.18
+    },
+    {
+      "step": "7 / 对新版本重新运行完整审计",
+      "elapsed_seconds": 4.639
+    },
+    {
+      "step": "8 / 查看历史，回退到版本 1；保留全部历史",
+      "elapsed_seconds": 5.108
+    },
+    {
+      "step": "9 / 导出当前 Markdown，保留来源与 AI 模式说明",
+      "elapsed_seconds": 5.566
+    },
+    {
+      "step": "演示结束 · 本地闭环完成；Mock 模型结果不证明实时 Hy3 效果",
+      "elapsed_seconds": 6.113
+    }
+  ]
+}

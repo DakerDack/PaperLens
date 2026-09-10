@@ -1677,8 +1677,10 @@ def test_mock_deep_audit_returns_valid_deep_audit_result() -> None:
     }
 
 
+@pytest.mark.parametrize("with_sources", [False, True])
 def test_mock_deep_audit_rejects_semantic_pair_mismatch(
     monkeypatch: pytest.MonkeyPatch,
+    with_sources: bool,
 ) -> None:
     service = Hy3Service(settings=mock_settings())
     invalid = json.loads(valid_deep_audit_json())
@@ -1693,6 +1695,9 @@ def test_mock_deep_audit_rejects_semantic_pair_mismatch(
         service.deep_audit(
             document=generated_bundle().document,
             claim_evidence_pairs=verified_claim_evidence_pairs(),
+            source_blocks=TypeAdapter(list[SourceBlock]).validate_json(
+                (FIXTURES / "source_blocks.json").read_text(encoding="utf-8")
+            ) if with_sources else None,
         )
 
     assert exc_info.value.error_code == "AUDIT_INCOMPLETE"
@@ -1700,8 +1705,10 @@ def test_mock_deep_audit_rejects_semantic_pair_mismatch(
     assert "p99-b999" not in (exc_info.value.field_error_summary or "")
 
 
+@pytest.mark.parametrize("with_sources", [False, True])
 def test_mock_deep_audit_uses_same_v2_schema_validation_chain(
     monkeypatch: pytest.MonkeyPatch,
+    with_sources: bool,
 ) -> None:
     service = Hy3Service(settings=mock_settings())
     invalid = json.loads(valid_deep_audit_json())
@@ -1716,6 +1723,9 @@ def test_mock_deep_audit_uses_same_v2_schema_validation_chain(
         service.deep_audit(
             document=generated_bundle().document,
             claim_evidence_pairs=verified_claim_evidence_pairs(),
+            source_blocks=TypeAdapter(list[SourceBlock]).validate_json(
+                (FIXTURES / "source_blocks.json").read_text(encoding="utf-8")
+            ) if with_sources else None,
         )
 
     assert exc_info.value.error_code == "SCHEMA_INVALID"

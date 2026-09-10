@@ -36,6 +36,47 @@ from backend.app.settings import Settings
 
 FIXTURES = Path(__file__).parent / "fixtures"
 VALID_PDF = b"%PDF-1.4\nPaperLens bounded upload fixture\n%%EOF"
+
+
+@pytest.mark.parametrize("scope", ["sentence", "document"])
+def test_release_mock_pdfplumber_closes_revision_audit_loop(tmp_path, monkeypatch, scope):
+    settings = Settings(_env_file=None, paperlens_model_mode="mock",
+        paperlens_data_dir=tmp_path / "data", mineru_command="missing-release-mineru")
+    service = Hy3Service(settings=settings)
+    monkeypatch.setattr(service, "_get_client", lambda: pytest.fail("Mock must not call a provider"))
+    app = create_app(settings_override=settings, hy3_service=service)
+    with TestClient(app) as client:
+        uploaded = client.post("/api/projects", data={"rights_confirmed": "true"},
+            files={"file": ("simple_2page.pdf", (FIXTURES / "simple_2page.pdf").read_bytes(), "application/pdf")})
+        assert uploaded.status_code == 201
+        url = f"/api/projects/{uploaded.json()['project_id']}"
+        generated = client.post(url + "/generate", json={"claim_policy": "required"})
+        assert generated.status_code == 200
+        assert generated.json()["model_mode"] == "mock"
+        audited = client.post(url + "/audit", json=VALID_AUDIT_REQUEST)
+        assert audited.status_code == 200, audited.json().get("error_code")
+        before = client.get(url).json()
+        assert before["audit_report"]["audit_status"] == "deep_complete"
+        preview = client.post(url + "/revisions", json={
+            "base_version_id": before["current_version_id"], "scope": scope,
+            "target_sentence_id": "s-003" if scope == "sentence" else None,
+            "user_instruction": "只追加安全标点" if scope == "sentence" else "简化全文表述",
+        })
+        assert preview.status_code == 200, preview.json().get("error_code")
+        assert client.get(url).json()["current_version_id"] == before["current_version_id"]
+        accepted = client.post(url + f"/revisions/{preview.json()['patch_id']}/accept")
+        assert accepted.status_code == 200, accepted.json().get("error_code")
+        reviewed = client.post(url + "/audit", json=VALID_AUDIT_REQUEST)
+        assert reviewed.status_code == 200, reviewed.json().get("error_code")
+        assert reviewed.json()["audit_report"]["audit_status"] == "deep_complete"
+        restored = client.post(url + f"/versions/{before['current_version_id']}/restore",
+            headers={"Idempotency-Key": "77777777-7777-4777-8777-777777777777"})
+        assert restored.status_code == 200
+        assert client.get(url).json()["document"] == before["document"]
+        exported = client.get(url + "/export")
+        assert exported.status_code == 200
+        assert "mock" in exported.text
+
 VALID_AUDIT_REQUEST = {
     "source_disclosure_status": "present",
     "ai_assistance_disclosure_status": "present",

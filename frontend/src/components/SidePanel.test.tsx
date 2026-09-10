@@ -104,6 +104,26 @@ afterEach(cleanup);
 
 
 describe("SidePanel", () => {
+  it("keeps quick-check completion visible when the current snapshot is deep-complete", () => {
+    render(
+      <SidePanel
+        selectedSentenceId={null}
+        selectedEvidence={null}
+        evidenceInsufficient={false}
+        quickReport={null}
+        deepReport={deepReport}
+        auditState="complete"
+        auditError={null}
+        versions={versions}
+        canAudit={false}
+        onRunAudit={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("快速检查完成")).toBeTruthy();
+    expect(screen.queryByText("尚未完成")).toBeNull();
+    expect(screen.getByText("当前显示完整审计结果")).toBeTruthy();
+  });
+
   it("shows empty evidence and quick-check status without a final score", () => {
     render(
       <SidePanel
