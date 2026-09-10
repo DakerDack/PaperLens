@@ -10,6 +10,7 @@ from typing import Iterator, Literal
 from uuid import uuid4
 
 from pydantic import TypeAdapter, ValidationError
+from backend.app.prompts import REVISION_PROMPT_VERSION
 
 from backend.app.models import (
     AtomicClaim,
@@ -851,7 +852,7 @@ class ProjectStore:
             or validated_metadata.retryable
             or validated_metadata.retryable_stage is not None
             or not validated_metadata.model
-            or validated_metadata.prompt_version != "revision-v2"
+            or validated_metadata.prompt_version != REVISION_PROMPT_VERSION
             or validated_metadata.schema_version != "edit-patch-v1"
         ):
             raise StoreError(

@@ -350,6 +350,10 @@ def _summarize_sample_scale(records: list[dict[str, Any]]) -> dict[str, Any]:
                 else record["case_id"].rsplit(":", 1)[0]
             )
         elif group == "attack":
+            attack_match = re.fullmatch(r"attack:([^:]+):(attack|clean)", record["case_id"])
+            if attack_match:
+                ids[group].add(attack_match.group(1))
+                continue
             ids[group].add(
                 metrics.get("attack_id")
                 if isinstance(metrics, dict) and isinstance(metrics.get("attack_id"), str)
@@ -1200,10 +1204,12 @@ def _expression_method_coverage(records: list[dict[str, Any]], freeze: dict[str,
             groups[group].append(record)
     valid = lambda r: (validate_expression_metrics(r)
                        and r.get("schema_version") == "deep-audit-result-v3"
-                       and r.get("prompt_version") == "audit-v7")
+                       and r.get("prompt_version") == "audit-v8")
     return {
         "status": ("present" if relevant and all(valid(r) for r in relevant) else "partial") if current else "not_available",
-        "evaluation_method_version": EVALUATION_METHOD_VERSION if current else None,
+        "evaluation_method_version": (next(iter(methods)) if len(methods := {
+            r.get("metrics", {}).get("evaluation_method_version") for r in relevant
+        }) == 1 else None) if current else None,
         "required": required,
         "complete_groups": {name: bool(rows) and all(valid(r) for r in rows) for name, rows in groups.items()},
         "rows": [

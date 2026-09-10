@@ -25,6 +25,7 @@ from backend.app.models import (
     UsageSnapshot,
 )
 from backend.app.project_store import ProjectStore, StoreError
+from backend.app.prompts import REVISION_PROMPT_VERSION
 from backend.app.settings import Settings
 
 
@@ -111,7 +112,7 @@ def revision_metadata(*, model: str = "hy3") -> RunMetadata:
         retryable=False,
         retryable_stage=None,
         model=model,
-        prompt_version="revision-v2",
+        prompt_version=REVISION_PROMPT_VERSION,
         schema_version="edit-patch-v1",
     )
 
@@ -122,6 +123,48 @@ def revision_usage() -> UsageSnapshot:
         completion_tokens=7,
         total_tokens=18,
     )
+
+
+@pytest.mark.parametrize("version", ["current", "revision-v2", "revision-v999"])
+def test_scope_context_contract_persistence_current_version_only(tmp_path, version):
+    store = parsed_store(tmp_path)
+    version_id, bundle, _, _ = save_generated_and_quick_checked(store, tmp_path)
+    patch = sentence_patch(bundle, patch_id="scope-version-preview")
+    selected = REVISION_PROMPT_VERSION if version == "current" else version
+    metadata = revision_metadata().model_copy(update={"prompt_version": selected})
+    before = store.row_counts()
+    def save():
+        return store.save_patch_preview(project_id="project-001", base_version_id=version_id,
+            patch=patch, mode="mock", metadata=metadata, usage=revision_usage(),
+            started_at=NOW, ended_at=NOW, created_at=NOW)
+    if version == "current":
+        assert save() == patch
+        run = operation_runs(store, "revision")[0]
+        assert run["metadata"]["prompt_version"] == REVISION_PROMPT_VERSION
+        assert run["usage"] == revision_usage().model_dump(mode="json")
+    else:
+        with pytest.raises(StoreError) as caught:
+            save()
+        assert caught.value.error_code == "SCHEMA_INVALID"
+        assert store.row_counts() == before
+
+
+def test_scope_context_contract_persistence_legacy_read_without_rewrite(tmp_path, monkeypatch):
+    import backend.app.project_store as module
+    store = parsed_store(tmp_path)
+    version_id, bundle, _, _ = save_generated_and_quick_checked(store, tmp_path)
+    patch = sentence_patch(bundle, patch_id="legacy-scope-preview")
+    # Produce an isolated historical record under the historical write contract.
+    with monkeypatch.context() as legacy:
+        legacy.setattr(module, "REVISION_PROMPT_VERSION", "revision-v2", raising=False)
+        store.save_patch_preview(project_id="project-001", base_version_id=version_id,
+            patch=patch, mode="mock", metadata=revision_metadata().model_copy(update={"prompt_version": "revision-v2"}),
+            usage=revision_usage(), started_at=NOW, ended_at=NOW, created_at=NOW)
+    before = store.database_path.read_bytes()
+    view = ProjectStore(store.data_dir).get_project_view("project-001", model_mode="mock")
+    assert view.pending_patch == patch
+    assert operation_runs(store, "revision")[0]["metadata"]["prompt_version"] == "revision-v2"
+    assert store.database_path.read_bytes() == before
 
 
 def operation_runs(

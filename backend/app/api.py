@@ -542,6 +542,7 @@ def audit_project(
             bundle,
             evidence.evidence_records,
             compliance_context,
+            source_blocks=store.get_parse_snapshot(project_id).blocks,
         )
     except (Hy3ServiceError, AuditServiceError, ValidationError) as error:
         audit_ended = datetime.now(timezone.utc)
@@ -652,6 +653,7 @@ def create_revision_preview(
                 current_text=current_text,
                 evidence_records=evidence,
                 user_instruction=revision_request.user_instruction,
+                source_blocks=store.get_parse_snapshot(project_id).blocks,
             )
         else:
             base_version, document = store.get_document_revision_inputs(
@@ -666,6 +668,9 @@ def create_revision_preview(
                 base_version=base_version,
                 document=document,
                 user_instruction=revision_request.user_instruction,
+                source_blocks=store.get_parse_snapshot(project_id).blocks,
+                evidence_records=[record for record in store.get_deep_audit_inputs(project_id)[1].evidence_records
+                                  if record.quote_verified],
             )
     except Hy3ServiceError as error:
         revision_ended = datetime.now(timezone.utc)
@@ -756,6 +761,7 @@ def accept_revision_patch(
                     accepted_after_text=patch.after_text,
                     original_claims=original_claims,
                     evidence_records=related_evidence,
+                    source_blocks=source_blocks,
                     allowed_block_ids=allowed_block_ids,
                     reserved_claim_ids=reserved_claim_ids,
                     user_instruction=(

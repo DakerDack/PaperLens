@@ -29,7 +29,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from backend.app.audit_service import AuditService, AuditServiceError
-from backend.app.hy3_service import Hy3Service, Hy3ServiceError
+from backend.app.hy3_service import Hy3Service, Hy3ServiceError, PreparedScopeContext
 from backend.app import hy3_service as hy3_contract
 from backend.app.models import (
     CORE_DIMENSION_GATES,
@@ -56,7 +56,7 @@ from backend.app.prompts import (
 
 SUPPORTED_MODES = ("smoke", "calibrate", "final", "stability")
 RESULT_VERSION = "paperlens-eval-result-v1"
-EVALUATION_METHOD_VERSION = "paperlens-stage7-method-v2"
+EVALUATION_METHOD_VERSION = "paperlens-stage7-method-v3"
 REVISION_DIAGNOSTIC_VERSION = "paperlens-revision-diagnostic-v1"
 REVISION_DIAGNOSTIC_BASELINE = "bb317e6a912b2b4e72848704dacb51ede36bf49e"
 REVISION_DIAGNOSTIC_CASE_IDS = tuple(f"revision:holdout-{i:02d}:bad" for i in (1, 3, 4))
@@ -355,6 +355,7 @@ def load_mode_cases(mode: str) -> list[EvaluationCase]:
 
 def build_mode_plan(
     *, mode: str, output_path: Path, diagnostic_plan: dict[str, Any] | None = None,
+    reviewed_scope_sha256: str | None = None,
 ) -> ModePlan:
     if mode == "smoke":
         raise ValueError("smoke is a zero-cost reference replay and needs no Live plan")
@@ -371,6 +372,7 @@ def build_mode_plan(
         mode=mode,
     )
     _validate_context_resume(output_path, mode, diagnostic_plan)
+    _validate_scope_context_resume(output_path, reviewed_scope_sha256)
     resume_keys = completed_keys | pending_keys
     if not resume_keys <= planned_keys:
         raise ValueError("resume data contains keys outside the frozen mode plan")
@@ -429,6 +431,117 @@ def _sha256_json(value: Any) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")).hexdigest()
+
+
+def _load_reviewed_scope_manifest(
+    path: Path | None, expected_sha256: str | None,
+) -> tuple[dict[str, PreparedScopeContext], str | None]:
+    """Bind a user-approved file to current material, not certify its research judgment.
+
+    The independent CLI digest authenticates the approved bytes; review_ref points
+    to the external human review. Neither a digest nor a self-declared label proves
+    study identity. No review metadata or path is sent to the provider.
+    """
+    if path is None and expected_sha256 is None:
+        return {}, None
+    if path is None or not isinstance(expected_sha256, str) or not _CONTEXT_HASH.fullmatch(expected_sha256):
+        raise ValueError("EVALUATION_FAILED")
+    try:
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != expected_sha256:
+            raise ValueError("CONFIG_DRIFT")
+        # Reject duplicate JSON members rather than silently accepting last wins.
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("EVALUATION_FAILED")
+                result[key] = value
+            return result
+        manifest = json.loads(raw, object_pairs_hook=unique_object)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError("EVALUATION_FAILED") from None
+    if (not isinstance(manifest, dict) or set(manifest) != {"version", "entries"}
+        or manifest["version"] != "paperlens-reviewed-scope-v1"
+        or not isinstance(manifest["entries"], list) or not manifest["entries"]):
+        raise ValueError("EVALUATION_FAILED")
+    # Validate EVERY declared association before any batch can call the model.
+    # A single approved file may cover multiple existing modes; nothing is inferred
+    # for cases omitted from it, including other variants of the same paper.
+    available = {c.case_id: c for mode in ("calibrate", "final", "stability") for c in load_mode_cases(mode)}
+    contexts, normalized = {}, []
+    for entry in manifest["entries"]:
+        if (not isinstance(entry, dict) or set(entry) != {
+            "case_id", "target_sentence_id", "material_sha256", "review_ref", "links",
+        } or any(not isinstance(entry[k], str) or not _CONTEXT_IDENTIFIER.fullmatch(entry[k])
+                 for k in ("case_id", "target_sentence_id", "review_ref"))
+            or not isinstance(entry["material_sha256"], str)
+            or not _CONTEXT_HASH.fullmatch(entry["material_sha256"])
+            or entry["case_id"] not in available or entry["case_id"] in contexts
+            or not isinstance(entry["links"], list) or not entry["links"]):
+            raise ValueError("EVALUATION_FAILED")
+        case = available[entry["case_id"]]
+        sources, bundle = materialize_live_case(case)
+        if entry["material_sha256"] != _sha256_json({
+            "sources": [b.model_dump(mode="json") for b in sources],
+            "bundle": bundle.model_dump(mode="json"),
+        }):
+            raise ValueError("CONFIG_DRIFT")
+        target = entry["target_sentence_id"]
+        if case.payload.get("case_group") == "revision":
+            paper = next(p for p in _load_live_manifest()["papers"] if p["paper_id"] == case.payload["paper_id"])
+            if target != paper["quality_mutations"]["bad"]["target_sentence_id"]:
+                raise ValueError("EVALUATION_FAILED")
+        target_ids = {c.claim_id for c in bundle.claims if c.sentence_id == target}
+        if not target_ids:
+            raise ValueError("EVALUATION_FAILED")
+        evidence, _ = AuditService().quick_check(bundle, sources)
+        evidence = [r for r in evidence if r.claim_id in target_ids]
+        allowed = {r.block_id for r in evidence if r.quote_verified}
+        blocks = {b.block_id: b for b in sources}
+        if len(blocks) != len(sources):
+            raise ValueError("EVALUATION_FAILED")
+        links, seen = [], set()
+        for link in entry["links"]:
+            if not isinstance(link, dict) or set(link) != {"source", "result"}:
+                raise ValueError("EVALUATION_FAILED")
+            for ref in link.values():
+                if (not isinstance(ref, dict) or set(ref) != {
+                    "block_id", "page_index", "reading_order", "start", "end", "sha256",
+                } or not isinstance(ref["block_id"], str) or ref["block_id"] not in blocks
+                    or any(type(ref[k]) is not int for k in ("page_index", "reading_order", "start", "end"))):
+                    raise ValueError("EVALUATION_FAILED")
+                block = blocks[ref["block_id"]]
+                if ref != {"block_id": block.block_id, "page_index": block.page_index,
+                    "reading_order": block.reading_order, "start": 0, "end": len(block.text),
+                    "sha256": hashlib.sha256(block.text.encode("utf-8")).hexdigest()}:
+                    raise ValueError("CONFIG_DRIFT")
+            key = (link["source"]["block_id"], link["result"]["block_id"])
+            if key in seen or key[0] == key[1] or key[1] not in allowed:
+                raise ValueError("EVALUATION_FAILED")
+            seen.add(key)
+            links.append({"review_source": "manual_review", **link})
+        context = PreparedScopeContext.prepare(sources, evidence, links)
+        expected_links = set(seen)
+        actual_links = {(c["block_id"], result) for c in context.payload() for result in c["applies_to_block_ids"]}
+        if not actual_links or actual_links != expected_links:
+            # Includes budget rejection: never silently degrade an explicit input.
+            raise ValueError("EVALUATION_FAILED")
+        contexts[case.case_id] = context
+        normalized.append({**entry, "links": sorted(entry["links"], key=_sha256_json)})
+    fingerprint = _sha256_json({"version": manifest["version"],
+                               "entries": sorted(normalized, key=lambda e: e["case_id"])})
+    return contexts, fingerprint
+
+
+def _validate_scope_context_resume(output_path: Path, fingerprint: str | None) -> None:
+    for path, pending in ((output_path, False), (pending_path_for(output_path), True)):
+        for _, record in _read_jsonl(path) if path.exists() else []:
+            container = record if pending else record["metrics"]
+            saved = container.get("reviewed_scope_sha256")
+            if (saved != fingerprint or ("reviewed_scope_sha256" in container and
+                (not isinstance(saved, str) or not _CONTEXT_HASH.fullmatch(saved)))):
+                raise ValueError("CONFIG_DRIFT")
 
 
 def _invalid_context_diagnostic() -> None:
@@ -493,7 +606,7 @@ def _context_configuration_sha256(service: Any) -> str:
     })
 
 
-def _context_input_hashes(service: Any, document: Any, pairs: list[Any], claim_id: str, block_id: str) -> tuple[str, str]:
+def _context_input_hashes(service: Any, document: Any, pairs: list[Any], claim_id: str, block_id: str, source_blocks=None, scope_context=None) -> tuple[str, str]:
     selected = [(c, e) for c, e in pairs if c.claim_id == claim_id and e.block_id == block_id and e.quote_verified]
     if len(selected) != 1:
         _invalid_context_diagnostic()
@@ -504,7 +617,7 @@ def _context_input_hashes(service: Any, document: Any, pairs: list[Any], claim_i
         "model": service.settings.hy3_model,
         "messages": [
             {"role": "system", "content": hy3_contract.DEEP_AUDIT_SYSTEM_PROMPT},
-            {"role": "user", "content": hy3_contract.Hy3Service._build_deep_audit_prompt(document, pairs)},
+            {"role": "user", "content": hy3_contract.Hy3Service._build_deep_audit_prompt(document, pairs, source_blocks, scope_context)},
         ],
         "response_format": hy3_contract.Hy3Service._deep_audit_response_format(),
         "stream": False, "temperature": hy3_contract.DEEP_AUDIT_TEMPERATURE,
@@ -517,6 +630,7 @@ def _context_input_hashes(service: Any, document: Any, pairs: list[Any], claim_i
 def build_context_diagnostic_plan(
     *, case_ids: list[str], target_claim_id: str, target_block_id: str,
     diagnostic_id: str, repetitions: int, hy3_service: Any, versions: VersionInfo,
+    scope_contexts: Mapping[str, PreparedScopeContext] | None = None,
 ) -> dict[str, Any]:
     if (
         not isinstance(case_ids, list)
@@ -542,7 +656,7 @@ def build_context_diagnostic_plan(
         records, _ = audit.quick_check(bundle, sources)
         pair_hash, request_hash = _context_input_hashes(
             hy3_service, bundle.document, audit.semantic_pairs(bundle, records),
-            target_claim_id, target_block_id,
+            target_claim_id, target_block_id, sources, (scope_contexts or {}).get(case.case_id),
         )
         pair_hashes.add(pair_hash)
         contexts.append({"case_id": case.case_id, "request_sha256": request_hash})
@@ -573,6 +687,10 @@ def validate_context_diagnostic_record(record: Mapping[str, Any], *, pending: bo
         {"case_id", "run_index", "mode", "context_diagnostic"}
         if pending else set(_REQUIRED_RESULT_FIELDS)
     )
+    if pending and "reviewed_scope_sha256" in record:
+        expected_fields.add("reviewed_scope_sha256")
+        if not isinstance(record["reviewed_scope_sha256"], str) or not _CONTEXT_HASH.fullmatch(record["reviewed_scope_sha256"]):
+            _invalid_context_diagnostic()
     if set(record) != expected_fields:
         _invalid_context_diagnostic()
     container = record if pending else record.get("metrics")
@@ -689,10 +807,12 @@ class _ContextDiagnosticService:
     def last_run_observation(self):
         return self.service.last_run_observation
 
-    def deep_audit(self, *, document, claim_evidence_pairs):
+    def deep_audit(self, *, document, claim_evidence_pairs, source_blocks=None, scope_context=None):
         pair_hash, request_hash = _context_input_hashes(
             self.service, document, claim_evidence_pairs,
             self.plan["target_claim_id"], self.plan["target_block_id"],
+            source_blocks,
+            scope_context,
         )
         metadata = _context_diagnostic_metadata(self.plan, self.case)
         if pair_hash != self.plan["pair_sha256"] or request_hash != metadata["request_sha256"] or _context_configuration_sha256(self.service) != self.plan["configuration_sha256"]:
@@ -706,7 +826,8 @@ class _ContextDiagnosticService:
                 self.service._get_client, metadata["request_sha256"],
             )
             self.service._get_client = lambda: self._dispatch_client
-        return self.service.deep_audit(document=document, claim_evidence_pairs=claim_evidence_pairs)
+        return self.service.deep_audit(document=document, claim_evidence_pairs=claim_evidence_pairs,
+            source_blocks=source_blocks, scope_context=scope_context)
 
 
 def materialize_live_case(
@@ -1094,6 +1215,8 @@ def evaluate_live_case(
     hy3_service: Any | None = None,
     diagnostic_plan: dict[str, Any] | None = None,
     revision_diagnostic: RevisionDiagnostic | None = None,
+    scope_context: PreparedScopeContext | None = None,
+    reviewed_scope_links: list[dict[str, Any]] | None = None,
 ) -> dict[str, object]:
     service = hy3_service or Hy3Service()
     if diagnostic_plan is not None:
@@ -1109,6 +1232,23 @@ def evaluate_live_case(
         revision_diagnostic.check_authorization()
         revision_diagnostic.case_id = case.case_id
     source_blocks, bundle = materialize_live_case(case)
+    group = case.payload.get("case_group")
+    mutation: Mapping[str, Any] | None = None
+    target_sentence_id: str | None = None
+    if group == "revision":
+        paper_id = _required_string(case.payload, "paper_id")
+        manifest = _load_live_manifest()
+        paper = next(
+            paper for paper in manifest["papers"] if paper["paper_id"] == paper_id
+        )
+        mutation = paper["quality_mutations"]["bad"]
+        target_sentence_id = _required_string(mutation, "target_sentence_id")
+
+    # Prepare once from the original, verified target evidence.  The caller's
+    # explicit links are the only route to non-empty context; no adjacency or
+    # lexical inference is performed here.  The local quick check remains in
+    # the normal error boundary so its failures retain existing accounting.
+    initial_evidence_records: list[Any] = []
     compliance_context = ComplianceContext(
         rights_or_license_confirmed=True,
         source_disclosure_status="present",
@@ -1119,16 +1259,21 @@ def evaluate_live_case(
 
     def audited(
         candidate_bundle: GeneratedBundle,
+        evidence_override: list[Any] | None = None,
     ) -> tuple[list[Any], DeepAuditResult, Any]:
-        evidence_records, _ = audit_service.quick_check(
-            candidate_bundle,
-            source_blocks,
-        )
+        evidence_records = evidence_override
+        if evidence_records is None:
+            evidence_records, _ = audit_service.quick_check(
+                candidate_bundle,
+                source_blocks,
+            )
         operation = lambda: _call_and_capture(
             lambda: audit_service.run_deep_audit(
                 candidate_bundle,
                 evidence_records,
                 compliance_context,
+                source_blocks=source_blocks,
+                scope_context=scope_context,
             ),
             service=service,
             observations=observations,
@@ -1146,9 +1291,28 @@ def evaluate_live_case(
         return evidence_records, result, report
 
     try:
-        group = case.payload.get("case_group")
+        initial_evidence_records, _ = audit_service.quick_check(bundle, source_blocks)
+        context_evidence = initial_evidence_records
+        if target_sentence_id is not None:
+            target_claim_ids = {
+                claim.claim_id
+                for claim in bundle.claims
+                if claim.sentence_id == target_sentence_id
+            }
+            context_evidence = [
+                record for record in initial_evidence_records
+                if record.claim_id in target_claim_ids
+            ]
+        if scope_context is not None and reviewed_scope_links is not None:
+            raise ValueError("scope context supplied twice")
+        if scope_context is None:
+            scope_context = PreparedScopeContext.prepare(
+                source_blocks,
+                context_evidence,
+                reviewed_scope_links,
+            )
         if group != "revision":
-            evidence_records, deep_result, report = audited(bundle)
+            evidence_records, deep_result, report = audited(bundle, initial_evidence_records)
             metrics = _live_report_metrics(
                 case=case,
                 bundle=bundle,
@@ -1164,13 +1328,6 @@ def evaluate_live_case(
                 metrics=metrics,
             )
 
-        paper_id = _required_string(case.payload, "paper_id")
-        manifest = _load_live_manifest()
-        paper = next(
-            paper for paper in manifest["papers"] if paper["paper_id"] == paper_id
-        )
-        mutation = paper["quality_mutations"]["bad"]
-        target_sentence_id = _required_string(mutation, "target_sentence_id")
         if revision_diagnostic is not None:
             revision_diagnostic.data["conditions"] = {"original_target_exists": False, "original_target_matches": False}
             try:
@@ -1179,7 +1336,7 @@ def evaluate_live_case(
                 raise _RevisionDiagnosticFailure() from None
             revision_diagnostic.data["conditions"].update(original_target_exists=True,
                 original_target_matches=original_target.text == mutation["replacement_text"])
-        evidence_records, before_result, before_report = audited(bundle)
+        evidence_records, before_result, before_report = audited(bundle, initial_evidence_records)
         target_sentence = _find_sentence(bundle, target_sentence_id)
         target_claims = [
             claim for claim in bundle.claims if claim.sentence_id == target_sentence_id
@@ -1197,6 +1354,8 @@ def evaluate_live_case(
                 sentence_id=target_sentence_id,
                 current_text=target_sentence.text,
                 evidence_records=target_evidence,
+                source_blocks=source_blocks,
+                scope_context=scope_context,
                 user_instruction=(
                     "修复已发现的问题，保持有证据支持的事实、范围和限制；"
                     "只修改目标句。"
@@ -1221,6 +1380,8 @@ def evaluate_live_case(
                 accepted_after_text=patch.after_text,
                 original_claims=target_claims,
                 evidence_records=target_evidence,
+                source_blocks=source_blocks,
+                scope_context=scope_context,
                 allowed_block_ids={block.block_id for block in source_blocks},
                 reserved_claim_ids={
                     claim.claim_id
@@ -1492,7 +1653,9 @@ def validate_expression_metrics(record: Mapping[str, Any]) -> bool:
             for code in codes
         ):
             raise invalid
-    if record.get("status") == "succeeded" and metrics.get("evaluation_method_version") != EVALUATION_METHOD_VERSION:
+    legacy_method = (record.get("prompt_version") == "audit-v7"
+                     and metrics.get("evaluation_method_version") == "paperlens-stage7-method-v2")
+    if record.get("status") == "succeeded" and metrics.get("evaluation_method_version") != EVALUATION_METHOD_VERSION and not legacy_method:
         raise invalid
     if "expression_findings" not in metrics:
         if record.get("status") == "succeeded":
@@ -2202,6 +2365,7 @@ def run_cases(
     versions: VersionInfo,
     evaluate: Callable[[EvaluationCase], Mapping[str, Any]],
     diagnostic_plan: dict[str, Any] | None = None,
+    reviewed_scope_sha256: str | None = None,
 ) -> RunSummary:
     with _evaluation_run_lock(output_path):
         return _run_cases_unlocked(
@@ -2211,6 +2375,7 @@ def run_cases(
             versions=versions,
             evaluate=evaluate,
             diagnostic_plan=diagnostic_plan,
+            reviewed_scope_sha256=reviewed_scope_sha256,
         )
 
 
@@ -2222,6 +2387,7 @@ def _run_cases_unlocked(
     versions: VersionInfo,
     evaluate: Callable[[EvaluationCase], Mapping[str, Any]],
     diagnostic_plan: dict[str, Any] | None = None,
+    reviewed_scope_sha256: str | None = None,
 ) -> RunSummary:
     if mode not in SUPPORTED_MODES:
         raise ValueError(f"unsupported evaluation mode: {mode}")
@@ -2242,6 +2408,7 @@ def _run_cases_unlocked(
         mode=mode,
     )
     _validate_context_resume(output_path, mode, diagnostic_plan)
+    _validate_scope_context_resume(output_path, reviewed_scope_sha256)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     skipped = 0
@@ -2253,6 +2420,8 @@ def _run_cases_unlocked(
             {"context_diagnostic": _context_diagnostic_metadata(diagnostic_plan, case)}
             if diagnostic_plan is not None else {}
         )
+        if reviewed_scope_sha256 is not None:
+            diagnostic_metrics["reviewed_scope_sha256"] = reviewed_scope_sha256
         if key in existing_keys:
             skipped += 1
             continue
@@ -2804,7 +2973,7 @@ def _code_version() -> str:
     return f"workspace-content-{digest.hexdigest()}"
 
 
-def _freeze_payload() -> dict[str, Any]:
+def _freeze_payload(*, reviewed_scope_sha256: str | None = None) -> dict[str, Any]:
     manifest_path = _PROJECT_ROOT / "eval" / "live_cases.json"
     manifest = _load_live_manifest()
     settings = Hy3Service().settings
@@ -2843,11 +3012,12 @@ def _freeze_payload() -> dict[str, Any]:
         "overall_score_threshold": 75,
         "acceptance_targets": copy.deepcopy(STAGE7_ACCEPTANCE_TARGETS),
         "code_version": _code_version(),
+        **({"reviewed_scope_sha256": reviewed_scope_sha256} if reviewed_scope_sha256 is not None else {}),
     }
 
 
-def freeze_configuration(*, output_path: Path = DEFAULT_FREEZE_PATH) -> dict[str, Any]:
-    payload = _freeze_payload()
+def freeze_configuration(*, output_path: Path = DEFAULT_FREEZE_PATH, reviewed_scope_sha256: str | None = None) -> dict[str, Any]:
+    payload = _freeze_payload(reviewed_scope_sha256=reviewed_scope_sha256)
     if output_path.exists():
         existing = json.loads(output_path.read_text(encoding="utf-8"))
         if not isinstance(existing, dict):
@@ -2868,13 +3038,13 @@ def freeze_configuration(*, output_path: Path = DEFAULT_FREEZE_PATH) -> dict[str
     return payload
 
 
-def _require_frozen_configuration() -> dict[str, Any]:
+def _require_frozen_configuration(*, reviewed_scope_sha256: str | None = None) -> dict[str, Any]:
     if not DEFAULT_FREEZE_PATH.exists():
         raise ValueError("CONFIG_NOT_FROZEN")
     existing = json.loads(DEFAULT_FREEZE_PATH.read_text(encoding="utf-8"))
     if not isinstance(existing, dict):
         raise ValueError("CONFIG_DRIFT")
-    expected = _freeze_payload()
+    expected = _freeze_payload(reviewed_scope_sha256=reviewed_scope_sha256)
     immutable_existing = {
         key: value for key, value in existing.items() if key != "created_at"
     }
@@ -3127,22 +3297,26 @@ def validate_revision_diagnostic_record(record: Mapping[str, Any]) -> dict[str, 
         raise ValueError("invalid revision diagnostic") from None
 
 
-def _revision_diagnostic_plan_id(versions: VersionInfo, diagnostic_id: str, authorization: Mapping | None, settings: Any) -> str:
+def _revision_diagnostic_plan_id(versions: VersionInfo, diagnostic_id: str, authorization: Mapping | None, settings: Any,
+                                 reviewed_scope_sha256: str | None = None) -> str:
     return _sha256_json({"versions": versions.__dict__, "diagnostic_id": _revision_diagnostic_id(diagnostic_id),
         "case_ids": REVISION_DIAGNOSTIC_CASE_IDS, "version": REVISION_DIAGNOSTIC_VERSION,
         "authorization": authorization, "manifest_sha256": _sha256_json(_load_live_manifest()),
+        **({"reviewed_scope_sha256": reviewed_scope_sha256} if reviewed_scope_sha256 is not None else {}),
         "provider_config": {"base_url_sha256": hashlib.sha256(settings.hy3_base_url.encode("utf-8")).hexdigest(),
                             "timeout_seconds": settings.hy3_timeout_seconds, "max_retries": settings.hy3_max_retries}})
 
 
 def run_revision_diagnostic(*, output_path: Path, versions: VersionInfo, diagnostic_id: str,
                             hy3_service: Any, confirm_cost: bool = False,
-                            authorization: Mapping | None = None, evidence_dir: Path | None = None) -> int:
+                            authorization: Mapping | None = None, evidence_dir: Path | None = None,
+                            scope_context_manifest: Path | None = None, scope_context_sha256: str | None = None) -> int:
+    contexts, scope_fingerprint = _load_reviewed_scope_manifest(scope_context_manifest, scope_context_sha256)
     if output_path.suffix != ".jsonl" or output_path.resolve() in {p.resolve() for p in DEFAULT_RESULT_PATHS.values()}:
         raise ValueError("invalid revision diagnostic")
     if type(hy3_service.settings.hy3_max_retries) is not int or not 0 <= hy3_service.settings.hy3_max_retries <= 2:
         raise ValueError("invalid revision diagnostic")
-    plan_id = _revision_diagnostic_plan_id(versions, diagnostic_id, authorization, hy3_service.settings)
+    plan_id = _revision_diagnostic_plan_id(versions, diagnostic_id, authorization, hy3_service.settings, scope_fingerprint)
     # Authorization/permissions checked even when all slots are already complete.
     RevisionDiagnostic(diagnostic_id, authorization=authorization, evidence_dir=evidence_dir)
     cases = revision_diagnostic_cases()
@@ -3286,7 +3460,8 @@ def run_revision_diagnostic(*, output_path: Path, versions: VersionInfo, diagnos
             diagnostic.checkpoint = checkpoint
             start = time.perf_counter()
             try:
-                value = evaluate_live_case(case, hy3_service=hy3_service, revision_diagnostic=diagnostic)
+                value = evaluate_live_case(case, hy3_service=hy3_service, revision_diagnostic=diagnostic,
+                                           **({"scope_context": contexts[case.case_id]} if case.case_id in contexts else {}))
                 status, code = "succeeded", "NONE"
                 if value["provider_calls"] is None:
                     status, code = "failed", "EVALUATION_FAILED"
@@ -3337,6 +3512,10 @@ def main() -> int:
     parser.add_argument("--revision-diagnostic", action="store_true")
     parser.add_argument("--evidence-authorization", type=Path)
     parser.add_argument("--evidence-dir", type=Path)
+    parser.add_argument("--scope-context-manifest", type=Path,
+                        help="external human-reviewed associations; no source text")
+    parser.add_argument("--scope-context-sha256",
+                        help="independently approved SHA256 of the supplied manifest bytes")
     parser.add_argument("--case-id", action="append")
     parser.add_argument("--target-claim-id")
     parser.add_argument("--target-block-id")
@@ -3355,12 +3534,21 @@ def main() -> int:
             versions = VersionInfo(model=service.settings.hy3_model, prompt_version=DEEP_AUDIT_PROMPT_VERSION,
                 schema_version=DEEP_AUDIT_SCHEMA_VERSION, data_version=_load_live_manifest()["data_version"], code_version=_code_version())
             return run_revision_diagnostic(output_path=args.output, versions=versions, diagnostic_id=args.diagnostic_id,
-                hy3_service=service, confirm_cost=args.confirm_cost, authorization=authorization, evidence_dir=args.evidence_dir)
+                hy3_service=service, confirm_cost=args.confirm_cost, authorization=authorization, evidence_dir=args.evidence_dir,
+                scope_context_manifest=args.scope_context_manifest, scope_context_sha256=args.scope_context_sha256)
         except (ValueError, OSError):
             print("EVAL_REFUSED=invalid revision diagnostic")
             return 2
     if args.evidence_authorization is not None or args.evidence_dir is not None:
         parser.error("invalid revision diagnostic")
+    try:
+        if args.mode == "smoke" and (args.scope_context_manifest is not None or args.scope_context_sha256 is not None):
+            raise ValueError("EVALUATION_FAILED")
+        scope_contexts, scope_fingerprint = _load_reviewed_scope_manifest(
+            args.scope_context_manifest, args.scope_context_sha256)
+    except ValueError as exc:
+        print("EVAL_REFUSED=" + ("CONFIG_DRIFT" if str(exc) == "CONFIG_DRIFT" else "EVALUATION_FAILED"))
+        return 2
     diagnostic_requested = any(value is not None for value in (
         args.diagnostic_id, args.case_id, args.target_claim_id,
         args.target_block_id, args.repeat_count,
@@ -3377,7 +3565,11 @@ def main() -> int:
     if args.freeze_config:
         if args.mode == "smoke":
             parser.error("--freeze-config is only valid for a Live mode")
-        frozen = freeze_configuration()
+        try:
+            frozen = freeze_configuration(output_path=DEFAULT_FREEZE_PATH, reviewed_scope_sha256=scope_fingerprint)
+        except ValueError:
+            print("EVAL_REFUSED=CONFIG_DRIFT")
+            return 2
         print(
             "CONFIG_FROZEN=True "
             f"VERSION={frozen['freeze_version']} "
@@ -3414,7 +3606,7 @@ def main() -> int:
 
     if args.mode in {"final", "stability"}:
         try:
-            _require_frozen_configuration()
+            _require_frozen_configuration(reviewed_scope_sha256=scope_fingerprint)
         except ValueError as exc:
             print(f"EVAL_REFUSED={exc}")
             return 2
@@ -3433,14 +3625,20 @@ def main() -> int:
                 case_ids=args.case_id, target_claim_id=args.target_claim_id,
                 target_block_id=args.target_block_id, diagnostic_id=args.diagnostic_id,
                 repetitions=args.repeat_count, hy3_service=service, versions=versions,
+                scope_contexts=scope_contexts,
             )
-            plan = build_mode_plan(mode=args.mode, output_path=output_path, diagnostic_plan=diagnostic_plan)
+            plan = build_mode_plan(mode=args.mode, output_path=output_path, diagnostic_plan=diagnostic_plan,
+                                   reviewed_scope_sha256=scope_fingerprint)
         except ValueError:
             print("EVAL_REFUSED=invalid context diagnostic")
             return 2
         print(f"DIAGNOSTIC_ONLY=True PLAN_SHA256={_sha256_json(diagnostic_plan)}")
     else:
-        plan = build_mode_plan(mode=args.mode, output_path=output_path)
+        try:
+            plan = build_mode_plan(mode=args.mode, output_path=output_path, reviewed_scope_sha256=scope_fingerprint)
+        except ValueError as exc:
+            print("EVAL_REFUSED=" + ("CONFIG_DRIFT" if str(exc) == "CONFIG_DRIFT" else "EVALUATION_FAILED"))
+            return 2
     print(
         f"EVAL_PLAN={args.mode} "
         f"SLOTS={plan.total_slots} "
@@ -3466,14 +3664,20 @@ def main() -> int:
         data_version=manifest["data_version"],
         code_version=_code_version(),
     )
-    summary = run_cases(
-        mode=args.mode,
-        cases=(context_diagnostic_cases(diagnostic_plan) if diagnostic_plan is not None else load_mode_cases(args.mode)),
-        output_path=output_path,
-        versions=versions,
-        evaluate=lambda case: evaluate_live_case(case, hy3_service=service, diagnostic_plan=diagnostic_plan),
-        diagnostic_plan=diagnostic_plan,
-    )
+    try:
+        summary = run_cases(
+            mode=args.mode,
+            cases=(context_diagnostic_cases(diagnostic_plan) if diagnostic_plan is not None else load_mode_cases(args.mode)),
+            output_path=output_path,
+            versions=versions,
+            evaluate=lambda case: evaluate_live_case(case, hy3_service=service, diagnostic_plan=diagnostic_plan,
+                **({"scope_context": scope_contexts[case.case_id]} if case.case_id in scope_contexts else {})),
+            diagnostic_plan=diagnostic_plan,
+            reviewed_scope_sha256=scope_fingerprint,
+        )
+    except ValueError as exc:
+        print("EVAL_REFUSED=" + ("CONFIG_DRIFT" if str(exc) == "CONFIG_DRIFT" else "EVALUATION_FAILED"))
+        return 2
     print(
         f"EVAL_MODE={args.mode} "
         f"REQUESTED={summary.requested} "

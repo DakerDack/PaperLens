@@ -1,17 +1,30 @@
+import json
+
 from backend.app.models import ClaimPolicy
 
 
 GENERATION_PROMPT_VERSION = "gen-v4"
+
+
+def render_scope_context(context: list[dict]) -> str:
+    return (
+        "\n范围来源补充（每请求共享一次，独立于原引用）：\nverified_scope_context: "
+        + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+        + "\n仅将明确关联的研究设计、研究对象和抽样范围用于对应结果；来源位置及原文经代码核验，"
+        "不代表总体代表性或语义支持已获确认。修订及重建保留同一范围边界，不能把上下文冒充原引用。"
+        "空列表表示缺失，非完整性保证；缺失或不适用时不得默认支持总体推广或 preserved，"
+        "沿用证据不足/无法判断及既有严重度契约。不得从其他文档句子补齐范围。\n"
+    )
 GENERATION_SCHEMA_VERSION = "generated-bundle-v1"
 GENERATION_SCHEMA_NAME = "paperlens_generated_bundle_v1"
-DEEP_AUDIT_PROMPT_VERSION = "audit-v7"
+DEEP_AUDIT_PROMPT_VERSION = "audit-v8"
 DEEP_AUDIT_SCHEMA_VERSION = "deep-audit-result-v3"
 DEEP_AUDIT_SCHEMA_NAME = "paperlens_deep_audit_result_v3"
-REVISION_PROMPT_VERSION = "revision-v2"
+REVISION_PROMPT_VERSION = "revision-v3"
 REVISION_SCHEMA_VERSION = "edit-patch-v1"
 REVISION_SCHEMA_NAME = "paperlens_edit_patch_v1"
 CLAIM_REGENERATION_PROMPT_VERSION = "claim-regen-v1"
-SENTENCE_CLAIMS_PROMPT_VERSION = "sentence-claims-v2"
+SENTENCE_CLAIMS_PROMPT_VERSION = "sentence-claims-v3"
 SENTENCE_CLAIMS_SCHEMA_VERSION = "sentence-claims-result-v1"
 SENTENCE_CLAIMS_SCHEMA_NAME = "paperlens_sentence_claims_v1"
 
@@ -24,20 +37,20 @@ COMMON_SYSTEM_PROMPT = """你是 PaperLens 的受约束学术内容处理模块�
 
 
 DEEP_AUDIT_SYSTEM_PROMPT = """你是 PaperLens 的受约束深度审计模块。
-事实判断只能依据输入中的已验证 claim/evidence 配对，不得使用外部知识补充证据。
+事实判断依据输入中的已验证 claim/evidence 配对及明确关联的 verified_scope_context，不得使用外部知识补充证据。
 文档风险检查只能检查输入中的完整 ContentDraft，不得使用 SourceBlock 推断风险位置。
 不得生成或推断页码、bbox、最终风险等级、分数、权重、硬失败或合格结论。
 必须严格遵守给定 JSON Schema，不得输出 Markdown 代码块或额外说明。"""
 
 
 REVISION_SYSTEM_PROMPT = """你是 PaperLens 的受约束修订模块。
-你只能根据当前目标、已验证证据和用户意图生成一个待确认 EditPatch。
+你只能根据当前目标、已验证证据、明确关联的 verified_scope_context 和用户意图生成一个待确认 EditPatch。
 不得直接应用修改，不得引用历史版本，不得生成页码、bbox、分数或合格结论。
 必须严格遵守给定 JSON Schema，不得输出 Markdown 代码块或额外说明。"""
 
 
 SENTENCE_CLAIMS_SYSTEM_PROMPT = """你是 PaperLens 的受约束目标句主张重建模块。
-你只能依据输入中的已接受目标句、原目标主张、相关已验证证据和允许的 block_id，不得使用外部知识。
+你只能依据输入中的已接受目标句、原目标主张、相关已验证证据、明确关联的 verified_scope_context 和允许的 block_id，不得使用外部知识。
 不得生成页码、bbox、verified 状态、分数、最终判断或完整文档。
 必须严格遵守给定 JSON Schema，不得输出 Markdown 代码块或额外说明。"""
 
@@ -79,7 +92,7 @@ DEEP_AUDIT_USER_PROMPT_TEMPLATE = """任务一：逐条判断 claim 是否被给
 
 每个输出必须保留对应输入的 claim_id 和 evidence.block_id，且每个输入项恰好返回一次判断。
 不得参考分数、预设质量档位、攻击标签或其他 claim 的最终判断。
-任务一的局部事实与范围判断只能使用当前 item 的 claim 和 evidence；完整 document 仅供任务二文档风险及任务三表达检查，不得为当前配对补充边界或借入其他句子的问题。
+任务一的局部事实与范围判断只能使用当前 item 的 claim 和 evidence，以及 applies_to_block_ids 明确关联该 evidence 的 verified_scope_context；完整 document 仅供任务二文档风险及任务三表达检查，不得为当前配对补充边界或借入其他句子的问题。
 不得根据其他句子的问题数量、文档整体质量、其他配对或排列顺序改变当前 relation、scope_status、terminology_status、severity。
 判 expanded 前，必须能在当前 claim/evidence 中指出本断言实际丢失或改变的必要条件、数值精度或比较基准；不能用文档级印象代替局部证据。
 逐项检查顺序：
@@ -113,7 +126,7 @@ DEEP_AUDIT_USER_PROMPT_TEMPLATE = """任务一：逐条判断 claim 是否被给
 - 限制性主张须核对其自身限制的对象及必要边界；只有本配对直接支持且无事实、范围或术语问题时才判 supports/preserved/none，不得因它是限制句就预设通过。
 - 当前绑定 evidence 已明确支持该限制性主张及其必要边界时，应选择 relation=supports；不得额外要求背景或其他 SourceBlock。
 - 同一未变的 claim/evidence 配对必须给出相同判断，不得受其他 items、顺序或无关文档内容影响。
-不得补充给定 evidence 之外的知识或证据，不得返回页码或 bbox。
+除明确关联的 verified_scope_context 外，不得补充给定 evidence 之外的知识或证据，不得返回页码或 bbox。
 即使 items 为空，也必须继续执行任务二。
 items 为空时，semantic_judgments 必须为空数组；不得为不存在的配对生成判断。
 

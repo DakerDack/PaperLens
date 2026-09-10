@@ -11,6 +11,7 @@ from rank_bm25 import BM25Okapi
 
 from backend.app.hy3_service import (
     Hy3Service,
+    PreparedScopeContext,
     build_safe_diagnostic_message,
 )
 from backend.app.models import (
@@ -449,6 +450,9 @@ class AuditService:
         bundle: GeneratedBundle,
         evidence_records: list[EvidenceRecord],
         compliance_context: ComplianceContext,
+        *,
+        source_blocks: list[SourceBlock] | None = None,
+        scope_context: PreparedScopeContext | None = None,
     ) -> tuple[DeepAuditResult, AuditReport]:
         try:
             validated_context = ComplianceContext.model_validate(
@@ -474,7 +478,9 @@ class AuditService:
         pairs = self.semantic_pairs(bundle, evidence_records)
         result = self.hy3_service.deep_audit(
             document=bundle.document,
-            claim_evidence_pairs=pairs
+            claim_evidence_pairs=pairs,
+            **({"source_blocks": source_blocks} if source_blocks is not None else {}),
+            **({"scope_context": scope_context} if scope_context is not None else {}),
         )
         report = self.score(
             bundle,

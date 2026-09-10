@@ -713,8 +713,8 @@ class CountingAuditService:
         self.quick_outputs.append(result)
         return result
 
-    def run_deep_audit(self, *args: object):
-        return self.delegate.run_deep_audit(*args)
+    def run_deep_audit(self, *args: object, **kwargs: object):
+        return self.delegate.run_deep_audit(*args, **kwargs)
 
 
 class ZeroClaimGenerateService(RecordingGenerateService):
@@ -739,6 +739,7 @@ class RiskOnlyDeepAuditProvider:
         *,
         document: object,
         claim_evidence_pairs: list[tuple[object, EvidenceRecord]],
+        source_blocks: list[SourceBlock] | None = None,
     ) -> DeepAuditResult:
         del document
         self.calls.append(claim_evidence_pairs)
@@ -821,6 +822,34 @@ def generate_project(
         f"/api/projects/{project_id}/generate",
         json={"claim_policy": claim_policy},
     )
+
+
+def test_scope_context_contract_api_passes_only_project_snapshot(tmp_path):
+    service = UnsafeSentenceRevisionService(fact_changed=True, evidence_changed=False,
+        after_text="The supported fixture fact is expressed with new wording.")
+    audit = CountingAuditService(explicit_mock_audit_service(tmp_path))
+    captured = []
+    original = audit.run_deep_audit
+    def capture(*args, **kwargs):
+        captured.append(kwargs["source_blocks"])
+        return original(*args, **kwargs)
+    audit.run_deep_audit = capture
+    with api_client(tmp_path, hy3_service=service, audit_service=audit) as (client, store, _):
+        upload_parsed_project(client)
+        assert generate_project(client).status_code == 200
+        view = client.get("/api/projects/project-001").json()
+        expected = store.get_parse_snapshot("project-001").blocks
+        response = client.post("/api/projects/project-001/revisions", json={
+            "base_version_id": view["current_version_id"], "scope": "sentence",
+            "target_sentence_id": view["document"]["sections"][0]["sentences"][0]["sentence_id"],
+            "user_instruction": "Preserve supported facts."})
+        assert response.status_code == 200, response.json().get("error_code")
+        assert service.sentence_revisions[0]["source_blocks"] == expected
+        accepted = client.post(f"/api/projects/project-001/revisions/{response.json()['patch_id']}/accept")
+        assert accepted.status_code == 200
+        assert service.sentence_claim_regenerations[0]["source_blocks"] == expected
+        client.post("/api/projects/project-001/audit", json=VALID_AUDIT_REQUEST)
+        assert captured == [expected]
 
 
 @pytest.mark.parametrize(
@@ -996,7 +1025,7 @@ def test_sentence_revision_preview_is_bounded_and_does_not_overwrite_current_ver
             "retryable": False,
             "retryable_stage": None,
             "model": "hy3",
-            "prompt_version": "revision-v2",
+            "prompt_version": "revision-v3",
             "schema_version": "edit-patch-v1",
         }
         assert revision_run["usage"] == {
@@ -1076,7 +1105,7 @@ def test_revision_provider_failure_records_one_safe_run_without_stable_writes(
             "retryable": True,
             "retryable_stage": stable_stage,
             "model": "hy3",
-            "prompt_version": "revision-v2",
+            "prompt_version": "revision-v3",
             "schema_version": "edit-patch-v1",
         }
         assert failed_run["usage"] == {
@@ -1369,7 +1398,7 @@ def test_live_revision_wrong_patch_id_echo_returns_schema_invalid_without_writes
             "retryable": False,
             "retryable_stage": "quick_checked",
             "model": "hy3",
-            "prompt_version": "revision-v2",
+            "prompt_version": "revision-v3",
             "schema_version": "edit-patch-v1",
         }
         assert failed_run["usage"] == {
@@ -1392,7 +1421,7 @@ def test_document_revision_preview_uses_current_document_without_history(
     tmp_path: Path,
 ) -> None:
     service = RecordingRevisionService()
-    with api_client(tmp_path, hy3_service=service) as (client, _store, _):
+    with api_client(tmp_path, hy3_service=service) as (client, store, _):
         upload_parsed_project(client)
         assert generate_project(client).status_code == 200
         stable = client.get("/api/projects/project-001").json()
@@ -1413,7 +1442,8 @@ def test_document_revision_preview_uses_current_document_without_history(
         call = service.document_revisions[0]
         assert call["document"].model_dump(mode="json") == stable["document"]
         assert "versions" not in call
-        assert "evidence_records" not in call
+        assert call["source_blocks"] == store.get_parse_snapshot("project-001").blocks
+        assert all(e.quote_verified for e in call["evidence_records"])
 
 
 @pytest.mark.parametrize(
@@ -1831,10 +1861,10 @@ def test_sentence_revision_acceptance_rebuilds_only_target_claims(
         )
         assert {
             "document",
-            "source_blocks",
             "history",
             "versions",
         }.isdisjoint(regeneration)
+        assert regeneration["source_blocks"] == store.get_parse_snapshot("project-001").blocks
         assert [claim["claim_id"] for claim in after["claims"]] == [
             "replacement-z",
             "replacement-a",
@@ -3470,6 +3500,7 @@ class RecordingAuditWrapper:
         bundle: GeneratedBundle,
         evidence_records: list[EvidenceRecord],
         compliance_context: ComplianceContext,
+        **kwargs: object,
     ):
         self.contexts.append(compliance_context)
         self.evidence.append(evidence_records)
@@ -3477,6 +3508,7 @@ class RecordingAuditWrapper:
             bundle,
             evidence_records,
             compliance_context,
+            **kwargs,
         )
 
 
@@ -3488,7 +3520,7 @@ class FailingDeepAudit:
     def quick_check(self, *args: object):
         return AuditService().quick_check(*args)
 
-    def run_deep_audit(self, *_args: object):
+    def run_deep_audit(self, *_args: object, **_kwargs: object):
         self.calls += 1
         raise self.error
 
@@ -3695,7 +3727,7 @@ class FailOnSecondDeepAudit:
     def quick_check(self, *args: object):
         return self.delegate.quick_check(*args)
 
-    def run_deep_audit(self, *args: object):
+    def run_deep_audit(self, *args: object, **kwargs: object):
         self.deep_calls += 1
         if self.deep_calls == 2:
             raise Hy3ServiceError(
@@ -3705,7 +3737,7 @@ class FailOnSecondDeepAudit:
                 field_error_summary="raw retry response SECRET-RETRY-RAW",
                 usage=(13, 8, 21),
             )
-        return self.delegate.run_deep_audit(*args)
+        return self.delegate.run_deep_audit(*args, **kwargs)
 
 
 def test_document_expression_contract_unclear_does_not_overwrite_stable_snapshot(tmp_path, monkeypatch):

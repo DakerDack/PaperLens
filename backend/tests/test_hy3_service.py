@@ -18,6 +18,7 @@ from backend.app.hy3_service import (
     SAFE_DIAGNOSTIC_MAX_LENGTH,
     Hy3Service,
     Hy3ServiceError,
+    PreparedScopeContext,
 )
 from backend.app.models import (
     AtomicClaim,
@@ -48,6 +49,237 @@ from backend.app.settings import Settings
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _scope_context_fixture():
+    blocks = [SourceBlock(block_id=f"scope-{i}", page_index=0, type="text", text=text,
+        bbox=None, reading_order=i, parser="pdfplumber", parser_version="synthetic")
+        for i, text in enumerate([
+            "The cross-sectional study assessed turbine reliability in coastal stations.",
+            "The turbine reliability survey recruited 38 participants at the selected stations.",
+            "Turbine reliability was 70%.",
+        ])]
+    claim, evidence = verified_claim_evidence_pairs()[0]
+    evidence = evidence.model_copy(update={"block_id": "scope-2", "quote": blocks[2].text})
+    claim = claim.model_copy(update={"text": "Turbine reliability was 70% in all stations.",
+        "candidate_block_ids": ["scope-2"], "candidate_quote": blocks[2].text})
+    return blocks, claim, evidence
+
+
+def _scope_optional_sources(method, blocks, evidence):
+    import inspect
+    import backend.app.hy3_service as module
+    if "source_blocks" not in inspect.signature(method).parameters:
+        return {}
+    return {"source_blocks": blocks,
+        "scope_context": module.PreparedScopeContext.prepare(
+            blocks, [evidence], _reviewed_scope_links(blocks))}
+
+
+def _scope_payload(request):
+    prompt = request["messages"][1]["content"]
+    marker = "verified_scope_context: "
+    marker_valid = prompt.count(marker) == 1
+    assert marker_valid, "SCOPE_CONTEXT_MISSING_OR_REPEATED"
+    return json.loads(prompt.split(marker, 1)[1].splitlines()[0])
+
+
+def _reviewed_scope_links(blocks):
+    def anchor(b):
+        return dict(block_id=b.block_id, page_index=b.page_index,
+            reading_order=b.reading_order, start=0, end=len(b.text),
+            sha256=sha256(b.text.encode()).hexdigest())
+    return [dict(review_source="manual_review", source=anchor(b), result=anchor(blocks[2])) for b in blocks[:2]]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_scope_context_consistency_three_actual_dispatches(monkeypatch, reverse):
+    blocks, claim, evidence = _scope_context_fixture()
+    extra = [b.model_copy(update={"block_id": b.block_id + "-other", "page_index": 1,
+        "text": b.text.replace("turbine", "battery").replace("Turbine", "Battery")}) for b in blocks]
+    other = claim.model_copy(update={"claim_id": "other-claim"})
+    other_e = evidence.model_copy(update={"claim_id": other.claim_id,
+        "block_id": extra[2].block_id, "page_index": 1, "quote": extra[2].text})
+    sources = blocks + extra
+    pairs = [(claim, evidence), (other, other_e)]
+    if reverse:
+        pairs.reverse()
+    monkeypatch.setattr("backend.app.hy3_service.uuid4", lambda: LOCAL_PATCH_ID)
+    after = "Turbine reliability was 70% in surveyed stations."
+    raw = json.loads(valid_deep_audit_json())
+    raw["semantic_judgments"] = [dict(raw["semantic_judgments"][0],
+        claim_id=c.claim_id, block_id=e.block_id) for c, e in pairs]
+    client = FakeClient([
+        revision_patch_json(base_version=1, scope="sentence", target_sentence_ids=[claim.sentence_id],
+            before_text=claim.text, after_text=after),
+        json.dumps({"claims": [claim.model_copy(update={"text": after}).model_dump(mode="json")]}),
+        json.dumps(raw)])
+    from backend.app.hy3_service import PreparedScopeContext
+    prepared = PreparedScopeContext.prepare(sources, [evidence], _reviewed_scope_links(blocks))
+    service = Hy3Service(settings=live_settings(), client=client)
+    service.revise_sentence(base_version=1, sentence_id=claim.sentence_id, current_text=claim.text,
+        evidence_records=[evidence], source_blocks=sources, scope_context=prepared,
+        user_instruction="Preserve supported scope.")
+    service.regenerate_sentence_claims(target_sentence_id=claim.sentence_id, accepted_after_text=after,
+        original_claims=[claim], evidence_records=[evidence], source_blocks=sources,
+        scope_context=prepared, allowed_block_ids={b.block_id for b in sources},
+        reserved_claim_ids=set(), user_instruction="Rebuild.")
+    service.deep_audit(document=generated_bundle().document, claim_evidence_pairs=pairs,
+        source_blocks=sources, scope_context=prepared)
+    contexts = [_scope_payload(r) for r in client.completions.calls]
+    assert len(contexts) == 3 and len(contexts[0]) == 2
+    assert contexts[0] == contexts[1] == contexts[2], "TARGET_CONTEXT_CHANGED"
+    assert all(c["applies_to_block_ids"] == [evidence.block_id] for c in contexts[2])
+    for request in client.completions.calls:
+        prompt = request["messages"][1]["content"]
+        assert all(prompt.count(b.text) == 1 for b in blocks[:2])
+        assert not any(label in prompt for label in ("quality_label", "known_error", "paper_id", "case_id"))
+
+
+@pytest.mark.parametrize("text", [
+    "An unrelated study measured turbine reliability in a different population.",
+    "The turbine reliability survey recruited 38 participants.",
+])
+def test_scope_context_consistency_no_reviewed_association(text):
+    blocks, claim, evidence = _scope_context_fixture()
+    blocks[0] = blocks[0].model_copy(update={"text": text})
+    raw = json.loads(valid_deep_audit_json())
+    raw["semantic_judgments"] = [dict(raw["semantic_judgments"][0], claim_id=claim.claim_id,
+        block_id=evidence.block_id)]
+    client = FakeClient([json.dumps(raw)])
+    Hy3Service(settings=live_settings(), client=client).deep_audit(
+        document=generated_bundle().document, claim_evidence_pairs=[(claim, evidence)], source_blocks=blocks)
+    assert _scope_payload(client.completions.calls[0]) == [], "UNREVIEWED_ASSOCIATION"
+    assert len(client.completions.calls) == 1
+
+
+def test_scope_context_consistency_rejects_tampered_reviewed_link():
+    blocks, _, evidence = _scope_context_fixture()
+    links = _reviewed_scope_links(blocks)
+    links[0]["source"]["sha256"] = "0" * 64
+    assert PreparedScopeContext.prepare(blocks, [evidence], links).payload() == []
+
+
+def test_scope_context_consistency_rejects_hash_only_association():
+    blocks, _, evidence = _scope_context_fixture()
+    links = _reviewed_scope_links(blocks)
+    links[0].pop("review_source")
+    assert PreparedScopeContext.prepare(blocks, [evidence], links).payload() == []
+
+
+def test_scope_context_contract_actual_three_dispatches(monkeypatch):
+    blocks, claim, evidence = _scope_context_fixture()
+    monkeypatch.setattr("backend.app.hy3_service.uuid4", lambda: LOCAL_PATCH_ID)
+    after = "Turbine reliability was 70% in the surveyed stations."
+    raw = json.loads(valid_deep_audit_json())
+    raw["semantic_judgments"] = [dict(raw["semantic_judgments"][0],
+        claim_id=claim.claim_id, block_id=evidence.block_id)]
+    client = FakeClient([
+        revision_patch_json(base_version=1, scope="sentence", target_sentence_ids=[claim.sentence_id],
+            before_text=claim.text, after_text=after),
+        json.dumps({"claims": [claim.model_copy(update={"text": after}).model_dump(mode="json")]}),
+        json.dumps(raw),
+    ])
+    service = Hy3Service(settings=live_settings(), client=client)
+    service.revise_sentence(base_version=1, sentence_id=claim.sentence_id, current_text=claim.text,
+        evidence_records=[evidence], user_instruction="Keep the supported sample scope.",
+        **_scope_optional_sources(service.revise_sentence, blocks, evidence))
+    service.regenerate_sentence_claims(target_sentence_id=claim.sentence_id, accepted_after_text=after,
+        original_claims=[claim], evidence_records=[evidence], allowed_block_ids={b.block_id for b in blocks},
+        reserved_claim_ids=set(), user_instruction="Rebuild the accepted sentence.",
+        **_scope_optional_sources(service.regenerate_sentence_claims, blocks, evidence))
+    service.deep_audit(document=generated_bundle().document, claim_evidence_pairs=[(claim, evidence)],
+        **_scope_optional_sources(service.deep_audit, blocks, evidence))
+    assert len(client.completions.calls) == 3
+    contexts = [_scope_payload(r) for r in client.completions.calls]
+    assert contexts[0] == contexts[1] == contexts[2]
+    assert [c["block_id"] for c in contexts[0]] == ["scope-0", "scope-1"]
+    for item, block in zip(contexts[0], blocks):
+        assert item["text"] == block.text and item["page_index"] == block.page_index
+        assert item["start"] == 0 and item["end"] == len(block.text)
+        assert item["sha256"] == sha256(block.text.encode()).hexdigest()
+        assert item["applies_to_block_ids"] == ["scope-2"]
+    for request in client.completions.calls:
+        prompt = request["messages"][1]["content"]
+        assert all(prompt.count(b.text) == 1 for b in blocks[:2])
+        assert not any(x in prompt for x in ("quality_label", "known_error", "paper_id", "case_id"))
+
+
+@pytest.mark.parametrize("claim_text,scope,relation,severity", [
+    ("Turbine reliability was 70% in all stations.", "expanded", "supports", "major"),
+    ("Turbine reliability was 70% in surveyed stations.", "preserved", "supports", "none"),
+    ("In surveyed stations, turbine reliability reached 70%.", "preserved", "supports", "none"),
+    ("Turbine reliability was 90% in surveyed stations.", "preserved", "contradicts", "major"),
+])
+def test_scope_context_contract_preserves_pair_and_independent_rule_signals(claim_text, scope, relation, severity):
+    from backend.app.audit_service import AuditService
+    blocks, claim, evidence = _scope_context_fixture()
+    claim = claim.model_copy(update={"text": claim_text, "numeric_entities": []})
+    verified = AuditService().verify_claim_evidence(claim, blocks)
+    assert len(verified) == 1 and verified[0].quote_verified
+    assert any(flag.startswith("NUMBER_MISMATCH:") for flag in verified[0].rule_flags) == ("90%" in claim_text)
+    raw = json.loads(valid_deep_audit_json())
+    raw["semantic_judgments"] = [dict(raw["semantic_judgments"][0], claim_id=claim.claim_id,
+        block_id=evidence.block_id, relation=relation, scope_status=scope, severity=severity)]
+    client = FakeClient([json.dumps(raw)])
+    service = Hy3Service(settings=live_settings(), client=client)
+    result = service.deep_audit(document=generated_bundle().document, claim_evidence_pairs=[(claim, verified[0])],
+        source_blocks=blocks, scope_context=PreparedScopeContext.prepare(
+            blocks, [verified[0]], _reviewed_scope_links(blocks)))
+    assert result.semantic_judgments[0].scope_status.value == scope
+    assert result.semantic_judgments[0].relation.value == relation
+    request = client.completions.calls[0]
+    assert len(_scope_payload(request)) == 2
+    # FakeClient checks transport and preservation only, not semantic competence.
+    assert len(client.completions.calls) == 1
+
+
+def test_scope_context_contract_population_supported_and_bm25():
+    from backend.app.audit_service import AuditService
+    from backend.app.hy3_service import verified_scope_context
+    blocks, claim, evidence = _scope_context_fixture()
+    blocks[0] = blocks[0].model_copy(update={"text": "The census study measured turbine reliability in the entire target population."})
+    claim = claim.model_copy(update={"text": "Turbine reliability was 70%.", "numeric_entities": [],
+        "candidate_block_ids": ["absent"], "candidate_quote": "fabricated"})
+    records = AuditService().verify_claim_evidence(claim, blocks)
+    assert records and all(r.match_method.value == "bm25_fallback" for r in records)
+    context = verified_scope_context(blocks, records, _reviewed_scope_links(blocks))
+    assert context and context[0]["text"] == blocks[0].text
+    assert all(r.quote_verified for r in records)
+
+
+def test_scope_context_contract_duplicate_pairs_share_one_context():
+    from backend.app.hy3_service import verified_scope_context
+    blocks, claim, evidence = _scope_context_fixture()
+    links = _reviewed_scope_links(blocks)
+    one = verified_scope_context(blocks, [evidence], links)
+    many = verified_scope_context(list(reversed(blocks)), [evidence, evidence.model_copy(update={"claim_id": "rebuilt"})], links)
+    assert one == many and len(one) == 2
+    assert verified_scope_context(blocks, [evidence.model_copy(update={"block_id": "other-project"})], links) == []
+    blocks[0] = blocks[0].model_copy(update={"text": "Scope is not stated here."})
+    blocks[1] = blocks[1].model_copy(update={"text": "Background unrelated to this result."})
+    assert verified_scope_context(blocks, [evidence], links) == []
+
+
+@pytest.mark.parametrize("damage", ["missing", "unrelated", "page", "quote", "duplicate", "budget"])
+def test_scope_context_contract_missing_or_unreliable_is_not_complete(damage, monkeypatch):
+    blocks, claim, evidence = _scope_context_fixture()
+    monkeypatch.setattr("backend.app.hy3_service.uuid4", lambda: LOCAL_PATCH_ID)
+    if damage == "missing": blocks = blocks[2:]
+    elif damage == "unrelated":
+        blocks = [b.model_copy(update={"text": b.text.replace("turbine", "orchid")}) for b in blocks[:2]] + blocks[2:]
+    elif damage == "page": blocks[0] = blocks[0].model_copy(update={"page_index": 9}); blocks[1] = blocks[1].model_copy(update={"page_index": 9})
+    elif damage == "quote": evidence = evidence.model_copy(update={"quote": "UNVERIFIED_QUOTE"})
+    elif damage == "duplicate": blocks.append(blocks[0])
+    else: blocks[0] = blocks[0].model_copy(update={"text": blocks[0].text + " qualifier" * 100})
+    client = FakeClient([revision_patch_json(base_version=1, scope="sentence", target_sentence_ids=[claim.sentence_id],
+        before_text=claim.text, after_text="The available evidence is insufficient.")])
+    service = Hy3Service(settings=live_settings(), client=client)
+    service.revise_sentence(base_version=1, sentence_id=claim.sentence_id, current_text=claim.text,
+        evidence_records=[evidence], user_instruction="Keep supported facts.",
+        source_blocks=blocks, scope_context=PreparedScopeContext())
+    assert _scope_payload(client.completions.calls[0]) == []
+    assert len(client.completions.calls) == 1
 LOCAL_PATCH_ID = "123e4567-e89b-42d3-a456-426614174010"
 OTHER_PATCH_ID = "223e4567-e89b-42d3-a456-426614174011"
 
@@ -545,7 +777,7 @@ def test_live_sentence_revision_sends_only_target_sentence_and_related_evidence(
     response_schema = request["response_format"]["json_schema"]["schema"]
     assert response_schema["properties"]["patch_id"]["const"] == LOCAL_PATCH_ID
     assert "const" not in EditPatch.model_json_schema()["properties"]["patch_id"]
-    assert REVISION_PROMPT_VERSION == "revision-v2"
+    assert REVISION_PROMPT_VERSION == "revision-v3"
 
 
 def test_live_document_revision_sends_current_five_sections_without_history(
@@ -1049,7 +1281,7 @@ def test_deep_audit_prompt_centralizes_v2_document_contract() -> None:
         )
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v7"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v8"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v3"
     assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v3"
     assert "逐条判断" in prompt
@@ -1074,7 +1306,7 @@ def test_deep_audit_prompt_defines_non_hedging_semantic_contract() -> None:
         ),
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v7"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v8"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v3"
     assert "relation=supports：仅当 evidence 直接蕴含 claim 的全部实质事实时选择。" in prompt
     assert "relation=contradicts：当数字、方向、因果、比较或结论冲突时选择。" in prompt
@@ -1128,7 +1360,7 @@ def test_deep_audit_prompt_closes_severity_decision_contract() -> None:
         ),
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v7"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v8"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v3"
     assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v3"
     assert (
@@ -1278,7 +1510,7 @@ def test_deep_audit_prompt_isolates_claim_scope() -> None:
         )
         for rule, category in (
             (
-                "任务一的局部事实与范围判断只能使用当前 item 的 claim 和 evidence；"
+                "任务一的局部事实与范围判断只能使用当前 item 的 claim 和 evidence，以及 applies_to_block_ids 明确关联该 evidence 的 verified_scope_context；"
                 "完整 document 仅供任务二文档风险及任务三表达检查，不得为当前配对补充边界或借入其他句子的问题。",
                 "LOCAL_SCOPE_INPUT_BOUNDARY_MISSING",
             ),
@@ -1806,7 +2038,7 @@ def test_live_deep_audit_schema_error_retries_and_logs_safely(caplog) -> None:
     retry_prompt = client.completions.calls[1]["messages"][1]["content"]
     assert retry_prompt.count("字段错误摘要：") == 1
     assert invalid not in retry_prompt
-    assert "prompt_version=audit-v7" in caplog.text
+    assert "prompt_version=audit-v8" in caplog.text
     assert "schema_version=deep-audit-result-v3" in caplog.text
     assert "retries=1" in caplog.text
     assert invalid not in caplog.text
@@ -4305,7 +4537,7 @@ def test_sentence_claim_regeneration_sends_only_minimal_target_context() -> None
     assert '"quote_verified":' not in prompt
     assert '"match_method":' not in prompt
     assert "history" not in prompt.casefold()
-    assert SENTENCE_CLAIMS_PROMPT_VERSION == "sentence-claims-v2"
+    assert SENTENCE_CLAIMS_PROMPT_VERSION == "sentence-claims-v3"
     response_format = request["response_format"]["json_schema"]
     assert response_format["name"] == "paperlens_sentence_claims_v1"
     assert response_format["strict"] is True

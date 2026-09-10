@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 import json
 import logging
+import re
 from pathlib import Path
 import time
 from typing import Any, Literal
@@ -53,6 +54,7 @@ from backend.app.prompts import (
     render_generation_retry_prompt,
     render_sentence_revision_prompt,
     render_sentence_claim_regeneration_prompt,
+    render_scope_context,
 )
 from backend.app.settings import Settings, settings as app_settings
 
@@ -100,6 +102,100 @@ _SAFE_DIAGNOSTIC_FALLBACK_MESSAGE = (
 UsageTuple = tuple[int | None, int | None, int | None]
 SemanticPair = tuple[AtomicClaim, EvidenceRecord]
 SemanticPairKey = tuple[str, str]
+
+
+def verified_scope_context(
+    source_blocks: list[SourceBlock] | None,
+    evidence_records: list[EvidenceRecord],
+    reviewed_links: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Return only manually reviewed, location-bound scope context.
+
+    Adjacency and lexical overlap are not evidence of study identity.  A link
+    must carry both block references, their positions, and content hashes.
+    """
+    if not source_blocks or not reviewed_links:
+        return []
+    blocks = {block.block_id: block for block in source_blocks}
+    if len(blocks) != len(source_blocks):
+        return []
+
+    def checked_ref(raw: Any) -> SourceBlock | None:
+        if not isinstance(raw, dict):
+            return None
+        block = blocks.get(raw.get("block_id"))
+        if block is None or any(raw.get(key) != value for key, value in {
+            "page_index": block.page_index, "reading_order": block.reading_order,
+            "start": 0, "end": len(block.text),
+        }.items()):
+            return None
+        if raw.get("sha256") != sha256(block.text.encode("utf-8")).hexdigest():
+            return None
+        return block
+
+    allowed_results = {
+        (record.block_id, record.page_index)
+        for record in evidence_records
+        if record.quote_verified and record.block_id and record.page_index is not None
+        and record.quote and record.block_id in blocks
+        and record.quote in blocks[record.block_id].text
+    }
+    selected: dict[str, dict[str, Any]] = {}
+    for link in reviewed_links:
+        if not isinstance(link, dict):
+            return []
+        # Content hashes prove integrity only; this explicit attestation is
+        # the separate provenance signal required for manual review input.
+        if link.get("review_source") != "manual_review":
+            return []
+        source = checked_ref(link.get("source"))
+        result = checked_ref(link.get("result"))
+        if source is None or result is None or source.block_id == result.block_id:
+            return []
+        if (result.block_id, result.page_index) not in allowed_results:
+            continue
+        entry = selected.setdefault(source.block_id, {
+            "block_id": source.block_id, "page_index": source.page_index,
+            "reading_order": source.reading_order, "start": 0,
+            "end": len(source.text),
+            "sha256": sha256(source.text.encode("utf-8")).hexdigest(),
+            "text": source.text, "applies_to_block_ids": [],
+        })
+        if result.block_id not in entry["applies_to_block_ids"]:
+            entry["applies_to_block_ids"].append(result.block_id)
+    context = sorted(selected.values(), key=lambda item: (
+        item["page_index"], item["reading_order"], item["block_id"],
+    ))
+    for item in context:
+        item["applies_to_block_ids"].sort()
+    if len(context) > 2 or sum(len(item["text"]) for item in context) > 800:
+        return []
+    if len(json.dumps(context, ensure_ascii=False, separators=(",", ":"))) > 1600:
+        return []
+    return context
+
+
+@dataclass(frozen=True)
+class PreparedScopeContext:
+    """Immutable prompt payload shared by all steps of one revision."""
+
+    serialized: str = "[]"
+
+    @classmethod
+    def prepare(
+        cls,
+        source_blocks: list[SourceBlock] | None,
+        evidence_records: list[EvidenceRecord],
+        reviewed_links: list[dict[str, Any]] | None = None,
+    ) -> "PreparedScopeContext":
+        return cls(json.dumps(
+            verified_scope_context(source_blocks, evidence_records, reviewed_links),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ))
+
+    def payload(self) -> list[dict[str, Any]]:
+        return json.loads(self.serialized)
 Hy3ValidationBoundary = Literal[
     "provider_unavailable",
     "content_missing",
@@ -320,6 +416,8 @@ class Hy3Service:
         *,
         document: ContentDraft,
         claim_evidence_pairs: list[SemanticPair],
+        source_blocks: list[SourceBlock] | None = None,
+        scope_context: PreparedScopeContext | None = None,
     ) -> DeepAuditResult:
         started_at = time.perf_counter()
         usage: UsageTuple = (None, None, None)
@@ -341,6 +439,8 @@ class Hy3Service:
                 prompt = self._build_deep_audit_prompt(
                     document,
                     claim_evidence_pairs,
+                    source_blocks,
+                    scope_context,
                 )
                 result, retries, usage = self._deep_audit_live(
                     prompt,
@@ -396,6 +496,8 @@ class Hy3Service:
         current_text: str,
         evidence_records: list[EvidenceRecord],
         user_instruction: str,
+        source_blocks: list[SourceBlock] | None = None,
+        scope_context: PreparedScopeContext | None = None,
     ) -> EditPatch:
         if (
             base_version < 1
@@ -458,6 +560,9 @@ class Hy3Service:
                 ),
                 user_instruction_json=json.dumps(user_instruction, ensure_ascii=False),
             )
+            prompt += render_scope_context(
+                scope_context.payload() if scope_context is not None else []
+            )
             patch = self._request_revision(
                 prompt,
                 expected_patch_id=patch_id,
@@ -480,6 +585,8 @@ class Hy3Service:
         allowed_block_ids: set[str],
         reserved_claim_ids: set[str],
         user_instruction: str,
+        source_blocks: list[SourceBlock] | None = None,
+        scope_context: PreparedScopeContext | None = None,
     ) -> SentenceClaimRegenerationResult:
         started_at = time.perf_counter()
         usage: UsageTuple = (None, None, None)
@@ -554,6 +661,9 @@ class Hy3Service:
                         auditable_claim_required
                     ),
                 )
+                prompt += render_scope_context(
+                    scope_context.payload() if scope_context is not None else []
+                )
                 result, retries, usage = self._sentence_claims_live(
                     prompt,
                     target_sentence_id=target_sentence_id,
@@ -610,6 +720,9 @@ class Hy3Service:
         base_version: int,
         document: ContentDraft,
         user_instruction: str,
+        source_blocks: list[SourceBlock] | None = None,
+        scope_context: PreparedScopeContext | None = None,
+        evidence_records: list[EvidenceRecord] | None = None,
     ) -> EditPatch:
         if base_version < 1 or not user_instruction.strip():
             self._record_run_observation(
@@ -656,6 +769,9 @@ class Hy3Service:
                 content_draft_json=before_text,
                 before_hash=before_hash,
                 user_instruction_json=json.dumps(user_instruction, ensure_ascii=False),
+            )
+            prompt += render_scope_context(
+                scope_context.payload() if scope_context is not None else []
             )
             patch = self._request_revision(
                 prompt,
@@ -1116,6 +1232,8 @@ class Hy3Service:
     def _build_deep_audit_prompt(
         document: ContentDraft,
         claim_evidence_pairs: list[SemanticPair],
+        source_blocks: list[SourceBlock] | None = None,
+        scope_context: PreparedScopeContext | None = None,
     ) -> str:
         items = [
             {
@@ -1131,6 +1249,8 @@ class Hy3Service:
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+        ) + render_scope_context(
+            scope_context.payload() if scope_context is not None else []
         )
 
     def _request_revision(

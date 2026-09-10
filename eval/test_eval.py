@@ -50,6 +50,56 @@ VERSIONS = VersionInfo(
 )
 
 
+@pytest.mark.parametrize("statuses", [("succeeded", "failed"), ("failed", "failed"), ("succeeded", "succeeded")])
+def test_attack_pair_count_contract_status_independent(statuses):
+    import eval.build_report as report
+    records = []
+    for role, status in zip(("attack", "clean"), statuses):
+        records.append({"case_id": f"attack:synthetic-long-id:{role}", "status": status,
+            "metrics": {"case_group": "attack", "attack_id": "synthetic-long-id"} if status == "succeeded" else {}})
+    summary = report._summarize_sample_scale(records)
+    assert summary["attack_records"] == 2
+    assert summary["attack_pair_id_count"] == 1
+
+
+def test_attack_pair_count_contract_jsonl_report_and_legacy(tmp_path, monkeypatch):
+    import eval.build_report as report
+    monkeypatch.setattr(report, "DEFAULT_FREEZE_PATH", tmp_path / "absent-freeze.json")
+    records = []
+    for role, status in (("attack", "succeeded"), ("clean", "failed")):
+        r = _existing_result()
+        r.update(case_id=f"attack:synthetic-pair:{role}", status=status,
+            error_code="NONE" if status == "succeeded" else "RUN_INTERRUPTED")
+        r["metrics"] = {"case_group": "attack", "attack_id": "synthetic-pair", "attack_type": "numeric_tampering",
+            "pair_role": role, "attack_detected": True} if status == "succeeded" else {}
+        records.append(r)
+    path, output = tmp_path / "synthetic.jsonl", tmp_path / "synthetic.md"
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    summary = report.build_report(input_path=path, output_path=output)
+    assert summary["sample_scale"]["attack_pair_id_count"] == 1
+    assert summary["sample_scale"]["attack_records"] == 2
+    assert output.exists()
+    legacy = [{"case_id": "legacy-attack", "metrics": {"case_group": "attack", "attack_id": "legacy"}}]
+    assert report._summarize_sample_scale(legacy)["attack_pair_id_count"] == 1
+
+
+def test_scope_context_contract_legacy_method_is_readable_not_current():
+    import eval.build_report as report
+    import eval.run_eval as runner
+    record = _existing_result()
+    record.update(case_id="quality:synthetic:good", mode="calibrate", prompt_version="audit-v7", schema_version="deep-audit-result-v3")
+    record["metrics"] = {"evaluation_method_version": "paperlens-stage7-method-v2",
+        "expression_findings": [{"category": c, "status": "not_detected", "sentence_ids": []}
+            for c in ("redundancy_or_off_topic", "unexplained_terminology")]}
+    assert runner.validate_expression_metrics(record)
+    coverage = report._expression_method_coverage([record], {})
+    assert coverage["evaluation_method_version"] == "paperlens-stage7-method-v2"
+    assert coverage["complete_groups"]["quality"] is False
+    record["prompt_version"] = "audit-v8"
+    with pytest.raises(ValueError, match="invalid expression metrics"):
+        runner.validate_expression_metrics(record)
+
+
 def _context_diagnostic_setup(**overrides):
     import eval.run_eval as runner
 
@@ -277,7 +327,7 @@ def test_context_diagnostic_fingerprint_matches_actual_provider_request(monkeypa
         audit = AuditService()
         records, _ = audit.quick_check(bundle, sources)
         pairs = audit.semantic_pairs(bundle, records)
-        prompt = Hy3Service._build_deep_audit_prompt(bundle.document, pairs)
+        prompt = Hy3Service._build_deep_audit_prompt(bundle.document, pairs, sources)
         with pytest.raises(Captured):
             service._deep_audit_live(prompt, {(c.claim_id, e.block_id) for c, e in pairs}, bundle.document)
         assert captured[-1] == context["request_sha256"]
@@ -326,7 +376,7 @@ def _context_dispatch_service():
     client = LocalClient()
 
     class InjectedService(Hy3Service):
-        def deep_audit(self, *, document, claim_evidence_pairs):
+        def deep_audit(self, *, document, claim_evidence_pairs, **_scope_kwargs):
             # Only the local response fixture is synthetic; serialization,
             # dispatch, Schema validation and retries use Hy3Service itself.
             client.response = _FakeLiveService().deep_audit(
@@ -2673,7 +2723,17 @@ def test_dev04_medium_condition_omission_has_no_deterministic_direction_mismatch
 class _FakeLiveService:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.scope_contexts: list[object] = []
+        self.sent_scope_payloads: list[str] = []
         self.last_run_observation = None
+
+    def _capture_scope(self, scope_context: object) -> None:
+        self.scope_contexts.append(scope_context)
+        self.sent_scope_payloads.append(json.dumps(
+            scope_context.payload() if scope_context is not None else [],
+            ensure_ascii=False,
+            sort_keys=True,
+        ))
 
     def _observe(self, operation: str) -> None:
         self.last_run_observation = SimpleNamespace(
@@ -2686,11 +2746,12 @@ class _FakeLiveService:
             error_code="NONE",
         )
 
-    def deep_audit(self, *, document, claim_evidence_pairs):
+    def deep_audit(self, *, document, claim_evidence_pairs, **_scope_kwargs):
         from backend.app.models import RiskCategory, RiskFinding, RiskLocation
         from backend.app.models import SemanticJudgment
 
         self.calls.append("deep_audit")
+        self._capture_scope(_scope_kwargs.get("scope_context"))
         self._observe("deep_audit")
         return DeepAuditResult(
             expression_findings=[{"category": category, "status": "not_detected", "locations": []}
@@ -2724,6 +2785,7 @@ class _FakeLiveService:
         from backend.app.models import EditPatch
 
         self.calls.append("revision")
+        self._capture_scope(_kwargs.get("scope_context"))
         self._observe("revision")
         after_text = " ".join(dict.fromkeys(
             record.quote for record in evidence_records if record.quote_verified and record.quote
@@ -2746,6 +2808,7 @@ class _FakeLiveService:
         from backend.app.models import SentenceClaimRegenerationResult
 
         self.calls.append("sentence_claims")
+        self._capture_scope(_kwargs.get("scope_context"))
         self._observe("sentence_claims")
         return SentenceClaimRegenerationResult(
             claims=[
@@ -2760,8 +2823,487 @@ class _FakeLiveService:
         )
 
 
+def test_scope_context_consistency_eval_entry_reuses_prepared_context():
+    from backend.app.hy3_service import PreparedScopeContext
+
+    case = next(
+        case for case in load_mode_cases("final")
+        if case.payload.get("case_group") == "revision"
+    )
+    service = _FakeLiveService()
+    prepared = PreparedScopeContext()
+    result = evaluate_live_case(case, hy3_service=service, scope_context=prepared)
+    assert result["provider_calls"] == 4
+    assert len(service.scope_contexts) == 4
+    assert service.scope_contexts[0] is service.scope_contexts[1]
+    assert service.scope_contexts[1] is service.scope_contexts[2]
+    assert service.scope_contexts[2] is service.scope_contexts[3]
+    assert service.scope_contexts[0] is prepared
+    assert service.scope_contexts[0].payload() == []
+
+
+def _scope_entry_manifest() -> tuple[dict[str, object], list[dict[str, object]]]:
+    source_blocks = [
+        {"block_id": "entry-scope-0", "text": "A reviewed sample study enrolled selected stations."},
+        {"block_id": "entry-scope-1", "text": "The sampling frame covered the surveyed stations only."},
+        {"block_id": "entry-scope-result", "text": "The study measured 70% in sampled stations."},
+    ]
+    sections = {
+        "research_question": {"sentence_id": "entry-s1", "text": "The study asked a synthetic question."},
+        "methods": {"sentence_id": "entry-s2", "text": "The study used a synthetic method."},
+        "results": {
+            "sentence_id": "entry-target",
+            "text": "The study measured 70% in sampled stations.",
+            "claim": {
+                "claim_id": "entry-claim",
+                "claim_type": "result",
+                "importance": "critical",
+                "qualifiers": ["in sampled stations"],
+                "numeric_entities": ["70%"],
+                "auditability": "auditable",
+                "candidate_block_id": "entry-scope-result",
+                "candidate_quote": "The study measured 70% in sampled stations.",
+            },
+        },
+        "limitations": {"sentence_id": "entry-s4", "text": "The study reported a synthetic limitation."},
+        "plain_explanation": {"sentence_id": "entry-s5", "text": "This is a synthetic explanation."},
+    }
+    manifest = {
+        "data_version": "synthetic-scope-entry-v1",
+        "attacks": [],
+        "stability_case_refs": [],
+        "revision_case_refs": [],
+        "papers": [{
+            "paper_id": "synthetic-scope-entry",
+            "source_blocks": source_blocks,
+            "base_output": {"title": "Synthetic scope entry", "sections": sections},
+            "quality_mutations": {"bad": {
+                "target_sentence_id": "entry-target",
+                "replacement_text": "The study measured 70% in sampled stations after review.",
+            }},
+        }],
+    }
+    def anchor(block: dict[str, object]) -> dict[str, object]:
+        text = block["text"]
+        assert isinstance(text, str)
+        return {
+            "block_id": block["block_id"],
+            "page_index": 0,
+            "reading_order": source_blocks.index(block),
+            "start": 0,
+            "end": len(text),
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+    links = [
+        {"review_source": "manual_review", "source": anchor(source_blocks[0]), "result": anchor(source_blocks[2])},
+        {"review_source": "manual_review", "source": anchor(source_blocks[1]), "result": anchor(source_blocks[2])},
+    ]
+    return manifest, links
+
+
+def _scope_context_cli_setup(monkeypatch, tmp_path, *, diagnostic=False, unrelated=False):
+    import eval.run_eval as runner
+    from backend.app.hy3_service import Hy3Service
+    from backend.app.settings import Settings
+
+    manifest, links = _scope_entry_manifest()
+    manifest["manifest_version"] = "synthetic-cli-v1"
+    paper = manifest["papers"][0]
+    paper["split"] = "holdout"
+    if unrelated:
+        block = {"block_id": "unrelated-result", "text": "A separate study measured 22 units."}
+        paper["source_blocks"].append(block)
+        paper["base_output"]["sections"]["methods"]["claim"] = {
+            **copy.deepcopy(paper["base_output"]["sections"]["results"]["claim"]),
+            "claim_id": "unrelated-claim", "numeric_entities": ["22"], "qualifiers": [],
+            "candidate_block_id": block["block_id"], "candidate_quote": block["text"],
+        }
+        paper["base_output"]["sections"]["methods"]["text"] = block["text"]
+    ids = runner.REVISION_DIAGNOSTIC_CASE_IDS if diagnostic else ("revision:synthetic-scope-entry:bad",)
+    cases = [EvaluationCase(case_id=key, run_index=0, payload={
+        "case_group": "revision", "paper_id": paper["paper_id"], "quality_label": "bad",
+    }) for key in ids]
+    monkeypatch.setattr(runner, "_load_live_manifest", lambda: manifest)
+    monkeypatch.setattr(runner, "load_mode_cases", lambda mode: cases)
+    if diagnostic:
+        monkeypatch.setattr(runner, "revision_diagnostic_cases", lambda: cases)
+    entries = []
+    for case in cases:
+        sources, bundle = runner.materialize_live_case(case)
+        entries.append({
+            "case_id": case.case_id, "target_sentence_id": "entry-target",
+            "material_sha256": runner._sha256_json({
+                "sources": [b.model_dump(mode="json") for b in sources],
+                "bundle": bundle.model_dump(mode="json"),
+            }),
+            "review_ref": "approved-synthetic-review-1",
+            "links": [{"source": link["source"], "result": link["result"]} for link in links],
+        })
+    external = {"version": "paperlens-reviewed-scope-v1", "entries": entries}
+    path = tmp_path / "reviewed-links.json"
+    freeze = tmp_path / "freeze.json"
+    monkeypatch.setattr(runner, "DEFAULT_FREEZE_PATH", freeze)
+    # Isolate the existing freeze material reader too; no real reports dependency.
+    root = tmp_path / "project"
+    (root / "eval").mkdir(parents=True)
+    (root / "eval" / "live_cases.json").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(runner, "_PROJECT_ROOT", root)
+    monkeypatch.setattr(runner, "_code_version", lambda: "synthetic-cli-code")
+
+    class Client:
+        def __init__(self):
+            self.chat = self.completions = self
+            self.sent = []
+            self.response = None
+
+        def create(self, **kwargs):
+            self.sent.append(copy.deepcopy(kwargs))
+            payload = copy.deepcopy(self.response)
+            properties = kwargs["response_format"]["json_schema"]["schema"]["properties"]
+            if "patch_id" in properties:
+                payload["patch_id"] = properties["patch_id"]["const"]
+            return SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop",
+                message=SimpleNamespace(content=json.dumps(payload)))],
+                usage=SimpleNamespace(prompt_tokens=100, completion_tokens=40, total_tokens=140))
+
+    client = Client()
+    class Service(Hy3Service):
+        def deep_audit(self, **kwargs):
+            if unrelated:
+                kwargs["claim_evidence_pairs"] = list(reversed(kwargs["claim_evidence_pairs"]))
+            client.response = _FakeLiveService().deep_audit(**kwargs).model_dump(mode="json")
+            return super().deep_audit(**kwargs)
+
+        def revise_sentence(self, **kwargs):
+            client.response = _FakeLiveService().revise_sentence(**kwargs).model_dump(mode="json")
+            return super().revise_sentence(**kwargs)
+
+        def regenerate_sentence_claims(self, **kwargs):
+            client.response = _FakeLiveService().regenerate_sentence_claims(**kwargs).model_dump(mode="json")
+            return super().regenerate_sentence_claims(**kwargs)
+
+    service = Service(settings=Settings(_env_file=None, paperlens_model_mode="live",
+        hy3_api_key="offline-placeholder", hy3_base_url="https://offline.invalid/v1", hy3_max_retries=0), client=client)
+    monkeypatch.setattr(runner, "Hy3Service", lambda: service)
+
+    def invoke(*, value=external, digest=None, output=None, freeze_only=False, mode="final", supplied=True):
+        argv = ["run_eval.py", "--mode", "calibrate" if diagnostic else mode]
+        if supplied:
+            path.write_text(json.dumps(value), encoding="utf-8")
+            approved_digest = digest or hashlib.sha256(path.read_bytes()).hexdigest()
+            argv += ["--scope-context-manifest", str(path), "--scope-context-sha256", approved_digest]
+        if freeze_only:
+            argv += ["--freeze-config"]
+        else:
+            argv += ["--confirm-cost", "--output", str(output or tmp_path / "results.jsonl")]
+        if diagnostic:
+            argv += ["--revision-diagnostic", "--diagnostic-id", "synthetic-scope-diagnostic"]
+        monkeypatch.setattr(sys, "argv", argv)
+        try:
+            return runner.main()
+        except SystemExit as exc:
+            return exc.code
+
+    return runner, external, client, invoke, freeze
+
+
+@pytest.mark.parametrize("diagnostic", [False, True])
+@pytest.mark.parametrize("unrelated", [False, True])
+def test_scope_context_manifest_cli_four_actual_dispatches(monkeypatch, tmp_path, diagnostic, unrelated):
+    runner, external, client, invoke, freeze = _scope_context_cli_setup(
+        monkeypatch, tmp_path, diagnostic=diagnostic, unrelated=unrelated)
+    if not diagnostic:
+        assert invoke(freeze_only=True) == 0, "SCOPE_MANIFEST_FREEZE_ENTRY_REQUIRED"
+    assert invoke() == 0, "SCOPE_MANIFEST_RUNTIME_ENTRY_REQUIRED"
+    assert len(client.sent) == (12 if diagnostic else 4)
+    contexts = []
+    for request in client.sent:
+        serialized = json.dumps(request, ensure_ascii=False)
+        assert all(marker not in serialized for marker in (
+            "approved-synthetic-review", '"quality_label"', '"paper_id"', '"case_id"',
+            "known_error", "material_sha256", "review_ref",
+        )), "REVIEW_OR_EVALUATION_METADATA_LEAK"
+        prompt = request["messages"][-1]["content"]
+        assert prompt.count("verified_scope_context: ") == 1
+        context, _ = json.JSONDecoder().raw_decode(prompt.split("verified_scope_context: ", 1)[1])
+        assert len(context) == 2, "NONEMPTY_REVIEWED_CONTEXT_REQUIRED"
+        assert all(c["applies_to_block_ids"] == ["entry-scope-result"] for c in context)
+        contexts.append(context)
+    assert all(c == contexts[0] for c in contexts), "FOUR_STEP_CONTEXT_DRIFT"
+    records = _read_jsonl(tmp_path / "results.jsonl")
+    assert all(r["provider_calls"] == 4 and r["usage"]["total_tokens"] == 560 for r in records)
+    original = (tmp_path / "results.jsonl").read_bytes()
+    assert all(marker not in original for marker in (
+        b"A reviewed sample study", b"The sampling frame", b"approved-synthetic-review",
+        b"offline-placeholder", b"offline.invalid", b"reviewed-links.json",
+    )), "SCOPE_MANIFEST_RESULT_PRIVACY"
+    reordered = copy.deepcopy(external)
+    reordered["entries"].reverse()
+    for entry in reordered["entries"]:
+        entry["links"].reverse()
+    assert invoke(value=reordered) == 0, "SEMANTICALLY_IDENTICAL_RESUME_MUST_SKIP"
+    assert len(client.sent) == len(records) * 4
+    assert (tmp_path / "results.jsonl").read_bytes() == original
+    changed = copy.deepcopy(external)
+    changed["entries"][0]["review_ref"] = "approved-synthetic-review-2"
+    assert invoke(value=changed) == 2, "REVIEW_BINDING_DRIFT_MUST_REFUSE"
+    assert invoke(supplied=False) == 2, "OMITTING_ASSOCIATIONS_MUST_NOT_REUSE_COMPLETE_SLOTS"
+    assert len(client.sent) == len(records) * 4
+    assert (tmp_path / "results.jsonl").read_bytes() == original
+
+
+@pytest.mark.parametrize("diagnostic", [False, True])
+@pytest.mark.parametrize("invalid", ["digest", "material", "target", "review", "position", "hash", "budget", "cross_target", "later_entry", "extra_text", "duplicate", "empty", "not_object"])
+def test_scope_context_manifest_cli_rejects_entire_invalid_manifest_before_calls(monkeypatch, tmp_path, diagnostic, invalid):
+    runner, external, client, invoke, _ = _scope_context_cli_setup(monkeypatch, tmp_path, diagnostic=diagnostic)
+    value = copy.deepcopy(external)
+    entry = value["entries"][0]
+    digest = None
+    if invalid == "digest":
+        digest = "0" * 64
+    elif invalid == "material":
+        entry["material_sha256"] = "0" * 64
+    elif invalid == "target":
+        entry["target_sentence_id"] = "entry-s1"
+    elif invalid == "review":
+        del entry["review_ref"]
+    elif invalid == "position":
+        entry["links"][0]["source"]["page_index"] = 1
+    elif invalid == "hash":
+        entry["links"][0]["source"]["sha256"] = "0" * 64
+    elif invalid == "budget":
+        paper = runner._load_live_manifest()["papers"][0]
+        paper["source_blocks"][0]["text"] = "Synthetic complete sampling definition. " * 24
+        for candidate in value["entries"]:
+            sources, bundle = runner.materialize_live_case(runner.load_mode_cases("final")[0])
+            candidate["material_sha256"] = runner._sha256_json({
+                "sources": [b.model_dump(mode="json") for b in sources], "bundle": bundle.model_dump(mode="json")})
+            anchor = candidate["links"][0]["source"]
+            anchor["end"] = len(sources[0].text)
+            anchor["sha256"] = hashlib.sha256(sources[0].text.encode()).hexdigest()
+    elif invalid == "cross_target":
+        entry["links"][0]["result"] = copy.deepcopy(entry["links"][1]["source"])
+    elif invalid == "later_entry":
+        value["entries"].append({**copy.deepcopy(entry), "case_id": "revision:unapproved:bad"})
+    elif invalid == "extra_text":
+        entry["review_text"] = "FORBIDDEN_FREE_TEXT"
+    elif invalid == "duplicate":
+        value["entries"].append(copy.deepcopy(entry))
+    elif invalid == "empty":
+        value["entries"] = []
+    else:
+        value = []
+    assert invoke(value=value, digest=digest, mode="calibrate") == 2
+    assert client.sent == [], "INVALID_ASSOCIATION_REACHED_CLIENT"
+    assert not (tmp_path / "results.jsonl").exists()
+    assert not (tmp_path / "results.jsonl.pending.jsonl").exists()
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_scope_context_manifest_calibrate_resume_drift_and_no_replay(monkeypatch, tmp_path, pending):
+    runner, external, client, invoke, _ = _scope_context_cli_setup(monkeypatch, tmp_path)
+    output = tmp_path / "results.jsonl"
+    if pending:
+        append = runner._append_jsonl
+        def interrupt_after_pending(path, record):
+            append(path, record)
+            if path == runner.pending_path_for(output):
+                raise KeyboardInterrupt()
+        monkeypatch.setattr(runner, "_append_jsonl", interrupt_after_pending)
+        with pytest.raises(KeyboardInterrupt):
+            invoke(mode="calibrate")
+        monkeypatch.setattr(runner, "_append_jsonl", append)
+    else:
+        assert invoke(mode="calibrate") == 0
+    calls = len(client.sent)
+    changed = copy.deepcopy(external)
+    changed["entries"][0]["links"].pop()
+    assert invoke(value=changed, mode="calibrate") == 2, "RESUME_ASSOCIATION_DRIFT_MUST_REFUSE"
+    assert len(client.sent) == calls
+    assert invoke(mode="calibrate") == 0
+    assert len(client.sent) == calls
+    if pending:
+        record = _read_jsonl(output)[0]
+        assert record["error_code"] == "RUN_INTERRUPTED" and record["provider_calls"] is None
+
+
+def test_scope_context_manifest_no_manifest_preserves_empty_context(monkeypatch, tmp_path):
+    _, _, client, invoke, _ = _scope_context_cli_setup(monkeypatch, tmp_path)
+    assert invoke(supplied=False, mode="calibrate") == 0
+    assert len(client.sent) == 4
+    for request in client.sent:
+        prompt = request["messages"][-1]["content"]
+        context, _ = json.JSONDecoder().raw_decode(prompt.split("verified_scope_context: ", 1)[1])
+        assert context == []
+    assert invoke(supplied=False, mode="calibrate") == 0
+    assert len(client.sent) == 4
+
+
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_scope_context_manifest_old_empty_records_cannot_gain_new_associations(monkeypatch, tmp_path, diagnostic):
+    _, _, client, invoke, _ = _scope_context_cli_setup(monkeypatch, tmp_path, diagnostic=diagnostic)
+    assert invoke(supplied=False, mode="calibrate") == 0
+    output = tmp_path / "results.jsonl"
+    original = output.read_bytes()
+    calls = len(client.sent)
+    assert invoke(mode="calibrate") == 2
+    assert output.read_bytes() == original and len(client.sent) == calls
+
+
+def test_scope_context_manifest_old_freeze_cannot_gain_new_associations(monkeypatch, tmp_path, capsys):
+    _, _, client, invoke, freeze = _scope_context_cli_setup(monkeypatch, tmp_path)
+    assert invoke(supplied=False, freeze_only=True) == 0
+    original = freeze.read_bytes()
+    assert "reviewed_scope_sha256" not in json.loads(original)
+    assert invoke() == 2
+    assert "CONFIG_DRIFT" in capsys.readouterr().out
+    assert invoke(freeze_only=True) == 2
+    assert freeze.read_bytes() == original and client.sent == []
+    assert not (tmp_path / "results.jsonl").exists()
+
+
+def test_scope_context_manifest_diagnostic_pending_drift_and_no_replay(monkeypatch, tmp_path):
+    runner, external, client, invoke, _ = _scope_context_cli_setup(monkeypatch, tmp_path, diagnostic=True)
+    output = tmp_path / "results.jsonl"
+    append = runner._append_jsonl
+    def interrupt_after_pending(path, record):
+        append(path, record)
+        if path == runner.pending_path_for(output):
+            raise KeyboardInterrupt()
+    monkeypatch.setattr(runner, "_append_jsonl", interrupt_after_pending)
+    with pytest.raises(KeyboardInterrupt):
+        invoke()
+    monkeypatch.setattr(runner, "_append_jsonl", append)
+    changed = copy.deepcopy(external)
+    changed["entries"][0]["review_ref"] = "approved-different-review"
+    assert invoke(value=changed) == 2
+    assert not output.exists()
+    assert invoke() == 2
+    record = _read_jsonl(output)[0]
+    assert record["status"] == "failed" and record["error_code"] == "RUN_INTERRUPTED"
+    assert record["provider_calls"] is None
+    assert invoke() == 2
+    assert client.sent == []
+
+
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_scope_context_manifest_current_material_drift_before_complete_skip(monkeypatch, tmp_path, diagnostic):
+    runner, _, client, invoke, _ = _scope_context_cli_setup(monkeypatch, tmp_path, diagnostic=diagnostic)
+    assert invoke(mode="calibrate") == 0
+    output = tmp_path / "results.jsonl"
+    original, calls = output.read_bytes(), len(client.sent)
+    runner._load_live_manifest()["papers"][0]["source_blocks"][0]["text"] += " Changed."
+    assert invoke(mode="calibrate") == 2
+    assert output.read_bytes() == original and len(client.sent) == calls
+
+
+@pytest.mark.parametrize("missing", ["--scope-context-manifest", "--scope-context-sha256"])
+def test_scope_context_manifest_requires_two_independent_cli_arguments(monkeypatch, tmp_path, missing):
+    runner, _, client, invoke, _ = _scope_context_cli_setup(monkeypatch, tmp_path)
+    assert invoke(digest="0" * 64, mode="calibrate") == 2
+    argv = list(sys.argv)
+    index = argv.index(missing)
+    del argv[index:index + 2]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert runner.main() == 2
+    assert client.sent == [] and not (tmp_path / "results.jsonl").exists()
+
+
+def test_scope_context_entry_prepares_nonempty_context_across_revision_steps(monkeypatch):
+    import eval.run_eval as runner
+
+    manifest, links = _scope_entry_manifest()
+    monkeypatch.setattr(runner, "_load_live_manifest", lambda: manifest)
+    case = EvaluationCase(
+        case_id="revision:synthetic-scope-entry:bad",
+        run_index=0,
+        payload={"case_group": "revision", "paper_id": "synthetic-scope-entry", "quality_label": "bad"},
+    )
+    service = _FakeLiveService()
+    result = runner.evaluate_live_case(
+        case,
+        hy3_service=service,
+        reviewed_scope_links=links,
+    )
+    assert result["provider_calls"] == 4
+    assert len(service.scope_contexts) == 4
+    assert all(context is service.scope_contexts[0] for context in service.scope_contexts)
+    payloads = [context.payload() for context in service.scope_contexts]
+    assert payloads[0] == payloads[1] == payloads[2] == payloads[3]
+    assert len(set(service.sent_scope_payloads)) == 1
+    assert payloads[0] and [item["block_id"] for item in payloads[0]] == [
+        "entry-scope-0", "entry-scope-1"
+    ]
+    assert all(item["applies_to_block_ids"] == ["entry-scope-result"] for item in payloads[0])
+
+
+def test_scope_context_entry_keeps_target_context_when_links_are_reordered_or_unreviewed(monkeypatch):
+    import eval.run_eval as runner
+
+    manifest, links = _scope_entry_manifest()
+    monkeypatch.setattr(runner, "_load_live_manifest", lambda: manifest)
+    case = EvaluationCase(
+        case_id="revision:synthetic-scope-entry:bad",
+        run_index=0,
+        payload={"case_group": "revision", "paper_id": "synthetic-scope-entry", "quality_label": "bad"},
+    )
+    first = _FakeLiveService()
+    second = _FakeLiveService()
+    third = _FakeLiveService()
+    runner.evaluate_live_case(case, hy3_service=first, reviewed_scope_links=links)
+    reordered = [dict(links[1]), dict(links[0])]
+    runner.evaluate_live_case(case, hy3_service=second, reviewed_scope_links=reordered)
+    assert first.scope_contexts[0].payload() == second.scope_contexts[0].payload()
+    unreviewed = [dict(reordered[0]), dict(reordered[1])]
+    for link in unreviewed:
+        link.pop("review_source")
+    runner.evaluate_live_case(case, hy3_service=third, reviewed_scope_links=unreviewed)
+    assert first.scope_contexts[0].payload() == first.scope_contexts[1].payload()
+    assert third.scope_contexts[0].payload() == []
+    assert first.scope_contexts[0].payload() != third.scope_contexts[0].payload()
+
+
+def test_scope_context_entry_fingerprint_tracks_prepared_context(monkeypatch):
+    import eval.run_eval as runner
+    from backend.app.audit_service import AuditService
+    from backend.app.hy3_service import PreparedScopeContext
+
+    manifest, links = _scope_entry_manifest()
+    monkeypatch.setattr(runner, "_load_live_manifest", lambda: manifest)
+    case = EvaluationCase(
+        case_id="revision:synthetic-scope-entry:bad",
+        run_index=0,
+        payload={"case_group": "revision", "paper_id": "synthetic-scope-entry", "quality_label": "bad"},
+    )
+    source_blocks, bundle = runner.materialize_live_case(case)
+    records, _ = AuditService().quick_check(bundle, source_blocks)
+    pairs = AuditService().semantic_pairs(bundle, records)
+    service = SimpleNamespace(
+        settings=SimpleNamespace(
+            hy3_model="hy3", hy3_base_url="https://offline.invalid/v1",
+            hy3_timeout_seconds=30, hy3_max_retries=2,
+        )
+    )
+    prepared = PreparedScopeContext.prepare(source_blocks, records, links)
+    reordered = PreparedScopeContext.prepare(source_blocks, records, list(reversed(links)))
+    _, empty_request = runner._context_input_hashes(
+        service, bundle.document, pairs, "entry-claim", "entry-scope-result",
+        source_blocks, PreparedScopeContext(),
+    )
+    _, prepared_request = runner._context_input_hashes(
+        service, bundle.document, pairs, "entry-claim", "entry-scope-result",
+        source_blocks, prepared,
+    )
+    _, reordered_request = runner._context_input_hashes(
+        service, bundle.document, pairs, "entry-claim", "entry-scope-result",
+        source_blocks, reordered,
+    )
+    assert prepared_request != empty_request
+    assert prepared_request == reordered_request
+
+
 class _NonTargetSevereIssueLiveService(_FakeLiveService):
-    def deep_audit(self, *, document, claim_evidence_pairs):
+    def deep_audit(self, *, document, claim_evidence_pairs, **_scope_kwargs):
         from backend.app.models import SemanticJudgment
 
         pairs = list(claim_evidence_pairs)
@@ -2795,7 +3337,7 @@ class _TargetSignalLiveService(_FakeLiveService):
         self.target_claim_id = target_claim_id
         self.signal = signal
 
-    def deep_audit(self, *, document, claim_evidence_pairs):
+    def deep_audit(self, *, document, claim_evidence_pairs, **_scope_kwargs):
         from backend.app.models import SemanticJudgment
 
         pairs = list(claim_evidence_pairs)
@@ -2834,7 +3376,7 @@ class _CapturingLiveService(_FakeLiveService):
         super().__init__()
         self.review_input = ""
 
-    def deep_audit(self, *, document, claim_evidence_pairs):
+    def deep_audit(self, *, document, claim_evidence_pairs, **_scope_kwargs):
         pairs = list(claim_evidence_pairs)
         self.review_input = json.dumps(
             {
@@ -3154,7 +3696,7 @@ def test_document_expression_contract_unknown_keeps_usage_and_failed_jsonl(tmp_p
     service = UnknownService()
     case = EvaluationCase(case_id="quality:synthetic:good", run_index=0,
         payload={"case_group": "quality", "paper_id": "synthetic", "quality_label": "good"})
-    versions = VersionInfo(model="hy3", prompt_version="audit-v7", schema_version="deep-audit-result-v3",
+    versions = VersionInfo(model="hy3", prompt_version="audit-v8", schema_version="deep-audit-result-v3",
         data_version="synthetic", code_version="synthetic")
     path, output = tmp_path / "results.jsonl", tmp_path / "report.md"
     run_cases(mode="calibrate", cases=[case], output_path=path, versions=versions,
@@ -3175,7 +3717,7 @@ def test_document_expression_contract_report_rejects_new_success_gaps(tmp_path, 
     import eval.build_report as report_module
     import eval.run_eval as runner
     record = _existing_result()
-    record.update(prompt_version="audit-v7", schema_version="deep-audit-result-v3")
+    record.update(prompt_version="audit-v8", schema_version="deep-audit-result-v3")
     record["metrics"] = {"evaluation_method_version": runner.EVALUATION_METHOD_VERSION,
         "expression_findings": [{"category": c, "status": "not_detected", "sentence_ids": []}
             for c in ("redundancy_or_off_topic", "unexplained_terminology")]}
@@ -3206,7 +3748,7 @@ def test_document_expression_contract_stability_requires_current_complete_method
     for record in records:
         if variant == "legacy" or (variant == "mixed" and record is records[0]):
             continue
-        record.update(prompt_version="audit-v7", schema_version="deep-audit-result-v3")
+        record.update(prompt_version="audit-v8", schema_version="deep-audit-result-v3")
         record["metrics"].update(evaluation_method_version=runner.EVALUATION_METHOD_VERSION,
             expression_findings=[{"category": c, "status": "not_detected", "sentence_ids": []}
                 for c in ("redundancy_or_off_topic", "unexplained_terminology")])
@@ -3329,7 +3871,7 @@ def test_attack_detection_attribution_contract_full_chain_pair_roles_and_usage_m
     monkeypatch.setattr(runner, "_load_live_manifest", lambda: {"attacks": [attack]})
 
     class LocalService(_TargetSignalLiveService):
-        def deep_audit(self, *, document, claim_evidence_pairs):
+        def deep_audit(self, *, document, claim_evidence_pairs, **_scope_kwargs):
             pairs = list(claim_evidence_pairs)
             self.captured = {
                 "document": document.model_dump(mode="json"),
@@ -3731,7 +4273,7 @@ def _three_diagnostic_setup(monkeypatch):
     inputs["case"] = cases[0]
     monkeypatch.setattr(runner, "revision_diagnostic_cases", lambda: cases)
     class ThreeSlotService(_SyntheticRevisionMetricsService):
-        def deep_audit(self, *, document, claim_evidence_pairs):
+        def deep_audit(self, *, document, claim_evidence_pairs, **_scope_kwargs):
             before = len(self.calls) % 4 == 0
             result = _FakeLiveService.deep_audit(self, document=document, claim_evidence_pairs=claim_evidence_pairs)
             result.semantic_judgments = self.inputs["before_result" if before else "after_result"].semantic_judgments
@@ -4236,7 +4778,7 @@ def test_revision_three_case_diagnostic_actual_client_same_call_capture(monkeypa
 
     client = Client()
     class Service(Hy3Service):
-        def deep_audit(self, *, document, claim_evidence_pairs):
+        def deep_audit(self, *, document, claim_evidence_pairs, **_scope_kwargs):
             result = _FakeLiveService().deep_audit(document=document, claim_evidence_pairs=claim_evidence_pairs)
             result.semantic_judgments = inputs["before_result" if client.calls == 0 else "after_result"].semantic_judgments
             client.response = result.model_dump(mode="json")
@@ -4456,7 +4998,7 @@ class _SyntheticRevisionMetricsService(_FakeLiveService):
         super().__init__()
         self.inputs = inputs
 
-    def deep_audit(self, *, document, claim_evidence_pairs):
+    def deep_audit(self, *, document, claim_evidence_pairs, **_scope_kwargs):
         first = not self.calls
         result = super().deep_audit(document=document, claim_evidence_pairs=claim_evidence_pairs)
         result.semantic_judgments = self.inputs["before_result" if first else "after_result"].semantic_judgments
@@ -4529,7 +5071,7 @@ def test_revision_metrics_fail_closed_failed_jsonl_cannot_complete_revision_gate
     assert records[-1]["error_code"] == "EVALUATION_FAILED"
     assert records[-1]["provider_calls"] == 4
     assert records[-1]["usage"] == {"prompt_tokens": 400, "completion_tokens": 160, "total_tokens": 560}
-    assert records[-1]["metrics"] == {"evaluation_method_version": "paperlens-stage7-method-v2"}
+    assert records[-1]["metrics"] == {"evaluation_method_version": "paperlens-stage7-method-v3"}
     summary = build_report(input_path=path, output_path=report_path)
     assert summary["revisions"]["completed"] == 4
     assert summary["status_counts"] == {"failed": 1, "succeeded": 4}
@@ -4657,7 +5199,7 @@ def test_revision_metrics_fail_closed_evidence_reanchor_jsonl_cannot_complete_ga
     records = _read_jsonl(path)
     failed = records[-1]
     assert (failed["status"], failed["error_code"], failed["metrics"]) == (
-        "failed", "EVALUATION_FAILED", {"evaluation_method_version": "paperlens-stage7-method-v2"})
+        "failed", "EVALUATION_FAILED", {"evaluation_method_version": "paperlens-stage7-method-v3"})
     assert failed["provider_calls"] == 4
     assert failed["usage"] == {"prompt_tokens": 400, "completion_tokens": 160, "total_tokens": 560}
     summary = build_report(input_path=path, output_path=output)
@@ -4736,7 +5278,7 @@ def test_freeze_configuration_records_manifest_and_model_contract_without_key(
     assert frozen["data_version"] == "paperlens-plos-abstracts-v1"
     assert len(frozen["manifest_sha256"]) == 64
     assert frozen["model"] == "hy3"
-    assert frozen["prompt_versions"]["deep_audit"] == "audit-v7"
+    assert frozen["prompt_versions"]["deep_audit"] == "audit-v8"
     assert frozen["schema_versions"]["deep_audit"] == "deep-audit-result-v3"
     assert frozen["overall_score_threshold"] == 75
     assert frozen["dimension_weights"]["factual_consistency"] == 0.20
@@ -4747,7 +5289,7 @@ def test_freeze_configuration_records_manifest_and_model_contract_without_key(
 def test_stage7_freeze_payload_tracks_audit_v7_with_expression_schema() -> None:
     payload = _freeze_payload()
 
-    assert payload["prompt_versions"]["deep_audit"] == "audit-v7"
+    assert payload["prompt_versions"]["deep_audit"] == "audit-v8"
     assert payload["schema_versions"]["deep_audit"] == "deep-audit-result-v3"
 
 
@@ -4765,7 +5307,7 @@ def test_stage7_freeze_rejects_previous_prompt_version_without_rewriting(
         runner.freeze_configuration(output_path=freeze_path)
     original_hash = hashlib.sha256(freeze_path.read_bytes()).hexdigest()
 
-    assert runner.DEEP_AUDIT_PROMPT_VERSION == "audit-v7"
+    assert runner.DEEP_AUDIT_PROMPT_VERSION == "audit-v8"
     with pytest.raises(ValueError, match="^CONFIG_DRIFT$"):
         runner._require_frozen_configuration()
 
