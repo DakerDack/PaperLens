@@ -1403,6 +1403,43 @@ C1 开发验证记录（非独立验收）：
 - `IMPLEMENTATION=COMPLETE`，`INDEPENDENT_ACCEPTANCE=PENDING`，`MODEL_EFFECTIVENESS=NOT_VERIFIED`；上述开放项不关闭。
 
 
+### 发布后 C2：普通表达显式条件前提（2026-09-11）
+
+基线 `e545e1b51cfe5531a724cd038eda0cf27f36fbdf`。本次唯一目标：在以下完整语法中，相同主体的条件文本不一致或仅一侧存在条件时，不仅凭方向词反向生成确定性方向冲突；不赋值 supports。
+
+四文件白名单：`docs/DEV_PLAN.md`、`backend/app/audit_service.py`、`backend/tests/test_audit_service.py`、`eval/test_eval.py`。固定 `AtomicClaim + SourceBlock[] → EvidenceRecord[]`，沿用 `COMPARISON_DIRECTION_MISMATCH`、`CRITICAL_DIRECTION_ERROR`、`INSUFFICIENT_EVIDENCE`；独立错误、否定规则、语义判断、评分与修订指标不变。
+
+语法穷举：`SUBJECT increased`、`SUBJECT decreased`、`SUBJECT increased under CONDITION conditions`、`SUBJECT decreased under CONDITION conditions`；可有一个末尾英文句号。SUBJECT/CONDITION 各为一个 ASCII 字母单词，折叠空白，语法关键字不分大小写，主体及条件大小写保留并精确比较。不得删词、拆对象指标、用 qualifiers 或相似度补足关系。只有双方完整匹配且主体相同，条件不同（包括单侧缺省）才抑制方向标记。条件相同或双方无条件保留原方向规则；主体不同或解析失败也回退原路径。C1 分支不改、不扩展。
+
+条件槽位大小写不敏感排除：`no` 为否定限定；`all/every/each` 为全称或逐一量化；`any/some` 为任指或存在量化；`either/neither/both` 为二选一、否定选择或双项量化。排除后整个句子无法由本规则解析，回退旧规则；不是修改既有否定处理。该集合只是明确语法排除，不是通用量化/否定解析。其他单词的词法匹配不证明其条件语义已确定。
+
+否定、模态、并列、多分句、多词主体或条件、程度修饰、额外标点及其他动词/时态不支持；必须 fullmatch 最终 quote。BM25 若选出单句则按该句判定，不重新选片段。条件文本不同只意味着对应关系未确定，不证明互斥。撤销这一有限范围内的确定性警报会漏掉条件同义、重叠或单侧遗漏但实际矛盾的情况，交由已有语义判断；模型效果未验证。其余旧路径误报/漏报仍开放。
+
+先补红测再最小实现；两条路径断言实际 quote、match_method、quote_verified、方向标记与派生硬失败。无召回单列，不能冒充覆盖分支。真实反转、量化否定拒绝、B/C1、独立错误、受控 insufficient 和混合配对契约保持。
+
+阶段回归明确沿用阶段 8 后端/评测全测及前端测试、构建、本地 Playwright；不重做 Live、评测 CLI、冻结或演示。精确命令：
+
+```powershell
+& 'D:\PaperLens\.venv313\Scripts\python.exe' -B -m pytest backend/tests/test_audit_service.py eval/test_eval.py -q -p no:cacheprovider -k "comparison_direction or revision_metrics_fail_closed"
+& 'D:\PaperLens\.venv313\Scripts\python.exe' -B -m pytest backend/tests eval/test_eval.py -q --tb=short -p no:cacheprovider
+Push-Location frontend
+npm.cmd run test -- --run
+npm.cmd run build
+.\node_modules\.bin\playwright.cmd test
+Pop-Location
+git diff --check
+git diff --name-only
+```
+
+九项历史保护 SHA256 必须前后一致；禁止 .env/秘密/私有证据读取、Live、真实 MinerU、旧样本和历史材料修改、归档目录修改、新依赖/接口/Schema、commit/push。模型效果未验证，历史 holdout-02=0/1 保持不变。卡 A、一般对象/指标对应、多分句、召回及不支持语法仍开放。完成后交独立验收，不自行宣布验收通过。
+
+
+C2 开发验证记录（非独立验收）：
+- 最终同一测试集在基线实现上 `51 failed, 176 passed, 638 deselected`，当前实现上 `227 passed, 638 deselected`；新增 96 项均由指定 focused 表达式选中。红测中 15 项为生产行为/消费断言失败，36 项为新增拒绝解析函数在基线不存在；不将后者冒充历史模型失败。
+- 后端/评测回归 `1327 passed, 1 skipped`；跳过真实 MinerU，另有既有 Starlette/httpx 弃用警告。前端 `74 passed`、构建成功（包体积提示）、项目本地 Playwright `6 passed`。受控语义响应及浏览器预设只验证机制。
+- 九项历史保护摘要与开工前及 task1_analysis.md 表一致；差异限定上述四文件，`git diff --check` 通过。未 commit/push，未运行 Live 或重新评测/冻结。
+- `IMPLEMENTATION=COMPLETE`，`INDEPENDENT_ACCEPTANCE=PENDING`，`MODEL_EFFECTIVENESS=NOT_VERIFIED`；历史 holdout-02=0/1，所有上述开放项保留。
+
 ## 9. AI 开发约束
 
 ### 9.1 每次任务开始前

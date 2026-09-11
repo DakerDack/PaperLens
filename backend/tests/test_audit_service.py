@@ -896,6 +896,136 @@ def test_comparison_direction_c1_hard_failure_consumption(reversed_relation):
         assert report.decision == Decision.UNQUALIFIED
 
 
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("subject,first,second", [("Accuracy", "warm", "cold"), ("Yield", "dry", "wet")])
+@pytest.mark.parametrize("kind", ["different", "same", "claim_only", "source_only", "same_direction_omission"])
+def test_comparison_direction_c2_condition_paths(fallback, subject, first, second, kind):
+    text = f"{subject} increased" + ("." if kind in {"source_only", "same_direction_omission"} else f" under {first} conditions.")
+    source = f"{subject} {'increased' if kind == 'same_direction_omission' else 'decreased'}" + (
+        "." if kind == "claim_only" else f" under {first if kind == 'same' else second} conditions.")
+    block = source_block("p01-b001", source)
+    claim = atomic_claim(text, candidate_block_ids=[block.block_id], candidate_quote=None if fallback else source)
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+    missing = fallback and kind in {"claim_only", "source_only"}
+    assert record.match_method == ("none" if missing else "bm25_fallback" if fallback else "model_candidate")
+    assert record.quote == (None if missing else source)
+    assert record.quote_verified is (not missing)
+    assert ("INSUFFICIENT_EVIDENCE" in record.rule_flags) is missing
+    conflict = kind == "same"
+    assert ("COMPARISON_DIRECTION_MISMATCH" in record.rule_flags) is conflict
+    from types import SimpleNamespace
+    hard = audit_module._rule_hard_failures(SimpleNamespace(claims=[claim]), [record])
+    assert ("CRITICAL_DIRECTION_ERROR:c-001" in hard) is conflict
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("word", ["no", "all", "any", "every", "some", "each", "either", "neither", "both"])
+@pytest.mark.parametrize("upper", [False, True])
+def test_comparison_direction_c2_excludes_quantified_conditions(fallback, word, upper):
+    word = word.upper() if upper else word
+    # Both sides retain the same negation presence so BM25 is eligible.
+    text = f"Accuracy increased under {word} conditions."
+    source = f"Accuracy decreased under {word} conditions."
+    block = source_block("p01-b001", source)
+    record = only_record(AuditService().verify_claim_evidence(
+        atomic_claim(text, candidate_block_ids=[block.block_id], candidate_quote=None if fallback else source), [block]))
+    assert record.match_method == ("bm25_fallback" if fallback else "model_candidate")
+    assert record.quote_verified and record.quote == source
+    assert "COMPARISON_DIRECTION_MISMATCH" in record.rule_flags
+    # Excluded words reject parsing rather than acting as ordinary labels.
+    assert audit_module._change_condition(text) is None
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("word", ["no", "all", "any", "every", "some", "each", "either", "neither", "both"])
+def test_comparison_direction_c2_quantified_vs_ordinary(fallback, word):
+    from types import SimpleNamespace
+    text = f"Accuracy increased under {word} conditions."
+    source = "Accuracy decreased under warm conditions."
+    block = source_block("p01-b001", source)
+    claim = atomic_claim(text, candidate_block_ids=[block.block_id], candidate_quote=None if fallback else source)
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+    missing = fallback and word in {"no", "neither"}
+    assert record.quote == (None if missing else source)
+    assert record.match_method == ("none" if missing else "bm25_fallback" if fallback else "model_candidate")
+    assert record.quote_verified is (not missing)
+    assert ("INSUFFICIENT_EVIDENCE" in record.rule_flags) is missing
+    assert ("COMPARISON_DIRECTION_MISMATCH" in record.rule_flags) is (not missing)
+    assert ("CRITICAL_DIRECTION_ERROR:c-001" in audit_module._rule_hard_failures(
+        SimpleNamespace(claims=[claim]), [record])) is (not missing)
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("text,source", [
+    ("Accuracy may have increased under warm conditions.", "Accuracy decreased under cold conditions."),
+    ("Accuracy increased under warm and dry conditions.", "Accuracy decreased under cold conditions."),
+    ("Accuracy increased under very warm conditions.", "Accuracy decreased under cold conditions."),
+    ("Accuracy increased under warm conditions.", "Latency decreased under cold conditions."),
+    ("Accuracy did not increase under warm conditions.", "Accuracy did not decrease under cold conditions."),
+    ("Accuracy increased under warm conditions.", "Accuracy decreased under cold conditions; accuracy was recorded."),
+])
+def test_comparison_direction_c2_fallback(fallback, text, source):
+    block = source_block("p01-b001", source)
+    record = only_record(AuditService().verify_claim_evidence(
+        atomic_claim(text, candidate_block_ids=[block.block_id], candidate_quote=None if fallback else source), [block]))
+    quote = source.split(" accuracy was")[0] if fallback and ";" in source else source
+    assert record.match_method == ("bm25_fallback" if fallback else "model_candidate")
+    assert record.quote_verified and record.quote == quote
+    assert "COMPARISON_DIRECTION_MISMATCH" in record.rule_flags
+    from types import SimpleNamespace
+    assert "CRITICAL_DIRECTION_ERROR:c-001" in audit_module._rule_hard_failures(SimpleNamespace(claims=[
+        atomic_claim(text, candidate_block_ids=[block.block_id], candidate_quote=source)]), [record])
+
+
+@pytest.mark.parametrize("same_condition", [False, True])
+@pytest.mark.parametrize("number_error", [False, True])
+def test_comparison_direction_c2_scoring_preserves_independent_errors(same_condition, number_error):
+    bundle = generated_bundle()
+    original = bundle.claims[0]
+    text = "Accuracy increased under warm conditions."
+    source = f"Accuracy decreased under {'warm' if same_condition else 'cold'} conditions."
+    block_id = original.candidate_block_ids[0]
+    bundle.claims[0] = original.model_copy(update={"text": text, "candidate_quote": source,
+        "numeric_entities": ["999"] if number_error else [], "qualifiers": []})
+    for section in bundle.document.sections:
+        for sentence in section.sentences:
+            if sentence.sentence_id == original.sentence_id:
+                sentence.text = text
+    blocks = [b.model_copy(update={"text": source}) if b.block_id == block_id else b for b in source_blocks_fixture()]
+    service = AuditService()
+    records, _ = service.quick_check(bundle, blocks)
+    record = only_record([r for r in records if r.claim_id == original.claim_id])
+    assert record.quote == source and record.quote_verified
+    assert record.match_method == "model_candidate"
+    assert ("COMPARISON_DIRECTION_MISMATCH" in record.rule_flags) is same_condition
+    assert ("NUMBER_MISMATCH:999" in record.rule_flags) is number_error
+    # Controlled semantic supports is not a provider-effectiveness claim.
+    result = RecordingDeepAudit().deep_audit(document=bundle.document,
+        claim_evidence_pairs=service.semantic_pairs(bundle, records))
+    report = service.score(bundle, records, result, compliance_context())
+    assert (f"CRITICAL_DIRECTION_ERROR:{original.claim_id}" in report.hard_failures) is same_condition
+    assert (f"CRITICAL_NUMBER_ERROR:{original.claim_id}" in report.hard_failures) is number_error
+    if same_condition or number_error:
+        assert report.decision == Decision.UNQUALIFIED
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_comparison_direction_c2_final_quote_boundary(fallback):
+    first = "Accuracy decreased under cold conditions."
+    source = first + " Calibration finished."
+    block = source_block("p01-b001", source)
+    claim = atomic_claim("Accuracy increased under warm conditions.",
+        candidate_block_ids=[block.block_id], candidate_quote=None if fallback else source)
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+    assert record.quote == (first if fallback else source)
+    assert record.match_method == ("bm25_fallback" if fallback else "model_candidate")
+    assert record.quote_verified
+    assert ("COMPARISON_DIRECTION_MISMATCH" in record.rule_flags) is (not fallback)
+    from types import SimpleNamespace
+    assert ("CRITICAL_DIRECTION_ERROR:c-001" in audit_module._rule_hard_failures(
+        SimpleNamespace(claims=[claim]), [record])) is (not fallback)
+
+
 @pytest.mark.parametrize("number_error", [False, True])
 def test_comparison_direction_absent_source_preserves_independent_hard_failures(
     number_error: bool,

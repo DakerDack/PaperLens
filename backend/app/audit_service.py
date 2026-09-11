@@ -1048,6 +1048,24 @@ def _explicit_comparison(text: str) -> tuple[str, str, str] | None:
     return (family, right, left) if op in {"lower", "slower"} else (family, left, right)
 
 
+def _change_condition(text: str) -> tuple[str, str | None] | None:
+    """C2 lexical boundary only; matching condition words proves no semantics."""
+    match = re.fullmatch(
+        r"([A-Za-z]+) (?i:increased|decreased)"
+        r"(?: (?i:under) ([A-Za-z]+) (?i:conditions))?\.?",
+        " ".join(text.split()),
+    )
+    if match is None:
+        return None
+    subject, condition = match.groups()
+    # Negation, quantification and choice are not ordinary condition labels.
+    if condition and condition.lower() in {
+        "no", "all", "any", "every", "some", "each", "either", "neither", "both",
+    }:
+        return None
+    return subject, condition
+
+
 def _claim_source_flags(claim: AtomicClaim, source_text: str) -> list[str]:
     source_numbers = _numbers(source_text)
     flags = [
@@ -1074,6 +1092,12 @@ def _claim_source_flags(claim: AtomicClaim, source_text: str) -> list[str]:
             claim_directions and source_directions
             and not claim_directions.issubset(source_directions)
         )
+    if direction_mismatch:
+        claim_change = _change_condition(claim.text)
+        source_change = _change_condition(source_text)
+        if (claim_change and source_change and claim_change[0] == source_change[0]
+                and claim_change[1] != source_change[1]):
+            direction_mismatch = False
     if direction_mismatch:
         flags.append("COMPARISON_DIRECTION_MISMATCH")
     return flags
