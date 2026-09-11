@@ -774,6 +774,128 @@ def test_negation_equivalence_bm25_fallback(
     assert "CANDIDATE_BLOCK_NOT_FOUND:p99-b999" in record.rule_flags
 
 
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("objects", [("A", "B"), ("X", "Y"), ('"Pump Alpha"', '"Pump Beta"')])
+@pytest.mark.parametrize("operators", [("higher", "lower"), ("faster", "slower")])
+@pytest.mark.parametrize("relation", ["equivalent", "reversed", "same_order_reversed"])
+def test_comparison_direction_c1_roles(fallback, objects, operators, relation):
+    left, right = objects
+    up, down = operators
+    source = f"{left} is {down if relation == 'reversed' else up} than {right}."
+    text = (f"{left} {down} than {right}." if relation == "same_order_reversed"
+            else f"{right} {down} than {left}.")
+    block = source_block("p01-b001", source)
+    claim = atomic_claim(text, candidate_block_ids=[block.block_id],
+                         candidate_quote=None if fallback else source)
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+    assert record.match_method == ("bm25_fallback" if fallback else "model_candidate")
+    assert record.quote_verified is True
+    assert record.quote == source
+    assert ("COMPARISON_DIRECTION_MISMATCH" in record.rule_flags) is (relation != "equivalent")
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("front_claim", [False, True])
+@pytest.mark.parametrize("up,down", [("higher", "lower"), ("faster", "slower")])
+def test_comparison_direction_c1_fronted(fallback, front_claim, up, down):
+    normal = f'"Pump Beta" is {down} than "Pump Alpha".'
+    front = f'Compared with "Pump Beta", "Pump Alpha" is {up}.'
+    text, source = (front, normal) if front_claim else (normal, front)
+    block = source_block("p01-b001", source)
+    record = only_record(AuditService().verify_claim_evidence(
+        atomic_claim(text, candidate_block_ids=[block.block_id],
+                     candidate_quote=None if fallback else source), [block]))
+    assert record.match_method == ("bm25_fallback" if fallback else "model_candidate")
+    assert record.quote_verified and record.quote == source
+    assert "COMPARISON_DIRECTION_MISMATCH" not in record.rule_flags
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("text,source,conflict", [
+    ('"Pump Beta" lower than "Pump Alpha".', '"Pump Gamma" higher than "Pump Alpha".', False),
+    ('"Pump Beta" lower than "Pump Alpha accuracy".', '"Pump Alpha latency" higher than "Pump Beta".', False),
+    ('"Pump Beta" lower than "Pump Alpha".', '"pump alpha" higher than "Pump Beta".', False),
+    ('"Pump Beta" lower than "Pump Alpha".', '"Pump Alpha" faster than "Pump Beta".', True),
+    ('"Pump Beta" lower than "Pump Alpha".', '"Pump Alpha" is much higher than "Pump Beta".', True),
+    ('"Pump Beta" lower than "Pump Alpha".', '"Pump Alpha" may be higher than "Pump Beta".', True),
+    ('"Pump Beta" lower than "Pump Alpha".', '"Pump Alpha" higher than "Pump Beta" under warm conditions.', True),
+    ('"Pump Beta" lower than "Pump Alpha".', '"Pump Alpha" higher.', True),
+    ('"Pump Beta" lower than "Pump Alpha".', 'Pump Alpha higher than Pump Beta.', True),
+    ('"Pump Alpha" lower than "Pump Alpha".', '"Pump Alpha" higher than "Pump Alpha".', True),
+    ('"Pump Beta" not lower than "Pump Alpha".', '"Pump Alpha" not higher than "Pump Beta".', True),
+    ('"Pump Beta" is much lower than "Pump Alpha".', '"Pump Alpha" higher than "Pump Beta".', True),
+    ('"Pump Beta" lower than "Pump Alpha".', '"Pump Alpha" higher than "Pump Beta" and "Pump Gamma" higher than "Pump Delta".', True),
+    ('"Pump Beta" lower than "Pump Alpha".', 'Compared with "Pump Beta", "Pump Alpha" higher.', False),
+    ('"Pump Beta" lower than "Pump Alpha".', '"Pump  Alpha" HIGHER than "Pump Beta".', False),
+
+])
+def test_comparison_direction_c1_boundaries(fallback, text, source, conflict):
+    block = source_block("p01-b001", source)
+    claim = atomic_claim(text, candidate_block_ids=[block.block_id],
+                         candidate_quote=None if fallback else source)
+    claim.qualifiers = ["Pump Alpha accuracy", "same object", "warm conditions"]
+    record = only_record(AuditService().verify_claim_evidence(claim, [block]))
+    assert record.match_method == ("bm25_fallback" if fallback else "model_candidate")
+    assert record.quote_verified and record.quote == source
+    assert ("COMPARISON_DIRECTION_MISMATCH" in record.rule_flags) is conflict
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("suffix", ["Calibration finished.", '"Pump Gamma" higher than "Pump Delta".'])
+def test_comparison_direction_c1_uses_final_quote_not_whole_block(fallback, suffix):
+    first = '"Pump Alpha" is higher than "Pump Beta".'
+    source = first + " " + suffix
+    block = source_block("p01-b001", source)
+    record = only_record(AuditService().verify_claim_evidence(
+        atomic_claim('"Pump Beta" is lower than "Pump Alpha".',
+                     candidate_block_ids=[block.block_id], candidate_quote=None if fallback else source), [block]))
+    assert record.match_method == ("bm25_fallback" if fallback else "model_candidate")
+    # The existing splitter separates before capitalized Calibration, but not
+    # before a double quote. Check the actual recall contract in both cases.
+    selected_single = fallback and suffix == "Calibration finished."
+    assert record.quote_verified and record.quote == (first if selected_single else source)
+    assert ("COMPARISON_DIRECTION_MISMATCH" in record.rule_flags) is (not selected_single)
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_comparison_direction_c1_no_recall_is_not_support(fallback):
+    block = source_block("p01-b001", "Interviews were recorded.")
+    record = only_record(AuditService().verify_claim_evidence(
+        atomic_claim("B lower than A.", candidate_block_ids=[block.block_id],
+                     candidate_quote=None if fallback else block.text), [block]))
+    assert record.match_method == ("none" if fallback else "model_candidate")
+    assert record.quote == (None if fallback else block.text)
+    assert record.quote_verified is (not fallback)
+    assert ("INSUFFICIENT_EVIDENCE" in record.rule_flags) is fallback
+    assert "COMPARISON_DIRECTION_MISMATCH" not in record.rule_flags
+
+
+@pytest.mark.parametrize("reversed_relation", [False, True])
+def test_comparison_direction_c1_hard_failure_consumption(reversed_relation):
+    bundle = generated_bundle()
+    original = bundle.claims[0]
+    text = '"Pump Beta" lower than "Pump Alpha".'
+    source = f'"Pump Alpha" {"lower" if reversed_relation else "higher"} than "Pump Beta".'
+    blocks = source_blocks_fixture()
+    block_id = original.candidate_block_ids[0]
+    bundle.claims[0] = original.model_copy(update={"text": text, "qualifiers": [],
+        "numeric_entities": [], "candidate_quote": source})
+    for section in bundle.document.sections:
+        for sentence in section.sentences:
+            if sentence.sentence_id == original.sentence_id:
+                sentence.text = text
+    blocks = [b.model_copy(update={"text": source}) if b.block_id == block_id else b for b in blocks]
+    service = AuditService()
+    records, _ = service.quick_check(bundle, blocks)
+    # Controlled supports cannot override a true deterministic reversal.
+    result = RecordingDeepAudit().deep_audit(document=bundle.document,
+        claim_evidence_pairs=service.semantic_pairs(bundle, records))
+    report = service.score(bundle, records, result, compliance_context())
+    assert (f"CRITICAL_DIRECTION_ERROR:{original.claim_id}" in report.hard_failures) is reversed_relation
+    if reversed_relation:
+        assert report.decision == Decision.UNQUALIFIED
+
+
 @pytest.mark.parametrize("number_error", [False, True])
 def test_comparison_direction_absent_source_preserves_independent_hard_failures(
     number_error: bool,

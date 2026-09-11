@@ -5017,6 +5017,41 @@ def test_revision_metrics_fail_closed_comparison_direction_absent_source(mixed_s
 
 
 @pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("mixed_support", [False, True])
+def test_revision_metrics_fail_closed_comparison_direction_c1(fallback, mixed_support):
+    import eval.run_eval as runner
+
+    text = '"Pump Beta" is lower than "Pump Alpha".'
+    quote = '"Pump Alpha" is higher than "Pump Beta".'
+    inputs, sources = _revision_metrics_fixture(after_a=text)
+    claim = inputs["after_bundle"].claims[0]
+    sources[0] = sources[0].model_copy(update={"text": quote})
+    claim.candidate_quote = None if fallback else quote
+    records = AuditService().verify_claim_evidence(claim, [sources[0]])
+    assert len(records) == 1
+    record = records[0]
+    assert record.match_method == ("bm25_fallback" if fallback else "model_candidate")
+    assert record.quote_verified and record.quote == quote
+    assert "COMPARISON_DIRECTION_MISMATCH" not in record.rule_flags
+    inputs["after_evidence"][0] = record
+    # Controlled responses exercise metrics only, not provider effectiveness.
+    payload = inputs["after_result"].model_dump(mode="json")
+    for judgment in payload["semantic_judgments"]:
+        if not mixed_support or judgment["claim_id"] == claim.claim_id:
+            judgment.update(relation="insufficient", severity="minor")
+    if mixed_support:
+        extra = sources[0].model_copy(update={"block_id": "extra-support", "text": text})
+        candidate = claim.model_copy(update={"candidate_block_ids": [extra.block_id], "candidate_quote": text})
+        inputs["after_evidence"].extend(AuditService().verify_claim_evidence(candidate, [extra]))
+        payload["semantic_judgments"].append({**payload["semantic_judgments"][0],
+            "block_id": extra.block_id, "relation": "supports", "severity": "none"})
+    inputs["after_result"] = DeepAuditResult.model_validate(payload)
+    metrics = runner._revision_metrics(**inputs)
+    assert metrics["resolved_issue_count"] == 0
+    assert metrics["error_resolution_rate"] == 0.0
+
+
+@pytest.mark.parametrize("fallback", [False, True])
 def test_revision_metrics_fail_closed_genuine_supported_repair_still_resolves(fallback):
     from backend.app.models import MatchMethod
     import eval.run_eval as runner

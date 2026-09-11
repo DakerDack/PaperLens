@@ -1026,6 +1026,28 @@ def _comparison_directions(text: str) -> set[str]:
     return directions
 
 
+def _explicit_comparison(text: str) -> tuple[str, str, str] | None:
+    """Parse only C1's symbol/quoted-label grammar; return high/fast then low/slow."""
+    text = " ".join(text.split())
+    label = r'(?:[A-Z][0-9]*|"[A-Za-z0-9_]+(?: [A-Za-z0-9_]+)*")'
+    operator = r"(?P<op>(?i:higher|lower|faster|slower))"
+    match = re.fullmatch(
+        rf"(?P<x>{label}) (?:(?i:is) )?{operator} (?i:than) (?P<y>{label})\.?", text,
+    )
+    if match is None:
+        match = re.fullmatch(
+            rf"(?i:compared with) (?P<y>{label}), (?P<x>{label}) (?:(?i:is) )?{operator}\.?", text,
+        )
+    if match is None:
+        return None
+    left, right = (match.group(key).strip('"') for key in ("x", "y"))
+    if left == right:
+        return None
+    op = match.group("op").lower()
+    family = "level" if op in {"higher", "lower"} else "speed"
+    return (family, right, left) if op in {"lower", "slower"} else (family, left, right)
+
+
 def _claim_source_flags(claim: AtomicClaim, source_text: str) -> list[str]:
     source_numbers = _numbers(source_text)
     flags = [
@@ -1040,9 +1062,19 @@ def _claim_source_flags(claim: AtomicClaim, source_text: str) -> list[str]:
     negation_source = _relevant_negation_fragment(claim.text, source_text)
     if _negation_mismatch(claim.text, negation_source):
         flags.append("NEGATION_MISMATCH")
-    claim_directions = _comparison_directions(claim.text)
-    source_directions = _comparison_directions(source_text)
-    if claim_directions and source_directions and not claim_directions.issubset(source_directions):
+    claim_relation = _explicit_comparison(claim.text)
+    source_relation = _explicit_comparison(source_text)
+    if claim_relation and source_relation and claim_relation[0] == source_relation[0]:
+        direction_mismatch = claim_relation[1:] == (source_relation[2], source_relation[1])
+    else:
+        # Outside C1's grammar, preserve the legacy rule and its known limits.
+        claim_directions = _comparison_directions(claim.text)
+        source_directions = _comparison_directions(source_text)
+        direction_mismatch = bool(
+            claim_directions and source_directions
+            and not claim_directions.issubset(source_directions)
+        )
+    if direction_mismatch:
         flags.append("COMPARISON_DIRECTION_MISMATCH")
     return flags
 

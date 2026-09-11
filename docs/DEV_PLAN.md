@@ -1354,6 +1354,55 @@ git diff --name-only
 - 状态：`IMPLEMENTATION=COMPLETE`；`INDEPENDENT_ACCEPTANCE=PENDING`；`OTHER_DIRECTION_DEFECTS=OPEN`；`MODEL_EFFECTIVENESS=NOT_VERIFIED`。交独立验收，不执行卡 A 或新 Live 实验。
 
 
+### 发布后原子返修 C1：有限显式双对象比较（2026-09-11）
+
+执行基线 `c40be7176257a60dc7d0fc2164e312c493531dd4`；用户已授权同一卡内登记契约、红测和最小实现。卡 B 的历史开发记录与已完成独立验收不改写。本次唯一目标：在以下封闭语法内正确区分等价对象交换和真正关系反转。
+
+允许最多四文件：`docs/DEV_PLAN.md`、`backend/app/audit_service.py`、`backend/tests/test_audit_service.py`、`eval/test_eval.py`。输入输出仍为 `AtomicClaim + SourceBlock[] → EvidenceRecord[]`；只使用现有 `COMPARISON_DIRECTION_MISMATCH`、`CRITICAL_DIRECTION_ERROR` 及 insufficient 处理。
+
+**支持语法（穷举）**：
+
+- 算子 `higher/lower` 属于 `level` 次序；`faster/slower` 属于 `speed` 次序。仅这四个算子；两种类型不能跨类型归一化，不承诺其他同义词。
+- 普通式：`X is OP than Y` 或 `X OP than Y`。
+- 基准前置式：`Compared with Y, X is OP` 或 `Compared with Y, X OP`。
+- 全句可有一个末尾英文句号；语法关键字不区分大小写；只做首尾去空白和连续空白折叠。
+- 对象只能是单个大写字母后跟零或多个数字（`[A-Z][0-9]*`，如 A、B、Q12），或双引号包围的显式对象标签。引号内部仅允许 ASCII 字母、数字、下划线及分隔词的空格，至少一个词；如 `"Pump Alpha"`、`"Sensor A accuracy"`。这是对象标签语法，不是自由名词短语识别。
+- 对象身份只去除界定标签的双引号并折叠空白，大小写保留。不删除指标、条件词、有意义修饰或词尾；不做同义、包含、相似度、大小写或 qualifiers 合并。引号内的词作为完整标签保留，不推导隐含条件或指标。
+
+**拒绝与分支边界**：否定、模态、条件、并列、多分句、省略对象、程度修饰、未支持词/标点或未加引号的多词名称均不能被完整语法消费。必须 fullmatch，不能从句中抽一段关系。quoted 标签之外多余的任何内容均拒绝。比较对象与自身相同也返回无法解析，不作为二元证明。
+
+只有 claim.text 与最终 EvidenceRecord.quote 都完整解析，且类型一致，才使用新分支：将 lower/slower 交换两端，得到从高/快端指向低/慢端的关系。同一对象对同向不标冲突，反向标冲突；明确不同对象对不标方向冲突，但绝不生成 supports。任一侧失败或类型不同，严格保留卡 B 后的旧方向词集合逻辑；它仍可能误报/漏报，不描述为已安全交由语义层。
+
+不能可靠区分未界定多词名称与修饰，因此本卡主动限制为符号和引号标签，不支持裸 `Sensor A` 等多词名词短语，不扩大 NLP 框架。多分句来源块经 BM25 选出单句时，必须按实际 quote 的语法判定，不按原块是否多句判定。
+
+**测试及成功门槛**：先红后绿；两个路径逐项断言 match_method、实际 quote、quote_verified 和方向标记；覆盖交换等价/反转、同序反转、名称替换、前置表达、对象对/类型不同、修饰与多分句拒绝、单侧失败、自比较和无召回。验证派生硬失败及独立数字错误；受控 insufficient 与混合配对仍不能计为修订解决，不宣称模型效果。已有正确对照不删除或放宽。
+
+```powershell
+& 'D:\PaperLens\.venv313\Scripts\python.exe' -B -m pytest backend/tests/test_audit_service.py eval/test_eval.py -q -p no:cacheprovider -k "comparison_direction or revision_metrics_fail_closed"
+& 'D:\PaperLens\.venv313\Scripts\python.exe' -B -m pytest backend/tests eval/test_eval.py -q --tb=short -p no:cacheprovider
+Push-Location frontend
+npm.cmd run test -- --run
+npm.cmd run build
+.\node_modules\.bin\playwright.cmd test
+Pop-Location
+git diff --check
+git diff --name-only
+```
+
+阶段回归明确沿用阶段 8 的前端测试/构建/本地 Playwright，以及上述后端评测全测；不运行评测 CLI、Live、真实 MinerU、重新冻结或演示。测试只允许本机回环，阻断外网和 .env 读取。九项历史保护文件前后 SHA256 相同，差异只限四文件；不修改归档目录，不新增依赖/模型/接口/抽象框架，不 commit/push。
+
+开放：卡 A、一般条件与对象对齐、多分句多指标、召回及不支持语法的旧路径缺陷。历史 holdout-02 保留 0/1；新实现模型效果未验证。实现验证完成后交独立验收，不自认验收完成。
+
+C1 开发验证记录（非独立验收）：
+
+- 同一最终测试集对原基线：`49 failed, 82 passed, 638 deselected`；对新实现：`131 passed, 638 deselected`。新增 86 项均被 focused 表达式选中，既有 45 项保持通过。
+- 初始红测 `45 failed, 74 passed`；补齐边界后曾有一项测试误以为句号后双引号会触发 BM25 分句。按实际召回修正精确 quote 断言，整段仍必须拒绝新解析；保留初始日志，再以相同最终测试集对原基线和新实现完成上述红绿对照。未修改召回，也未取消多关系拒绝断言。
+- 后端/评测回归 `1231 passed, 1 skipped`，跳过真实 MinerU；前端 `74 passed`，构建通过，本地 Playwright `6 passed`（预置接口）。保留依赖弃用、构建块大小等提示，不为提示升级依赖。
+- 项目解释器 `.venv313/Scripts/python.exe`，仓库外 sitecustomize 阻断外网及 .env，只允许回环；真实 MinerU 开关为 0。未进行供应商调用、模型效果实验、冻结、commit 或 push。
+- 交接末项核对四文件白名单、`git diff --check` 与九项历史 SHA256；完整 diff、红绿及回归日志保存在本次仓库外临时证据目录。
+- `IMPLEMENTATION=COMPLETE`，`INDEPENDENT_ACCEPTANCE=PENDING`，`MODEL_EFFECTIVENESS=NOT_VERIFIED`；上述开放项不关闭。
+
+
 ## 9. AI 开发约束
 
 ### 9.1 每次任务开始前
