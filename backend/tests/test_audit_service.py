@@ -774,6 +774,52 @@ def test_negation_equivalence_bm25_fallback(
     assert "CANDIDATE_BLOCK_NOT_FOUND:p99-b999" in record.rule_flags
 
 
+@pytest.mark.parametrize("number_error", [False, True])
+def test_comparison_direction_absent_source_preserves_independent_hard_failures(
+    number_error: bool,
+) -> None:
+    bundle = generated_bundle()
+    blocks = source_blocks_fixture()
+    original = bundle.claims[0]
+    block_id = original.candidate_block_ids[0]
+    evidence_text = "Accuracy was measured in 10 trials."
+    claim_text = f"Accuracy increased in {11 if number_error else 10} trials."
+    bundle.claims[0] = original.model_copy(update={
+        "text": claim_text, "numeric_entities": [], "qualifiers": [],
+        "candidate_quote": evidence_text,
+    })
+    for section in bundle.document.sections:
+        for sentence in section.sentences:
+            if sentence.sentence_id == original.sentence_id:
+                sentence.text = claim_text
+    blocks = [block.model_copy(update={"text": evidence_text})
+              if block.block_id == block_id else block for block in blocks]
+    service = AuditService()
+    records, _ = service.quick_check(bundle, blocks)
+    record = only_record([r for r in records if r.claim_id == original.claim_id])
+    assert record.quote_verified is True
+    assert "COMPARISON_DIRECTION_MISMATCH" not in record.rule_flags
+    assert ("NUMBER_MISMATCH:11" in record.rule_flags) is number_error
+
+    # Controlled semantic input tests scoring, not a real model judgment.
+    result = RecordingDeepAudit().deep_audit(
+        document=bundle.document,
+        claim_evidence_pairs=service.semantic_pairs(bundle, records),
+    )
+    payload = result.model_dump(mode="json")
+    for judgment in payload["semantic_judgments"]:
+        if judgment["claim_id"] == original.claim_id:
+            judgment.update(relation="insufficient", severity="minor")
+    result = DeepAuditResult.model_validate(payload)
+    report = service.score(bundle, records, result, compliance_context())
+    assert f"CRITICAL_DIRECTION_ERROR:{original.claim_id}" not in report.hard_failures
+    assert (f"CRITICAL_NUMBER_ERROR:{original.claim_id}" in report.hard_failures) is number_error
+    assert next(j for j in result.semantic_judgments
+                if j.claim_id == original.claim_id).relation.value == "insufficient"
+    if number_error:
+        assert report.decision == Decision.UNQUALIFIED
+
+
 def test_evidence_detects_comparison_direction_change() -> None:
     block = source_block("p01-b001", "Accuracy decreased relative to baseline.")
     claim = atomic_claim(

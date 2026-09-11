@@ -1311,6 +1311,49 @@ npx playwright test
 
 通过门槛：所有 P0 通过；P1 未完成项有明确说明；仓库没有密钥和私密全文；演示使用真实 Hy3 或明确标注的预置结果，不能把 Mock 冒充真实调用。
 
+### 发布后原子返修 B：来源无方向时不生成方向冲突（2026-09-11）
+
+本卡由用户在发布基线 `a097bf3c371539fedb7c884df661de2fc252330d` 上单独授权，是本次唯一执行任务。上文阶段入口、验收与实验结论保留为历史记录，不回写其状态。
+
+- 单一可观察目标：来源证据没有可识别方向信息时，不因主张含方向词生成 `COMPARISON_DIRECTION_MISMATCH`；证据不足仍保持不足，不自动视为支持。
+- 允许修改恰好四个文件：`docs/DEV_PLAN.md`、`backend/tests/test_audit_service.py`、`backend/app/audit_service.py`、`eval/test_eval.py`。
+- 固定输入输出：`AtomicClaim + SourceBlock[] → EvidenceRecord[]`，以 `backend/app/models.py` 为真源；不新增字段、错误码或接口。保留 `COMPARISON_DIRECTION_MISMATCH`、`CRITICAL_DIRECTION_ERROR` 及现有 `insufficient` 处理。
+- 最小实现：先补来源无方向的失败测试，再给现有方向冲突判断增加必要前提；不重写方向识别算法。
+- 必须验证：无方向来源不触发方向冲突及其派生硬失败，其他独立硬失败保留；真实反转与已有快慢同义改写继续通过；已验证引文不等于语义支持；去掉方向标记后，单独 insufficient 及混合 supports/insufficient 的目标配对仍不能计为修订解决。受控语义响应只验证代码机制，不是模型效果。
+- 禁止：改证据召回、语义判断、修订指标、评分门槛、Prompt；改旧 JSONL、报告、冻结、样本、标签、人工关联或验收记录；读 .env、密钥、私有证据；Live、真实 MinerU、重新评测/冻结；新依赖/API/Schema/数据库变更；无关重构、commit、push。不得修改归档工作区。
+- 保护摘要：执行前保存 `task1_analysis.md` 摘要表九项文件的 SHA256，结束时逐项比对；所有九项必须不变。
+- 状态门槛：实现及回归完成后交独立验收；独立验收在本卡开发执行中始终为待执行。新实现的模型效果未验证，不能用受控测试关闭历史失败。
+
+验证命令（仓库根目录；缺失环境只按现有 requirements.lock/package-lock.json 准备）：
+
+```powershell
+& .\.venv313\Scripts\python.exe -B -m pytest backend/tests/test_audit_service.py eval/test_eval.py -q -p no:cacheprovider -k "comparison_direction or revision_metrics_fail_closed"
+& .\.venv313\Scripts\python.exe -B -m pytest backend/tests eval/test_eval.py -q --tb=short -p no:cacheprovider
+Push-Location frontend
+npm.cmd run test -- --run
+npm.cmd run build
+.\node_modules\.bin\playwright.cmd test
+Pop-Location
+git diff --check
+git diff --name-only
+```
+
+本次阶段回归沿用阶段 8 的后端/评测全测、前端测试、构建与本地 Playwright；不运行评测 CLI，不重做实验、冻结或发布演示。新增测试名称必须由 focused 表达式选中并报告实际数量。
+
+**仍开放，不属于本卡：**不同对象、不同条件、对象交换及混合方向造成的误报/漏报；A 的比较信息遗漏未检出（不改 Prompt、不加关键词规则）。历史 `revision:holdout-02:bad` 的解决数继续保留 `0/1`，不推断新代码上的模型结果，也不声称本卡解决了整个历史修订链路。
+
+本卡开发验证记录（2026-09-11；不是独立验收）：
+
+- 工作分支：`codex/postrelease-b-direction-precondition`；HEAD 仍为上述发布基线，改动未提交。
+- 新建本副本 `.venv313` 并按 `requirements.lock` 安装，实际 freeze 与锁文件一致，`pip check` 通过；前端通过 `npm.cmd ci --no-audit --no-fund` 按锁文件安装。未借用或修改归档环境。
+- 生产实现仅增加 `source_directions` 非空前提；两个新增参数化测试共 4 项，均由指定 focused 表达式选中。既有反转及同义改写测试复用。
+- 红：`4 failed, 41 passed, 638 deselected`，新增 4 项均在无方向来源错误产生方向标记处失败；绿：`45 passed, 638 deselected`。
+- 后端/评测回归：`1145 passed, 1 skipped`；跳过真实 MinerU 集成。首次运行被临时测试保护钩子阻断 Windows asyncio 回环 socketpair，得到 `104 failed, 1041 passed, 1 skipped`；保留失败日志，仅允许回环地址后重跑相同命令通过，未改业务或测试以规避失败。测试进程通过仓库外 `sitecustomize` 阻断外网和 `.env` 读取，并设 `PAPERLENS_RUN_MINERU_INTEGRATION=0`。
+- 前端：`74 passed`；构建通过；项目本地 Playwright `6 passed`（预置接口）。保留依赖弃用、构建产物大小及颜色环境等提示，未为消除提示升级依赖。
+- 九项保护文件前后 SHA256 必须全部相同；`git diff --check` 和四文件白名单检查作为交接末项执行，原始日志与哈希清单保存于仓库外本次临时证据目录。
+- 状态：`IMPLEMENTATION=COMPLETE`；`INDEPENDENT_ACCEPTANCE=PENDING`；`OTHER_DIRECTION_DEFECTS=OPEN`；`MODEL_EFFECTIVENESS=NOT_VERIFIED`。交独立验收，不执行卡 A 或新 Live 实验。
+
+
 ## 9. AI 开发约束
 
 ### 9.1 每次任务开始前

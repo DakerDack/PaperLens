@@ -4977,6 +4977,45 @@ def test_revision_metrics_fail_closed_incomplete_target_coverage_is_not_resolved
     assert runner._revision_metrics(**inputs)["resolved_issue_count"] == 0
 
 
+@pytest.mark.parametrize("mixed_support", [False, True])
+def test_revision_metrics_fail_closed_comparison_direction_absent_source(mixed_support):
+    from backend.app.models import DeepAuditResult
+    import eval.run_eval as runner
+
+    inputs, sources = _revision_metrics_fixture(after_a="Sensor A measured higher values.")
+    claim = inputs["after_bundle"].claims[0]
+    record = inputs["after_evidence"][0]
+    assert record.quote_verified is True
+    assert record.rule_flags == []
+
+    # Explicit synthetic judgments: verified quotation is not semantic support.
+    payload = inputs["after_result"].model_dump(mode="json")
+    for judgment in payload["semantic_judgments"]:
+        if not mixed_support or judgment["claim_id"] == claim.claim_id:
+            judgment.update(relation="insufficient", severity="minor")
+    if mixed_support:
+        # The same target claim also has a supporting pair; the insufficient
+        # pair must not be dropped just because another source supports it.
+        supporting = sources[0].model_copy(update={
+            "block_id": "synthetic-supporting-block", "text": claim.text,
+        })
+        candidate = claim.model_copy(update={
+            "candidate_block_ids": [supporting.block_id], "candidate_quote": supporting.text,
+        })
+        inputs["after_evidence"].extend(AuditService().verify_claim_evidence(candidate, [supporting]))
+        payload["semantic_judgments"].append({
+            **payload["semantic_judgments"][0], "block_id": supporting.block_id,
+            "relation": "supports", "severity": "none",
+        })
+    inputs["after_result"] = DeepAuditResult.model_validate(payload)
+    assert all(r.quote_verified and not r.rule_flags for r in inputs["after_evidence"])
+    metrics = runner._revision_metrics(**inputs)
+    assert metrics["known_issue_count"] == 1
+    assert metrics["resolved_issue_count"] == 0
+    assert metrics["error_resolution_rate"] == 0.0
+    assert metrics["new_severe_error_count"] == 0
+
+
 @pytest.mark.parametrize("fallback", [False, True])
 def test_revision_metrics_fail_closed_genuine_supported_repair_still_resolves(fallback):
     from backend.app.models import MatchMethod

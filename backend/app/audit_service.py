@@ -1042,7 +1042,7 @@ def _claim_source_flags(claim: AtomicClaim, source_text: str) -> list[str]:
         flags.append("NEGATION_MISMATCH")
     claim_directions = _comparison_directions(claim.text)
     source_directions = _comparison_directions(source_text)
-    if claim_directions and not claim_directions.issubset(source_directions):
+    if claim_directions and source_directions and not claim_directions.issubset(source_directions):
         flags.append("COMPARISON_DIRECTION_MISMATCH")
     return flags
 
