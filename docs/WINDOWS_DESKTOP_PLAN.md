@@ -110,6 +110,7 @@ PDF.js worker、cMaps、standard_fonts、wasm 从已锁定 pdfjs-dist 收集到 
 | D1b | 文本入口绝不运行 MinerU | backend/app/document_service.py；backend/tests/test_document_service.py | F document_service |
 | D1c | 隔离环境可装入经审查的桌面依赖 | pyproject.toml；requirements-desktop.lock；.gitignore；docs/WINDOWS_DESKTOP_PLAN.md | 依赖安装、pip check、版本/许可记录 |
 | D1d | 双击原型打开现有工作台并正常退出 | backend/app/desktop.py；backend/tests/test_desktop.py；frontend/src/api.ts；frontend/src/api.test.ts | F desktop + UI API；原生窗口观察 |
+| D1e-a | 冻结资源定位与下载开关 | docs/WINDOWS_DESKTOP_PLAN.md；backend/app/desktop.py；backend/tests/test_desktop.py | F desktop；源码/模拟冻结、中文空格路径、不同 cwd、缺失资源及下载启用时序 |
 | D1e | 冻结原型可离线上传、渲染、导出 | desktop.spec；frontend/src/components/PdfPane.tsx；frontend/src/components/PdfPane.test.tsx；tools/build_desktop.ps1 | F desktop；UI PDF；B；原生 PDF/导出实测 |
 | D2a | 数据与资源分离，进程锁和退出可重复验证 | backend/app/desktop.py；backend/tests/test_desktop.py；backend/app/main.py；backend/tests/test_api.py | F desktop + api；并发启动/异常退出 |
 | D2b | 未授权本机访问与外域导航被拒绝 | backend/app/desktop.py；backend/tests/test_desktop.py；frontend/src/api.ts；frontend/src/api.test.ts | F desktop；UI API；原生导航攻击检查 |
@@ -244,3 +245,18 @@ pywebview 不装 Qt/CEF/GTK extra；没有安装 MinerU。移除 pywebview/pytho
 - [WebView2 分发](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution)：Evergreen 在线/离线分发与检测，不假定所有目标系统已安装。
 - [CredWriteW](https://learn.microsoft.com/en-us/windows/win32/api/wincred/nf-wincred-credwritew)、[CredReadW](https://learn.microsoft.com/en-us/windows/win32/api/wincred/nf-wincred-credreadw)：当前登录用户目标凭据读写与返回内存释放。
 - [pywebview 许可](https://github.com/r0x0r/pywebview/blob/master/LICENSE)、[PyInstaller 许可](https://pyinstaller.org/en/stable/license.html)、[Inno Setup](https://jrsoftware.org/isinfo.php) 及 [许可](https://jrsoftware.org/files/is/license.txt)：实际安装版本与传递依赖还须逐项归档。
+
+## D1e-a 拆卡登记
+
+独立方案审查已通过；基线 `c63cf20a249c3a5f8387f5e6a4072e4d32835275`（D1d PASS 后提交）。先执行 D1e-a，开发完成冻结交接；独立 PASS 后提交，再执行原 D1e。原 D1e 四文件白名单与真实冻结/PDF/保存/取消验收不变。
+
+D1e-a 仅修改本方案、`backend/app/desktop.py`、`backend/tests/test_desktop.py`。源码以前端对应的模块根定位；PyInstaller 冻结模式使用 `sys._MEIPASS/frontend/dist`；均不依赖 cwd。资源缺失沿用 `DESKTOP_RESOURCE_MISSING`，在创建窗口前显式启用 `ALLOW_DOWNLOADS`。业务接口、临时数据路径和其他生命周期行为保持。
+
+验证：
+```powershell
+.\.venv-desktop\Scripts\python.exe -B tools/desktop_verify.py --suite focused --tests backend/tests/test_desktop.py
+.\.venv-desktop\Scripts\python.exe -B tools/desktop_verify.py --suite backend
+git diff --check
+git status --short
+```
+模拟冻结路径及开关测试不代表实际 EXE 或下载成功。真实冻结包、PDF 渲染、保存及取消操作仍由原 D1e 验证。

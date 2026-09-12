@@ -25,6 +25,11 @@ class DesktopError(RuntimeError):
     pass
 
 
+def frontend_resources() -> Path:
+    root = Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2]
+    return root / "frontend/dist"
+
+
 def create_desktop_app(resources: Path, data_dir: Path):
     resources = resources.resolve()
     if not (resources / "index.html").is_file():
@@ -107,8 +112,9 @@ def main() -> int:
     code = None
     try:
         import webview
-        server = LocalServer(create_desktop_app(ROOT / "frontend/dist", data / "data"))
+        server = LocalServer(create_desktop_app(frontend_resources(), data / "data"))
         server.start()
+        webview.settings["ALLOW_DOWNLOADS"] = True
         webview.settings["ALLOW_FILE_URLS"] = False
         webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = False
         window = webview.create_window("PaperLens · 桌面原型 · MOCK", server.url,

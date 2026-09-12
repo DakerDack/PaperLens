@@ -72,6 +72,8 @@ def test_main_reports_cleanup_failure_without_masking_startup(
             return self
     window = SimpleNamespace(events=SimpleNamespace(before_show=Event()))
     webview = SimpleNamespace(settings={}, create_window=Mock(return_value=window), start=Mock())
+    downloads_at_creation = []
+    webview.create_window.side_effect = lambda *args, **kwargs: (downloads_at_creation.append(webview.settings.get('ALLOW_DOWNLOADS')), window)[1]
     dialog = Mock()
     monkeypatch.setitem(sys.modules, 'webview', webview)
     monkeypatch.setattr(desktop.os, 'environ', {})
@@ -83,10 +85,43 @@ def test_main_reports_cleanup_failure_without_masking_startup(
     monkeypatch.setattr(ctypes, 'windll', SimpleNamespace(user32=SimpleNamespace(MessageBoxW=dialog)))
 
     assert desktop.main() == (1 if expected else 0)
+    assert downloads_at_creation == ([] if startup_code else [True])
     server.stop.assert_called_once_with()
     assert webview.start.call_count == (0 if startup_code else 1)
     if expected:
         dialog.assert_called_once_with(None, f'桌面原型未能完成启动或退出：{expected}', 'PaperLens', 0x10)
     else:
         dialog.assert_not_called()
+
+
+@pytest.mark.parametrize('frozen', [False, True])
+@pytest.mark.parametrize('present', [False, True])
+def test_resource_location_ignores_cwd(monkeypatch, tmp_path, frozen, present):
+    from backend.app import desktop
+
+    source = tmp_path / '源码 space'
+    bundle = tmp_path / '冻结 space'
+    cwd = tmp_path / '另一个 cwd'
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(desktop, '__file__', str(source / 'backend/app/desktop.py'))
+    monkeypatch.setattr(desktop.sys, 'frozen', frozen, raising=False)
+    monkeypatch.setattr(desktop.sys, '_MEIPASS', str(bundle), raising=False)
+    expected = (bundle if frozen else source) / 'frontend/dist'
+    expected.mkdir(parents=True)
+    # A decoy under cwd must never be selected, even when the real index is absent.
+    (cwd / 'frontend/dist').mkdir(parents=True)
+    (cwd / 'frontend/dist/index.html').write_text('<head>decoy</head>')
+    if present:
+        (expected / 'index.html').write_text('<head>synthetic</head>')
+    assert desktop.frontend_resources() == expected
+    if present:
+        app = desktop.create_desktop_app(desktop.frontend_resources(), tmp_path / 'data')
+        with TestClient(app) as client:
+            assert 'synthetic' in client.get('/').text
+            assert 'decoy' not in client.get('/').text
+    else:
+        with pytest.raises(desktop.DesktopError, match='^DESKTOP_RESOURCE_MISSING$'):
+            desktop.create_desktop_app(desktop.frontend_resources(), tmp_path / 'data')
+        assert not (tmp_path / 'data').exists()
 
