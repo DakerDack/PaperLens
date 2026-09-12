@@ -1281,7 +1281,7 @@ def test_deep_audit_prompt_centralizes_v2_document_contract() -> None:
         )
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v8"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v9"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v3"
     assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v3"
     assert "逐条判断" in prompt
@@ -1306,7 +1306,7 @@ def test_deep_audit_prompt_defines_non_hedging_semantic_contract() -> None:
         ),
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v8"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v9"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v3"
     assert "relation=supports：仅当 evidence 直接蕴含 claim 的全部实质事实时选择。" in prompt
     assert "relation=contradicts：当数字、方向、因果、比较或结论冲突时选择。" in prompt
@@ -1360,7 +1360,7 @@ def test_deep_audit_prompt_closes_severity_decision_contract() -> None:
         ),
     )
 
-    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v8"
+    assert DEEP_AUDIT_PROMPT_VERSION == "audit-v9"
     assert DEEP_AUDIT_SCHEMA_VERSION == "deep-audit-result-v3"
     assert DEEP_AUDIT_SCHEMA_NAME == "paperlens_deep_audit_result_v3"
     assert (
@@ -2048,7 +2048,7 @@ def test_live_deep_audit_schema_error_retries_and_logs_safely(caplog) -> None:
     retry_prompt = client.completions.calls[1]["messages"][1]["content"]
     assert retry_prompt.count("字段错误摘要：") == 1
     assert invalid not in retry_prompt
-    assert "prompt_version=audit-v8" in caplog.text
+    assert "prompt_version=audit-v9" in caplog.text
     assert "schema_version=deep-audit-result-v3" in caplog.text
     assert "retries=1" in caplog.text
     assert invalid not in caplog.text
@@ -4815,3 +4815,13 @@ def test_sentence_claim_regeneration_live_failure_never_loads_mock(
     assert exc_info.value.error_code == "HY3_UNAVAILABLE"
     assert exc_info.value.retryable is True
     assert len(client.completions.calls) == 1
+
+
+def test_deep_audit_prompt_matches_accepted_card_a_candidate():
+    import hashlib
+    from backend.app.prompts import DEEP_AUDIT_USER_PROMPT_TEMPLATE
+
+    # Bind production text to the candidate used in the accepted diagnostic.
+    assert hashlib.sha256(DEEP_AUDIT_USER_PROMPT_TEMPLATE.encode("utf-8")).hexdigest() == (
+        "49d0cb80f4f1478502bb78f16170ac052390a425a623ee67fb02f93e9ac4a265"
+    )

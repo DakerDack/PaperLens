@@ -5382,7 +5382,7 @@ def test_freeze_configuration_records_manifest_and_model_contract_without_key(
     assert frozen["data_version"] == "paperlens-plos-abstracts-v1"
     assert len(frozen["manifest_sha256"]) == 64
     assert frozen["model"] == "hy3"
-    assert frozen["prompt_versions"]["deep_audit"] == "audit-v8"
+    assert frozen["prompt_versions"]["deep_audit"] == "audit-v9"
     assert frozen["schema_versions"]["deep_audit"] == "deep-audit-result-v3"
     assert frozen["overall_score_threshold"] == 75
     assert frozen["dimension_weights"]["factual_consistency"] == 0.20
@@ -5393,7 +5393,7 @@ def test_freeze_configuration_records_manifest_and_model_contract_without_key(
 def test_stage7_freeze_payload_tracks_audit_v7_with_expression_schema() -> None:
     payload = _freeze_payload()
 
-    assert payload["prompt_versions"]["deep_audit"] == "audit-v8"
+    assert payload["prompt_versions"]["deep_audit"] == "audit-v9"
     assert payload["schema_versions"]["deep_audit"] == "deep-audit-result-v3"
 
 
@@ -5411,7 +5411,7 @@ def test_stage7_freeze_rejects_previous_prompt_version_without_rewriting(
         runner.freeze_configuration(output_path=freeze_path)
     original_hash = hashlib.sha256(freeze_path.read_bytes()).hexdigest()
 
-    assert runner.DEEP_AUDIT_PROMPT_VERSION == "audit-v8"
+    assert runner.DEEP_AUDIT_PROMPT_VERSION == "audit-v9"
     with pytest.raises(ValueError, match="^CONFIG_DRIFT$"):
         runner._require_frozen_configuration()
 

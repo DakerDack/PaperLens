@@ -1440,6 +1440,24 @@ C2 开发验证记录（非独立验收）：
 - 九项历史保护摘要与开工前及 task1_analysis.md 表一致；差异限定上述四文件，`git diff --check` 通过。未 commit/push，未运行 Live 或重新评测/冻结。
 - `IMPLEMENTATION=COMPLETE`，`INDEPENDENT_ACCEPTANCE=PENDING`，`MODEL_EFFECTIVENESS=NOT_VERIFIED`；历史 holdout-02=0/1，所有上述开放项保留。
 
+### 发布后卡 A：候选落地与交付（2026-09-12）
+
+- 目标：将已通过定向及新边界诊断的唯一候选落入生产，标记 audit-v9，并完成发布回归。
+- 白名单：backend/app/prompts.py、backend/tests/test_hy3_service.py、eval/test_eval.py、docs/DEV_PLAN.md。
+- 固定契约：Schema、输入输出、错误码、评分、确定性规则不变；不调用 Live/MinerU，不改历史冻结与结果。
+- 验证：先运行 Prompt/冻结 focused 红绿测试，再运行 backend/tests 与 eval/test_eval.py 全量；前端 Vitest、build、Playwright；git diff --check。
+- 实施状态：完成；采用候选并发布 audit-v9。生产模板 SHA256：`49d0cb80f4f1478502bb78f16170ac052390a425a623ee67fb02f93e9ac4a265`，与诊断候选一致。
+- 实际回归：相同 focused 红测 7 failed / 14 passed，绿测 21 passed；后端/评测 1328 passed / 1 skipped（真实 MinerU）；前端 74 passed、构建成功、预置接口 Playwright 6 passed。现有依赖弃用及构建包体积提示保留，未升级依赖。
+- 本地复现（仓库根目录、禁用 .env 与外网的测试环境）：
+  - `.\.venv313\Scripts\python.exe -B -m pytest backend/tests/test_hy3_service.py eval/test_eval.py -q -p no:cacheprovider -k "deep_audit_prompt or freeze_configuration_records or stage7_freeze_payload or stage7_freeze_rejects_previous"`
+  - `.\.venv313\Scripts\python.exe -B -m pytest backend/tests eval/test_eval.py -q --tb=short -p no:cacheprovider`
+  - frontend 目录：`npm run test -- --run`、`npm run build`、`npx --no-install playwright test`。
+- 已接受实验汇总：定向两臂 72 槽，baseline 34/36、candidate 36/36；新边界两臂 54 槽，baseline 26/27、candidate 27/27。两批均首次有效、无重试，候选未增加负对照误报。新边界三项歧义样本未发送、未计分。这是有限人工构造配对的诊断证据，不是端到端或泛化证明；本次落地未追加模型调用。
+- 诊断日志 SHA256：72 槽 `e132475109e4253b7b4c630b22f8fe949fc05897da5f0af97f3e4a71b78a035a`；54 槽 `8676761ee47faf1e7f0101c8e417eeb96660e18b74c44360d6ae311dcc28087d`。原始脱敏日志留存本机，未作为公开仓库文件上传。
+- 历史九项 SHA256 与原表一致；旧 audit-v8 冻结、结果和 holdout-02 0/1 保持不变，不能用新版本结果覆盖历史成绩。
+- 交付包含 B/C1/C2 及本卡 A。已知限制：C3 一般对象/指标对应、多分句、召回与不支持语法的旧规则误报/漏报仍开放；模型输出需人工复核。真实 MinerU 本轮未验证，预置接口端到端测试不代表真实供应商效果。
+- 用户已授权完成回归后提交并推送 GitHub；不追加研究实验。
+
 ## 9. AI 开发约束
 
 ### 9.1 每次任务开始前

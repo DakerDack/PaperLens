@@ -17,7 +17,7 @@ def render_scope_context(context: list[dict]) -> str:
     )
 GENERATION_SCHEMA_VERSION = "generated-bundle-v1"
 GENERATION_SCHEMA_NAME = "paperlens_generated_bundle_v1"
-DEEP_AUDIT_PROMPT_VERSION = "audit-v8"
+DEEP_AUDIT_PROMPT_VERSION = "audit-v9"
 DEEP_AUDIT_SCHEMA_VERSION = "deep-audit-result-v3"
 DEEP_AUDIT_SCHEMA_NAME = "paperlens_deep_audit_result_v3"
 REVISION_PROMPT_VERSION = "revision-v3"
@@ -98,6 +98,7 @@ DEEP_AUDIT_USER_PROMPT_TEMPLATE = """任务一：逐条判断 claim 是否被给
 逐项检查顺序：
 1. 先判断 claim 中保留的事实是否被 evidence 支持；再独立检查相关边界或精度是否丢失。
 2. 只核对与当前断言的同一对象、谓词、结果或比较关系直接相关的数值精度和比较基准。数值精度遗漏包括相关数量或效应量的精确程度丢失；比较基准遗漏包括相对对象或参照条件丢失。不得把 evidence 中出现但 claim 未重复的所有数字、条件都判为遗漏。
+比较关系仍存在不等于比较对象完整；higher、longer 等方向词本身不能确定参照对象。若明确比较对象只能从 evidence 补入、无法从 claim 自身唯一恢复，应单独报告该必要比较边界损失，事实支持与严重度仍按现有规则分别判断。若 claim 自身已通过等价表达或指向明确先行对象的指代唯一确定参照，则不因省略比较连接词或未重复背景而判 expanded。
 3. 核心事实仍被支持，且相关精度或比较边界仅有局部损失、未实质改变主张理解时，可以使用 relation=supports + scope_status=expanded + severity=minor。不得仅因省略细节就自动判 contradicts、insufficient、major、critical。
 保留完整边界的同义改述、语序变化或合法简写不应误报；与当前断言无关的背景事实可以省略。
 真正的数值错误、方向反转、因果改变仍按事实与严重度契约处理，不得统一降为 minor。
