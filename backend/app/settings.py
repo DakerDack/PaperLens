@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 from typing import Literal
 
 from pydantic import Field, field_validator
@@ -30,6 +31,23 @@ class Settings(BaseSettings):
     hy3_api_key: str = ""
     hy3_timeout_seconds: int = Field(default=120, ge=10, le=600)
     hy3_max_retries: int = Field(default=2, ge=0, le=2)
+
+    def __init__(self, **values):
+        # DotEnvSettingsSource reads during construction, before source selection.
+        if os.environ.get("PAPERLENS_DESKTOP") == "1":
+            values["_env_file"] = None
+            values["_secrets_dir"] = None
+            values["_cli_parse_args"] = False
+        super().__init__(**values)
+
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings,
+        file_secret_settings,
+    ):
+        if os.environ.get("PAPERLENS_DESKTOP") == "1":
+            return (init_settings,)
+        return (init_settings, env_settings, dotenv_settings, file_secret_settings)
 
     @field_validator("paperlens_data_dir")
     @classmethod
