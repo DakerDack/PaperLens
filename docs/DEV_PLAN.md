@@ -1458,6 +1458,18 @@ C2 开发验证记录（非独立验收）：
 - 交付包含 B/C1/C2 及本卡 A。已知限制：C3 一般对象/指标对应、多分句、召回与不支持语法的旧规则误报/漏报仍开放；模型输出需人工复核。真实 MinerU 本轮未验证，预置接口端到端测试不代表真实供应商效果。
 - 用户已授权完成回归后提交并推送 GitHub；不追加研究实验。
 
+### Windows 桌面阶段 D0–D5（2026-09-12）
+
+本阶段由用户明确授权，工作区固定为 `D:\PaperLens`，开发分支为 `codex/windows-desktop`；不修改历史工作区。当前唯一执行卡为 **D0：现状核查和具体方案**。桌面授权仅在本节及 [WINDOWS_DESKTOP_PLAN.md](WINDOWS_DESKTOP_PLAN.md) 定义的范围覆盖旧版浏览器交付限制，不改变历史实验、业务 Prompt、Schema、评分及规则。
+
+- D0 唯一目标：形成可由独立验收会话决定 PASS/FAIL 的桌面方案。
+- D0 白名单：`docs/DEV_PLAN.md`、`docs/WINDOWS_DESKTOP_PLAN.md`、`docs/WINDOWS_DESKTOP_D0_HANDOFF.md`。
+- 固定契约：本卡不改变运行时输入输出或错误码；后续桌面控制契约须按方案逐卡落实，业务契约原样保留。
+- 验证：仓库根目录执行 `git diff --check`、`git diff --stat`、`git status --short`；逐项审查方案覆盖、来源、拆卡白名单和验证命令。文档卡不制造无意义红测，也不运行可能读取真实 `.env` 的业务测试。
+- D0 状态：`DEVELOPMENT=COMPLETE`，`INDEPENDENT_ACCEPTANCE=PENDING`，`DESKTOP_COMPATIBILITY=NOT_VERIFIED`。
+- D0 PASS 后方可提交 D0 并执行 D1a；每张子卡独立 PASS 后提交，才能进入下一卡。验收期间开发停止修改共享工作区，Git 写操作仅由开发执行。
+- 用户选择手动转发交接单；当前工具不提供跨任务通信，不声称已通知。范围内方案经独立验收通过后无须用户重复批准；真实付费调用、读取旧凭据/私有论文、真实 MinerU、合并 main、公开 Release、删除用户数据及强推仍不授权。
+
 ## 9. AI 开发约束
 
 ### 9.1 每次任务开始前
