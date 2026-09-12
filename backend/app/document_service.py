@@ -70,11 +70,16 @@ class DocumentService:
         self,
         settings: Settings | None = None,
         temp_root: Path | None = None,
+        *,
+        text_only: bool = False,
     ) -> None:
         self.settings = settings or app_settings
         self.temp_root = Path(temp_root) if temp_root is not None else None
+        self.text_only = text_only
 
     def parse(self, pdf_path: Path) -> ParseResult:
+        if self.text_only:
+            return self.parse_with_pdfplumber(pdf_path)
         try:
             return self.parse_with_mineru(pdf_path)
         except _MinerUUnavailable:

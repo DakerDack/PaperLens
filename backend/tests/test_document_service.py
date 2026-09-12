@@ -17,6 +17,38 @@ from backend.app.settings import Settings
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+@pytest.mark.parametrize(
+    ("filename", "error_code"),
+    [
+        ("simple_2page.pdf", None),
+        ("corrupt.pdf", "PDF_INVALID"),
+        ("scanned_1page.pdf", "PARSE_QUALITY_LOW"),
+        ("missing-synthetic.pdf", "PDF_INVALID"),
+    ],
+)
+def test_text_only_parse_never_probes_mineru(monkeypatch, filename, error_code):
+    def forbidden(*args, **kwargs):
+        pytest.fail("text-only parsing must not probe or invoke MinerU")
+
+    monkeypatch.setattr(DocumentService, "parse_with_mineru", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    service = DocumentService(text_only=True)
+    if error_code is not None:
+        with pytest.raises(DocumentParseError) as raised:
+            service.parse(FIXTURES / filename)
+        assert raised.value.error_code == error_code
+        assert raised.value.retryable is False
+        return
+
+    result = service.parse(FIXTURES / filename)
+    assert result == DocumentService().parse_with_pdfplumber(FIXTURES / filename)
+    assert [b.page_index for b in result.blocks] == [0, 1]
+    assert [b.block_id for b in result.blocks] == ["p01-b001", "p02-b001"]
+    assert all(b.parser.value == "pdfplumber" and b.bbox is None for b in result.blocks)
+    assert result.quality.page_count == 2
+    assert "PaperLens fixture - page one" in result.blocks[0].text
+
+
 def test_settings_default_to_project_local_mineru(monkeypatch) -> None:
     monkeypatch.delenv("MINERU_COMMAND", raising=False)
     project_root = FIXTURES.parents[2]
