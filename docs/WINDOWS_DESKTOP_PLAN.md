@@ -187,6 +187,54 @@ D0 审查通过只是方案门槛；D1 必须完成原生窗口＋冻结兼容�
 
 每卡开发完冻结工作区，将卡号/基线/差异/日志/验收步骤交独立验收会话。当前无通信工具，用户已选择手工转发，无第三会话；PASS 后开发提交并记录哈希再推进。FAIL 只返修当前卡。全部通过后推送 `codex/windows-desktop` 并创建指向 main 的 PR，交安装包绝对路径和 SHA256；不 merge、不公开 Release。安装包外部分发位置若尚未有可用授权存储，在最终阶段与用户确认；本地交付路径必须真实存在。
 
+## D1c 开发记录（2026-09-12，待独立验收）
+
+基线 `18ac7657c4d13fdb84dcd9b5b96fc10badc418e2`（D1b 已独立 PASS 后提交）。本卡四文件：`pyproject.toml`、`requirements-desktop.lock`、`.gitignore`、本方案。D1c 完成依赖安装/导入验证，尚未提交；不启动 D1d。
+
+独立 `.venv-desktop` 使用 Python 3.13.3 x64。业务依赖沿用旧 `requirements.lock` 的全部固定版本，无业务依赖升级。新增 `desktop` optional extra 固定 `pywebview==6.2.1`（仅 win32），PyInstaller 是构建工具，只进入桌面完整锁，不加入产品普通运行依赖。`.gitignore` 仅补充根 build/dist 产物规则，原 `.venv*/` 已覆盖隔离环境。
+
+实际安装命令及复核（仓库根目录）：
+
+```powershell
+.\.venv313\Scripts\python.exe -m venv .venv-desktop
+.\.venv-desktop\Scripts\python.exe -m pip --isolated install --index-url https://pypi.org/simple -c requirements.lock -e ".[dev,desktop]" pyinstaller --report .venv-desktop/install-report.json
+.\.venv-desktop\Scripts\python.exe -m pip check
+.\.venv-desktop\Scripts\python.exe -m pip freeze --exclude-editable
+.\.venv-desktop\Scripts\python.exe -B tools/desktop_verify.py --suite focused --tests backend/tests/test_settings.py backend/tests/test_desktop_verify.py backend/tests/test_document_service.py
+.\.venv-desktop\Scripts\python.exe -B tools/desktop_verify.py --suite backend
+.\.venv-desktop\Scripts\python.exe -B tools/desktop_verify.py --suite frontend
+```
+
+候选解析后再固定 pywebview 版本，使用 `pip --isolated install --no-index --no-deps --no-build-isolation -e ".[dev,desktop]"` 刷新 editable 元数据。`requirements-desktop.lock` 是实际 freeze 的 51 项精确版本，UTF-8 无 BOM，无 editable、URL、Key 或本机路径；其中包括开发/构建依赖，不能将整环境直接作为包资源递归收集。锁文件 SHA256：`7951FC16140256440ED56CE3E11A0DCF5F197CE809427C69D1CDCD4AA2186E5A`。实际 freeze 与锁逐字匹配，旧业务 pins 全部相同。重建命令为新 venv 内 `pip --isolated install --index-url https://pypi.org/simple -r requirements-desktop.lock`，然后 `pip --isolated install --no-index --no-deps --no-build-isolation -e .`；本卡完成第一次独立安装，没有把该重建命令描述为第二次干净安装实测。
+
+新增项的实际许可核查：
+
+| 包 | 固定版本 | 许可及用途 |
+|---|---|---|
+| pywebview | 6.2.1 | BSD-3-Clause，窗口容器；现有栈无法替代原生宿主 |
+| pythonnet | 3.1.0 | MIT，Windows CLR 桥；其发行包也带第三方声明 |
+| clr_loader | 0.3.1 | 实际 LICENSE 为 MIT，元数据许可字段为空不能当作无许可 |
+| bottle | 0.13.4 | MIT，pywebview 必需传递项；产品继续用 FastAPI，不另建 Bottle 服务 |
+| proxy_tools | 0.1.0 | 发行元数据 MIT，上游实际文本 BSD，见下述保留要求 |
+| PyInstaller | 6.22.2 | GPLv2+ 带打包分发例外；构建工具，不把许可简化为 MIT |
+| pyinstaller-hooks-contrib | 2026.7 | 普通 hooks GPLv2+，随产物进入的 runtime hooks 为 Apache-2.0 |
+| altgraph | 0.17.5 | MIT，PyInstaller 传递依赖 |
+| pefile | 2024.8.26 | MIT，PyInstaller PE 分析依赖 |
+| pywin32-ctypes | 0.2.3 | BSD-3-Clause，PyInstaller 传递依赖；不是引入 pywin32 业务层 |
+| setuptools | 84.0.0 | MIT 及所带第三方声明，构建工具 |
+
+pywebview 不装 Qt/CEF/GTK extra；没有安装 MinerU。移除 pywebview/pythonnet 及其必需项会失去本路线的原生容器，移除 PyInstaller 构建链会失去自带 Python 的产物，均应返回方案审查，不能称浏览器/源码运行是桌面目标降级通过。
+
+`proxy_tools` 的 wheel 与 sdist 均未包含许可正文，不能仅凭元数据认定 MIT。已从其官方仓库固定提交 `db43f1e35d4f90a65c5a4d56d9e9af88212ec6e6` 获取 [LICENSE.txt](https://github.com/jtushman/proxy_tools/blob/db43f1e35d4f90a65c5a4d56d9e9af88212ec6e6/LICENSE.txt)，发行模块与该提交模块字节相同（SHA256 `d1539d95e1a713c068ca81d42e047b2c76568964cf277596d4e19efb22f476be`）。保留发行元数据的差异记录，并在 D4 第三方声明中随包带入此上游 BSD 正文与版权，不自行重写/补造许可；正文 SHA256 `a428fb8a2e762af3eb0a6edbbb88e9b42ccfee80fd9b423958bcacf9b9abbfe4`。上游文件末尾有重复句，分发时原样保留。此次许可审查允许继续内部兼容验证，不代表 D4 全产物许可/微软再分发检查已完成。
+
+本机加载探针：显式 `PYTHONNET_RUNTIME=netfx`，导入 webview、clr、PyInstaller、webview.platforms.edgechromium，读取 CoreWebView2Environment 的可用版本。结果 CLR `4.0.30319.42000`、renderer `edgechromium`、WebView2 `152.0.4191.66`、PyInstaller `6.22.2`；未创建窗口、未装系统 runtime、未调用凭据或业务服务。Windows .NET/Edge DLL 均从已安装依赖及系统读取。依赖目录已发现 Core/WinForms/Loader 与 Python.Runtime 等原生文件，生成哈希清单供 D1e 按架构选择；不能把存在 DLL 当作冻结成功。
+
+开发实测：`pip check` 无冲突；新解释器 focused `45 passed, 1 skipped`，后端/评测 `1349 passed, 1 skipped`；前端保护探针通过、Vitest `74 passed`、build 成功、预置接口 Playwright `6 passed`。真实 MinerU 未运行，保留 Starlette/httpx 弃用及构建块体积提示。依赖卡不制造红测，以上不是窗口、安装、干净机器或真实模型效果证据。
+
+证据目录：`C:\Users\DAKER\AppData\Local\Temp\paperlens-d1c-18ac765`，含 focused/backend、pip-check、smoke、lock-check 日志，`dependency-inventory.json`（52 个非项目发行包，包含 pip）、`download-hashes.json`（51 项源发行摘要）、`native-hashes.json`（109 个 DLL/PYD 摘要）、proxy-tools 固定提交比对及许可正文。安装器原始报告在忽略的 `.venv-desktop/install-report.json`，含本机 editable 路径，不提交；证据的 download-hashes 已排除项目本地项。前端证据在 `C:\Users\DAKER\AppData\Local\Temp\paperlens-desktop-frontend-agp67741`，四份日志对应探针、Vitest、build、Playwright。沙箱 ensurepip/临时目录权限失败及受限网络下载无进展均保留任务记录，获准重跑通过；没有清理旧环境或全局缓存。
+
+`D1c_IMPLEMENTATION=COMPLETE`；`D1c_INDEPENDENT_ACCEPTANCE=PENDING`；`NATIVE_WINDOW/FROZEN_PACKAGE/INSTALLATION=NOT_VERIFIED`；`LIVE_MODEL_VALIDATION=NOT_RUN`。
+
 ## 11. 官方依据（2026-09-12 查阅）
 
 - [pywebview 安装](https://pywebview.flowrl.com/guide/installation.html) 和 [引擎选择](https://pywebview.flowrl.com/guide/web_engine.html)：Windows 使用 pythonnet/.NET 与 WebView2，需强制 EdgeChromium；实际最低 .NET 以所锁版本验证。

@@ -20,6 +20,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+desktop = [
+    "pywebview==6.2.1; sys_platform == 'win32'",
+]
 dev = [
     "httpx>=0.27,<1",
     "pytest>=8,<10",
@@ -31,4 +34,3 @@ include = ["backend*"]
 [tool.pytest.ini_options]
 testpaths = ["backend/tests", "eval"]
 addopts = "-ra"
-
