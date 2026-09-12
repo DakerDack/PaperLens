@@ -76,7 +76,8 @@ function isErrorResponse(value: unknown): value is ErrorResponse {
 
 async function request(path: string, init?: RequestInit): Promise<Response> {
   try {
-    return await fetch(`${API_BASE_URL}${path}`, init);
+    const base = document.querySelector('meta[name="paperlens-desktop"]') ? "" : API_BASE_URL;
+    return await fetch(`${base}${path}`, init);
   } catch (error: unknown) {
     if (isRequestCancelled(error)) {
       throw error;
