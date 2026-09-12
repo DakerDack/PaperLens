@@ -1,187 +1,202 @@
+<div align="center">
+
 # PaperLens
 
-PaperLens 是一个基于 Hy3 的可信学术解读、主张级证据审计与对话式修订项目。
+### 读懂论文，让每一句解读都有据可循。
 
-这是个人项目，非腾讯官方产品。已实现上传、解析、五区联合生成、证据核验、快速/完整审计、页码和摘录、句子/全文补丁预览与确认、版本回退及 Markdown 导出。阶段 8 已通过独立验收，范围限本地源码交付；`PRODUCTION_READY=NO`。参见 [发布与独立验收说明](docs/stage8_publish.md) 和 [开发交付实测记录](docs/stage8_release_check.md)。
+基于腾讯混元 Hy3 的学术阅读与证据审计工作台<br>
+从 PDF 到结构化解读，从原文核验到对话式修订，在一个界面完成。
 
-模型默认 **Mock（预置合成结果）**，不是实时 Hy3；Live 失败不会回退 Mock。Mock 只适合仓库合成 PDF 演练，不用于解读任意论文。快速检查不产生完整评分；完整审计仍可能出错，需人工核对原文。
+[![Python](https://img.shields.io/badge/Python-3.13-3776AB?style=flat-square&logo=python&logoColor=white)](pyproject.toml)
+[![React](https://img.shields.io/badge/React-19-149ECA?style=flat-square&logo=react&logoColor=white)](frontend/package.json)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?style=flat-square&logo=typescript&logoColor=white)](frontend/package.json)
+[![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)](backend/app/main.py)
+[![License: MIT](https://img.shields.io/badge/License-MIT-8B5CF6?style=flat-square)](LICENSE)
 
-## 活动提交材料（任务一）
+[快速开始](#快速开始) · [功能亮点](#功能亮点) · [观看演示](reports/stage8_demo.webm) · [项目资料](#项目资料)
 
-本仓库选择“开放式场景：AI 应用与评判标准设计”。[任务一分析报告](docs/task1_analysis.md)集中说明场景、八维标准、样本、实验过程、失败模式与能力边界，并逐项对应活动 PDF 的产出要求。
+</div>
 
-| 材料 | 入口 |
-|---|---|
-| 评测样本与方法 | [10 篇材料及变异清单](eval/live_cases.json)、[执行脚本](eval/run_eval.py)、[报告重建](eval/build_report.py) |
-| 完整结果 | [103 槽逐行结果表](reports/stage7_full_results_auditv8_scope_r1.md)、[正式报告](reports/stage7_report_auditv8_scope_r1.md)、[校准报告](reports/calibrate_report_auditv8_scope_r1_postfreeze.md) |
-| 原始数据与冻结 | [校准 15 条](reports/calibrate_results_auditv8_scope_r1.jsonl)、[正式 88 条](reports/stage7_results_auditv8_scope_r1.jsonl)、[本轮冻结](reports/stage7_frozen_auditv8_scope_r1.json) |
-| 实验分析与复核 | [分析、失败案例和离线重建命令](docs/task1_analysis.md)、[人工范围关联](eval/reviewed_scope_manifest_auditv8_scope_r1.json) |
-| 演示 | [50.04 秒视频](reports/stage8_demo.webm)，真实本地 API，模型明确为 Mock |
+---
 
-正式结果为已查看固定样本上的通过：排序 5/5、攻击警报 16/16、修订解决 4/5；校准存在好中打平，篇幅攻击被检出后仍可能合格。结论不代表盲测或任意论文效果。下方说明安装和使用；仅复核实验数据时，运行分析报告中的零调用命令即可。
+## 为深入阅读而设计
 
-## 从零安装应用（Windows PowerShell）
+论文阅读不仅是提取摘要，还包括理解研究方法、核对关键结论，以及整理自己的表达。**PaperLens 将阅读、证据和修订放在同一个工作台**：一边查看 PDF 原文，一边阅读结构化解读，随时追溯句子的来源，再通过自然语言完成修改。
 
-先安装 [Python 3.13](https://www.python.org/downloads/windows/) 和 [Node.js](https://nodejs.org/en/download)。本轮使用 Python 3.13.3、Node 24.13.0；不要使用全局 Python 业务包或全局 Vite。以下命令从仓库根目录运行，保留已有 `.env`：
+适合希望快速建立论文全貌的学生、需要核对论据的研究者，以及正在整理文献笔记的知识工作者。
 
-```powershell
-$ErrorActionPreference = 'Stop'
-py -3.13 -m venv .venv313
-if ($LASTEXITCODE -ne 0) { throw 'Python environment creation failed' }
-$Python = (Resolve-Path '.\.venv313\Scripts\python.exe').Path
-& $Python -m pip install -r requirements.lock
-if ($LASTEXITCODE -ne 0) { throw 'Python installation failed' }
-& $Python -m pip check
-if ($LASTEXITCODE -ne 0) { throw 'Python dependency check failed' }
-if (-not (Test-Path -LiteralPath '.env')) { Copy-Item -LiteralPath '.env.example' -Destination '.env' }
-Push-Location -LiteralPath frontend
-try {
-    & npm.cmd ci
-    if ($LASTEXITCODE -ne 0) { throw 'Node dependency installation failed' }
-    & '.\node_modules\.bin\playwright.cmd' install chromium
-    if ($LASTEXITCODE -ne 0) { throw 'Browser installation failed' }
-} finally { Pop-Location }
+## 功能亮点
+
+| | 功能 | 你可以做什么 |
+| :---: | --- | --- |
+| 📄 | **五区结构化解读** | 按研究问题、研究方法、主要结果、研究局限与通俗解释组织论文内容 |
+| 🔎 | **主张级证据追溯** | 从解读句子定位引用摘录与 PDF 页码，在阅读中核对依据 |
+| 🧭 | **快速检查与完整审计** | 先查看证据检查，再进行八维完整审计与评分 |
+| 💬 | **对话式修订** | 用自然语言提出句子或全文修改意图，先预览补丁，再确认应用 |
+| 🕘 | **版本记录与回退** | 保留修改历史，比较阅读与修订过程中的不同版本 |
+| 📤 | **Markdown 导出** | 将当前解读导出为便于整理、分享和继续编辑的文档 |
+
+### 一条连贯的阅读流程
+
+```mermaid
+flowchart LR
+    A[上传 PDF] --> B[生成五区解读]
+    B --> C[追溯原文证据]
+    C --> D[检查与审计]
+    D --> E[对话式修订]
+    E --> F[预览并确认]
+    F --> D
+    F --> G[导出 Markdown]
 ```
 
-## 启动与合成演练
+**原文、解读、操作并排呈现。** 在三栏工作台中，阅读与核验无需反复切换页面；修订由你确认，历史版本随时可回看。
 
-在仓库根目录的第一个终端执行。演练使用独立数据目录，显式禁用真实 MinerU 命令以走 pdfplumber 文本解析；这不是 MinerU 集成验证：
+> 🎬 [观看约 50 秒的工作台演示](reports/stage8_demo.webm) · 演示采用本地 API 与 Mock 预置示例。
+
+## 快速开始
+
+以下命令适用于 **Windows PowerShell**。准备 Python 3.13、Node.js 24 和 Git，在本地启动工作台。
+
+### 1. 获取项目
 
 ```powershell
-$ErrorActionPreference = 'Stop'
+git clone https://github.com/DakerDack/PaperLens.git
+Set-Location PaperLens
+```
+
+### 2. 安装依赖
+
+```powershell
+py -3.13 -m venv .venv313
+& '.\.venv313\Scripts\python.exe' -m pip install -r requirements.lock
+& '.\.venv313\Scripts\python.exe' -m pip check
+
+if (-not (Test-Path -LiteralPath '.env')) {
+    Copy-Item -LiteralPath '.env.example' -Destination '.env'
+}
+
+Push-Location frontend
+npm.cmd ci
+Pop-Location
+```
+
+### 3. 启动示例工作台
+
+在仓库根目录打开第一个终端，启动后端。此配置使用 **Mock 预置结果**与 pdfplumber 文本解析，适合体验仓库自带示例。
+
+```powershell
 $env:PAPERLENS_MODEL_MODE = 'mock'
 $env:PAPERLENS_DATA_DIR = './data/demo'
 $env:MINERU_COMMAND = './.venv-mineru-disabled/Scripts/mineru.exe'
+
 & '.\.venv313\Scripts\python.exe' -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
-if ($LASTEXITCODE -ne 0) { throw 'Backend stopped with an error' }
 ```
 
-第二个终端从仓库根目录执行：
+在仓库根目录打开第二个终端，启动前端：
 
 ```powershell
-$ErrorActionPreference = 'Stop'
-Push-Location -LiteralPath frontend
-try {
-    & npm.cmd run dev -- --host 127.0.0.1 --port 5173 --strictPort
-    if ($LASTEXITCODE -ne 0) { throw 'Frontend stopped with an error' }
-} finally { Pop-Location }
+Set-Location frontend
+npm.cmd run dev -- --host 127.0.0.1 --port 5173 --strictPort
 ```
 
-打开 [工作台](http://127.0.0.1:5173)；[API 文档](http://127.0.0.1:8000/api/docs)。上传 `backend/tests/fixtures/simple_2page.pdf` 并确认处理权限，生成后检查 Mock 标记和快速检查，再运行完整审计。点击第二页句子查看摘录；修改意图输入“只追加安全标点”，预览后接受、重新深审、回退到版本 1 并导出。全文修改也可预览、接受和复核，但可能出现证据不足或不合格，不能把完成审计等同合格。
+| 入口 | 地址 |
+| --- | --- |
+| 阅读工作台 | http://127.0.0.1:5173 |
+| 交互式 API 文档 | http://127.0.0.1:8000/api/docs |
 
-阶段 8 曾发现 pdfplumber 分块与静态 Mock 夹具不一致导致 `AUDIT_INCOMPLETE`，已增加仅针对内容完全匹配合成页的适配，并保留坏夹具拒绝测试。Mock 仅支持该固定合成材料及明确预置修订；不是通用模型。演示使用真实本地 API 与 pdfplumber，模型回答为明确标注的预置结果，见 [视频](reports/stage8_demo.webm)。其他材料及未知修订仍可能失败。
+### 4. 体验完整流程
 
-本地 PDF 与项目历史保存在数据目录，不会在关闭浏览器时自动删除；应用没有项目删除界面。不要上传私密论文或审稿材料。两个终端分别按 Ctrl+C 停止服务。
+1. 上传 [`simple_2page.pdf`](backend/tests/fixtures/simple_2page.pdf)，确认处理权限。
+2. 生成五区解读，查看快速检查与完整审计。
+3. 点击解读句子，查看对应页码和引用摘录。
+4. 输入示例修改意图 **“只追加安全标点”**，预览并接受修订。
+5. 重新审计、查看历史版本，导出 Markdown。
 
-## Live
+两个终端分别按 `Ctrl+C` 即可停止服务；项目数据保存在 `PAPERLENS_DATA_DIR` 指定的本地目录。
 
-仅在有处理权限和费用授权时，将本机 `.env` 的 `HY3_API_KEY` 填入有效密钥，设置 `PAPERLENS_MODEL_MODE=live`，并移除终端里覆盖模式的环境变量后启动。不得提交 `.env`。使用上面的 Mock 启动脚本仍会显式覆盖成 Mock。Live 会将来源块、生成文档和修订上下文发送至 TokenHub，页面必须显示 Live；供应商不可用、结构无效或审计不完整会明确失败。
+## 连接 Hy3
 
-页码和引文来自解析与代码核验；分数及门槛由代码计算，均不由 Hy3 直接决定。普通文本 PDF 支持 pdfplumber 降级。P1 文本查找高亮已实现，匹配失败时保留页码和摘录；P2 bbox 精确覆盖和复杂 OCR/表格没有正式验收，不宣称支持。
+**Live 模式**通过腾讯云 TokenHub 调用 Hy3，用于真实模型生成、审计与修订。在本机 `.env` 中配置：
 
-阶段 7 仅在已查看的固定样本上通过，非盲测或泛化证明；holdout-02 的修订未解决。公开数据、哈希与离线复核见 [任务一分析报告](docs/task1_analysis.md)，历史验收过程见 [阶段 7 收尾](docs/stage7_closeout.md)。`eval/run_eval.py --mode smoke` 是参考回放，无供应商调用，不替代正式评测。
+```dotenv
+PAPERLENS_MODEL_MODE=live
+HY3_API_KEY=your_tokenhub_api_key
+```
 
-## 环境
-
-- PaperLens 应用：Python 3.13（当前实测 3.13.3）
-- MinerU 独立工具：CPython 3.12（当前实测 3.12.14）
-- Node.js 24.13.0（本轮使用独立官方 Windows x64 归档复现）
-- MinerU 3.4.5 `pipeline`，只通过独立 CLI 调用
-- 腾讯云大模型服务平台 TokenHub 的 Hy3 访问权限，进入真实模型探针阶段后配置
-
-## 可选：Windows 上重建 MinerU 工具环境
-
-这是历史锁定的独立工具安装记录；阶段 8 的全新环境验证使用 pdfplumber，未重新下载/运行 MinerU 模型。MinerU 不安装到应用的 `.venv313`。需要此可选工具时，先安装官方 CPython 3.12，并确保 `py -3.12` 可用，然后在仓库根目录执行：
+在新的后端终端中，从仓库根目录启动：
 
 ```powershell
-$ErrorActionPreference = "Stop"
-
-py -3.12 -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version"
-py -3.12 -m venv ".venv-mineru312"
-$MinerUPython = (Resolve-Path ".\.venv-mineru312\Scripts\python.exe").Path
-
-& $MinerUPython -m pip install --upgrade pip
-if ($LASTEXITCODE -ne 0) { throw 'MinerU pip upgrade failed' }
-& $MinerUPython -m pip install --index-url "https://download.pytorch.org/whl/cpu" "torch==2.8.0+cpu" "torchvision==0.23.0+cpu"
-if ($LASTEXITCODE -ne 0) { throw 'MinerU torch installation failed' }
-& $MinerUPython -m pip install "mineru[pipeline]==3.4.5" "onnxruntime==1.29.0" "six==1.17.0"
-if ($LASTEXITCODE -ne 0) { throw 'MinerU installation failed' }
-& $MinerUPython -m pip check
-if ($LASTEXITCODE -ne 0) { throw 'MinerU dependency check failed' }
-
-$MinerU = (Resolve-Path ".\.venv-mineru312\Scripts\mineru.exe").Path
-& $MinerU -v
+& '.\.venv313\Scripts\python.exe' -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 ```
 
-`six==1.17.0` 是 MinerU 3.4.5 pipeline 当前实际启动所需的隔离工具依赖，不加入 PaperLens 的 `pyproject.toml`。
+若沿用示例终端，先执行 `Remove-Item Env:PAPERLENS_MODEL_MODE -ErrorAction SilentlyContinue`，让模式配置从 `.env` 加载。页面中的模式标识可用于确认当前运行方式。
 
-MinerU 使用独立工具环境，不写入应用的 `requirements.lock`。PaperLens 默认通过 `./.venv-mineru312/Scripts/mineru.exe` 调用它。
+Live 请求会将相关来源内容、解读和修订上下文发送至模型服务。请使用有权处理的材料，并将 API Key 保留在本机 `.env` 中。模型调用费用按服务商计费规则结算。
 
-首次下载模型并用公开合成夹具冒烟验证：
+## 设计与技术
+
+PaperLens 将语言理解与可核验的工程环节分开组织：**Hy3 负责生成与语义分析，代码负责引文核验、页码关联及评分计算**。
+
+| 层次 | 技术与职责 |
+| --- | --- |
+| 交互界面 | React 19、TypeScript、Vite，组织阅读、审计与修订流程 |
+| PDF 阅读 | PDF.js，呈现原文、页码跳转与文本查找 |
+| 服务端 | FastAPI、Pydantic，提供接口与结构化数据契约 |
+| 文档解析 | pdfplumber 文本解析；可通过独立 CLI 接入 MinerU |
+| 模型服务 | Hy3，经 TokenHub 完成生成、语义审计与修订 |
+| 证据处理 | 引文匹配、BM25 检索及确定性核验 |
+| 项目存储 | 本地文件与 SQLite，记录项目内容及版本历史 |
+| 工程验证 | pytest、Vitest、Playwright |
+
+<details>
+<summary><strong>开发者：运行检查</strong></summary>
+
+在仓库根目录运行后端与评测测试：
 
 ```powershell
-$ErrorActionPreference = "Stop"
-$MinerU = (Resolve-Path ".\.venv-mineru312\Scripts\mineru.exe").Path
-$SmokeOutput = Join-Path (Resolve-Path ".").Path ".test-tmp-mineru-smoke"
-
-$env:MINERU_MODEL_SOURCE = "modelscope"
-$env:MODELSCOPE_CACHE = Join-Path (Resolve-Path ".").Path ".venv-mineru312\models"
-$env:HF_HOME = Join-Path (Resolve-Path ".").Path ".venv-mineru312\hf-cache"
-
-& $MinerU -p "backend\tests\fixtures\simple_2page.pdf" -o $SmokeOutput -b pipeline -m txt
-if ($LASTEXITCODE -ne 0) { throw "MinerU smoke test failed" }
-# 保留输出供检查；不要将模型缓存或解析原文提交到仓库。
+& '.\.venv313\Scripts\python.exe' -m pytest backend/tests eval/test_eval.py -q -p no:cacheprovider
 ```
 
-默认配置会从仓库内 `./.venv-mineru312/Scripts/mineru.exe` 调用 MinerU；也可通过本机 `.env` 的 `MINERU_COMMAND` 显式覆盖。
-
-## 应用 Python 依赖锁
-
-`requirements.lock` 是应用 `.venv313` 的完整非 editable 冻结结果，不包含独立 MinerU 环境。新环境使用以下命令安装和检查：
+前端检查与构建：
 
 ```powershell
-$ErrorActionPreference = "Stop"
-$Python = (Resolve-Path ".\.venv313\Scripts\python.exe").Path
-
-& $Python -m pip install -r "requirements.lock"
-if ($LASTEXITCODE -ne 0) { throw "Python dependency installation failed: $LASTEXITCODE" }
-& $Python -m pip check
-if ($LASTEXITCODE -ne 0) { throw "Python dependency check failed: $LASTEXITCODE" }
+Set-Location frontend
+npx.cmd --no-install playwright install chromium
+npm.cmd run test -- --run
+npm.cmd run typecheck
+npm.cmd run build
+npx.cmd --no-install playwright test
 ```
 
-维护者只能用 `.\.venv313\Scripts\python.exe -m pip freeze --exclude-editable` 的实际输出更新该文件，并保持 UTF-8 无 BOM；不得写入 `file:///`、本机绝对路径、editable 项目或密钥。
+应用 Python 依赖由 `requirements.lock` 固定，前端依赖通过 `package-lock.json` 与 `npm ci` 安装。MinerU 使用独立工具环境，通过 `MINERU_COMMAND` 指定 CLI 路径。
 
-## 当前验证
+</details>
 
-```powershell
-$ErrorActionPreference = "Stop"
-$Python = (Resolve-Path ".\.venv313\Scripts\python.exe").Path
+## 项目资料
 
-& $Python -m pip check
-if ($LASTEXITCODE -ne 0) { throw "Python dependency check failed: $LASTEXITCODE" }
-& $Python -m pytest "backend/tests" "eval/test_eval.py" -q -p no:cacheprovider
-if ($LASTEXITCODE -ne 0) { throw "Final Python tests failed: $LASTEXITCODE" }
-& $Python "eval/run_eval.py" --mode smoke
-if ($LASTEXITCODE -ne 0) { throw "Final smoke evaluation failed: $LASTEXITCODE" }
+本项目参与“开放式场景：AI 应用与评判标准设计”，配套提供场景分析、评测材料和可追溯的实验记录。
 
-Push-Location "frontend"
-try {
-    & npm.cmd run test -- --run
-    if ($LASTEXITCODE -ne 0) { throw "Final frontend tests failed: $LASTEXITCODE" }
-    & npm.cmd run typecheck
-    if ($LASTEXITCODE -ne 0) { throw "Final typecheck failed: $LASTEXITCODE" }
-    & npm.cmd run build
-    if ($LASTEXITCODE -ne 0) { throw "Final production build failed: $LASTEXITCODE" }
-    & '.\node_modules\.bin\playwright.cmd' test
-    if ($LASTEXITCODE -ne 0) { throw "Final Playwright tests failed: $LASTEXITCODE" }
-    & npm.cmd audit
-    if ($LASTEXITCODE -ne 0) { throw "Final npm audit failed: $LASTEXITCODE" }
-}
-finally {
-    Pop-Location
-}
-```
+| 资料 | 内容 |
+| --- | --- |
+| [任务一分析报告](docs/task1_analysis.md) | 应用场景、八维评价标准、实验设计与分析 |
+| [项目设计](docs/paperlens_project_proposal.md) | 产品目标与工作流设计 |
+| [开发计划](docs/DEV_PLAN.md) | 实现任务、版本演进与验证记录 |
+| [评测样本](eval/live_cases.json) | 公开材料与样本清单 |
+| [评测结果](reports/stage7_full_results_auditv8_scope_r1.md) | 逐项结果与记录索引 |
+| [评测工具](eval/run_eval.py) · [报告工具](eval/build_report.py) | 评测执行与报告重建 |
 
-API Key 只能写入本机 `.env`。不要上传私密论文、未公开稿件、审稿材料或许可不明全文。
+## 开源与致谢
 
-项目自有代码使用 [MIT](LICENSE)。MinerU、PDF.js、Hy3、依赖、论文署名和 AI 使用边界见 [第三方归属与数据说明](docs/THIRD_PARTY_NOTICES.md)。
+PaperLens 的自有代码采用 **[MIT License](LICENSE)**，欢迎学习、使用和参与改进。
+
+感谢腾讯混元 Hy3 及开源社区提供的模型与工具支持。第三方组件和材料归属见 [第三方说明](docs/THIRD_PARTY_NOTICES.md)。本项目为个人开源项目。
+
+---
+
+<div align="center">
+
+**PaperLens · 从阅读到理解，从结论到证据。**
+
+如果这个项目对你有帮助，欢迎点亮一颗 ⭐
+
+</div>
