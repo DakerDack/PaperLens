@@ -1,4 +1,4 @@
-"""Desktop entry: text-only Mock until the settings card enables provider configuration.
+"""Desktop entry with text-only parsing and explicit persisted settings.
 
 Run with pythonw.exe backend/app/desktop.py (or double-click via a shortcut).
 Product data and instance locking are local; API authentication follows in D2b.
@@ -181,7 +181,8 @@ def navigation_allowed(url, origin):
 
 
 class RecentProjectBridge:
-    def __init__(self, path, origin, current_url):
+    def __init__(self, path, origin, current_url, *, credentials=None):
+        self._credentials = credentials
         self._path = path
         self._origin = origin
         self._current_url = current_url
@@ -196,15 +197,31 @@ class RecentProjectBridge:
         try:
             return DesktopState.model_validate_json(self._path.read_text(encoding='utf-8'))
         except FileNotFoundError:
-            return DesktopState()
+            return DesktopState(mode="live")
         except (ValidationError, UnicodeError):
             raise DesktopError('DESKTOP_STATE_INVALID') from None
+
+    def _write(self, state):
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=self._path.parent,
+                                             prefix='.desktop-state-', suffix='.tmp', delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(state.model_dump_json())
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self._path)
+        finally:
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
 
     @staticmethod
     def _error(code):
         messages = {'DESKTOP_ACCESS_DENIED':'当前窗口无权访问桌面状态。',
                     'DESKTOP_STATE_INVALID':'桌面状态无效，请检查后重试。',
-                    'DESKTOP_DATA_UNAVAILABLE':'无法读写桌面状态，请重试。'}
+                    'DESKTOP_DATA_UNAVAILABLE':'无法读写桌面状态，请重试。',
+                    'DESKTOP_SETTINGS_INVALID':'设置输入无效。'}
         return {'ok':False,'error':{'error_code':code,'message':messages[code],'retryable':code=='DESKTOP_DATA_UNAVAILABLE'}}
 
     def get_recent_project(self):
@@ -229,19 +246,7 @@ class RecentProjectBridge:
             with self._lock:
                 state = self._read()
                 state.project_id = request.project_id
-                self._path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = None
-                try:
-                    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=self._path.parent,
-                                                     prefix='.desktop-state-', suffix='.tmp', delete=False) as stream:
-                        temporary = Path(stream.name)
-                        stream.write(state.model_dump_json())
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    os.replace(temporary, self._path)
-                finally:
-                    if temporary is not None and temporary.exists():
-                        temporary.unlink()
+                self._write(state)
             return {'ok':True,'value':{'saved':True}}
         except ValidationError:
             return self._error('DESKTOP_STATE_INVALID')
@@ -250,13 +255,81 @@ class RecentProjectBridge:
         except Exception:
             return self._error('DESKTOP_DATA_UNAVAILABLE')
 
+    def _store(self):
+        if self._credentials is None:
+            from backend.app.desktop_credentials import CredentialStore
+            self._credentials = CredentialStore()
+        return self._credentials
+
+    def _startup_configuration(self):
+        with self._lock:
+            return self._read().mode, self._store().read() or ''
+
+    def get_desktop_settings(self, *args, **kwargs):
+        from backend.app.desktop_credentials import CredentialError
+        from backend.app.models import DesktopSettingsStatus
+        try:
+            if not self._trusted(): return self._error('DESKTOP_ACCESS_DENIED')
+            if args or kwargs: return self._error('DESKTOP_SETTINGS_INVALID')
+            with self._lock:
+                status=DesktopSettingsStatus(mode=self._read().mode, key_configured=self._store().configured())
+            return {'ok':True,'value':status.model_dump()}
+        except CredentialError as error:
+            return error.envelope()
+        except DesktopError as error:
+            return self._error(str(error))
+        except Exception:
+            return self._error('DESKTOP_DATA_UNAVAILABLE')
+
+    def save_desktop_settings(self, payload=None, *args, **kwargs):
+        from backend.app.desktop_credentials import CredentialError
+        from backend.app.models import DesktopSettingsRequest
+        from pydantic import ValidationError
+        try:
+            if not self._trusted(): return self._error('DESKTOP_ACCESS_DENIED')
+            if args or kwargs: return self._error('DESKTOP_SETTINGS_INVALID')
+            request=DesktopSettingsRequest.model_validate(payload)
+            with self._lock:
+                old=self._read()
+                state=old.model_copy(update={'mode':request.mode})
+                # Persist non-secret state first; a failed credential write leaves the old Key intact.
+                self._write(state)
+                try:
+                    if 'api_key' in request.model_fields_set:
+                        self._store().write(request.api_key.get_secret_value())
+                except Exception:
+                    self._write(old)
+                    raise
+            return {'ok':True,'value':{'restart_required':True}}
+        except ValidationError:
+            return self._error('DESKTOP_SETTINGS_INVALID')
+        except CredentialError as error:
+            return error.envelope()
+        except DesktopError as error:
+            return self._error(str(error))
+        except Exception:
+            return self._error('DESKTOP_DATA_UNAVAILABLE')
+
+    def clear_desktop_key(self, *args, **kwargs):
+        from backend.app.desktop_credentials import CredentialError
+        try:
+            if not self._trusted(): return self._error('DESKTOP_ACCESS_DENIED')
+            if args or kwargs: return self._error('DESKTOP_SETTINGS_INVALID')
+            with self._lock:
+                self._store().clear()
+            return {'ok':True,'value':{'key_configured':False,'restart_required':True}}
+        except CredentialError:
+            return CredentialError(clearing=True).envelope()
+        except Exception:
+            return CredentialError(clearing=True).envelope()
+
 
 def frontend_resources() -> Path:
     root = Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2]
     return root / "frontend/dist"
 
 
-def create_desktop_app(resources: Path, data_dir: Path, *, token=None):
+def create_desktop_app(resources: Path, data_dir: Path, *, token=None, settings_bridge=None):
     resources = resources.resolve()
     data_dir = data_dir.resolve()
     if data_dir.is_relative_to(resources) or resources.is_relative_to(data_dir):
@@ -271,8 +344,9 @@ def create_desktop_app(resources: Path, data_dir: Path, *, token=None):
     from backend.app.document_service import DocumentService
     from backend.app.settings import Settings
 
-    settings = Settings(paperlens_env="test", paperlens_model_mode="mock",
-                        paperlens_data_dir=data_dir, hy3_api_key="")
+    mode, key = settings_bridge._startup_configuration() if settings_bridge is not None else ("live", "")
+    settings = Settings(paperlens_env="test", paperlens_model_mode=mode,
+                        paperlens_data_dir=data_dir, hy3_api_key=key)
     app = create_app(settings_override=settings,
                      document_service=DocumentService(settings, text_only=True))
     import secrets
@@ -356,14 +430,15 @@ def main() -> int:
             raise DesktopError('DESKTOP_DATA_UNAVAILABLE') from None
         install_guard(data)
         import webview
-        app = create_desktop_app(frontend_resources(), data / "data", token=webview.token)
+        bridge = RecentProjectBridge(data / "desktop-state.json", None, lambda: window.get_current_url())
+        app = create_desktop_app(frontend_resources(), data / "data", token=webview.token, settings_bridge=bridge)
         server = LocalServer(app)
         server.start()
         webview.settings["ALLOW_DOWNLOADS"] = True
         webview.settings["ALLOW_FILE_URLS"] = False
         webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = False
-        bridge = RecentProjectBridge(data / 'desktop-state.json', server.url, lambda: window.get_current_url())
-        window = webview.create_window("PaperLens · 桌面原型 · MOCK", server.url,
+        bridge._origin = server.url
+        window = webview.create_window(f"PaperLens · {app.state.settings.paperlens_model_mode.upper()}", server.url,
                                        width=1280, height=850, js_api=bridge)
         def restrict_navigation():
             # pywebview 6.2.1's pinned Windows native surface, before first load.
@@ -385,11 +460,12 @@ def main() -> int:
             import ctypes
             ctypes.windll.user32.MessageBoxW(None, message, 'PaperLens', 0x30)
         window.events.closing += lambda: close_window(app.state.desktop_gate, server, notify)
-        # D1 uses only the trusted bundled page and exposes no custom native API.
+        # Only the trusted bundled page can use the explicit project/settings methods.
         webview.start(gui="edgechromium", debug=False, private_mode=False,
                       storage_path=str(data / "webview"))
     except Exception as error:
-        code = str(error) if isinstance(error, DesktopError) else "DESKTOP_START_FAILED"
+        from backend.app.desktop_credentials import CredentialError
+        code = str(error) if isinstance(error, (DesktopError, CredentialError)) else "DESKTOP_START_FAILED"
     finally:
         if server is not None:
             try:

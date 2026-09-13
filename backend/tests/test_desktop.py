@@ -29,7 +29,7 @@ def test_desktop_serves_workbench_and_real_text_api(tmp_path):
         assert 'paperlens-desktop' in client.get('/').text
         assert client.get('/api/health').json()['status'] == 'ok'
         assert client.get('/api/unknown').status_code == 404
-        assert app.state.settings.paperlens_model_mode == 'mock'
+        assert app.state.settings.paperlens_model_mode == 'live'
         assert app.state.settings.hy3_api_key == ''
         assert app.state.document_service.text_only is True
         fixture = Path(__file__).parent / 'fixtures/simple_2page.pdf'
@@ -456,3 +456,110 @@ def test_recent_bridge_preserves_live_mode_on_success_and_io_error(tmp_path,monk
     result=bridge.get_recent_project()
     assert result['error']['error_code']=='DESKTOP_DATA_UNAVAILABLE'
     assert 'synthetic private' not in str(result)
+
+
+@pytest.fixture
+def settings_bridge(tmp_path):
+    from uuid import uuid4
+    from backend.app.desktop import RecentProjectBridge
+    from backend.app.desktop_credentials import CredentialStore
+    store = CredentialStore(target='PaperLens.Test.' + uuid4().hex + '/Hy3')
+    bridge = RecentProjectBridge(tmp_path/'desktop-state.json', 'http://127.0.0.1:1234',
+                                 lambda:'http://127.0.0.1:1234/', credentials=store)
+    try:
+        yield bridge, store
+    finally:
+        store.clear()
+
+
+def test_settings_save_clear_and_next_start(settings_bridge, tmp_path):
+    from backend.app.desktop import create_desktop_app
+    bridge, store = settings_bridge
+    assert bridge.get_desktop_settings() == {'ok':True,'value':{'mode':'live','key_configured':False}}
+    assert bridge.save_desktop_settings({'mode':'live','api_key':'synthetic-only'}) == {'ok':True,'value':{'restart_required':True}}
+    resources=tmp_path/'assets';resources.mkdir();(resources/'index.html').write_text('<head></head>')
+    app=create_desktop_app(resources,tmp_path/'data', settings_bridge=bridge)
+    assert app.state.settings.hy3_api_key == 'synthetic-only'
+    assert app.state.settings.paperlens_model_mode == 'live'
+    assert bridge.clear_desktop_key() == {'ok':True,'value':{'key_configured':False,'restart_required':True}}
+    assert app.state.settings.hy3_api_key == 'synthetic-only'
+    assert bridge.get_desktop_settings()['value']['key_configured'] is False
+    assert bridge.clear_desktop_key()['ok']
+    restarted=create_desktop_app(resources,tmp_path/'data',settings_bridge=bridge)
+    assert restarted.state.settings.hy3_api_key == ''
+    assert restarted.state.settings.paperlens_model_mode == 'live'
+    with TestClient(restarted) as client:
+        fixture=Path(__file__).parent/'fixtures/simple_2page.pdf'
+        created=client.post('/api/projects',data={'rights_confirmed':'true'},files={'file':('synthetic.pdf',fixture.read_bytes(),'application/pdf')}).json()
+        response=client.post('/api/projects/'+created['project_id']+'/generate',json={'claim_policy':'required'})
+        assert response.json()['error_code']=='HY3_CONFIG_MISSING'
+
+
+def test_settings_save_omitted_key_and_invalid_clear(settings_bridge):
+    bridge,store=settings_bridge
+    store.write('synthetic-old')
+    assert bridge.save_desktop_settings({'mode':'mock'})['ok']
+    assert store.read()=='synthetic-old'
+    assert bridge.get_desktop_settings()['value']=={'mode':'mock','key_configured':True}
+    assert bridge.clear_desktop_key({'target':'anything'})['error']['error_code']=='DESKTOP_SETTINGS_INVALID'
+    assert store.read()=='synthetic-old'
+    for payload in ({'mode':'live','api_key':''},{'mode':'live','extra':True}):
+        assert bridge.save_desktop_settings(payload)['error']['error_code']=='DESKTOP_SETTINGS_INVALID'
+    bridge._current_url=lambda:'https://example.invalid/'
+    assert bridge.clear_desktop_key()['error']['error_code']=='DESKTOP_ACCESS_DENIED'
+    assert bridge.get_desktop_settings()['error']['error_code']=='DESKTOP_ACCESS_DENIED'
+    assert bridge.save_desktop_settings({'mode':'mock'})['error']['error_code']=='DESKTOP_ACCESS_DENIED'
+
+
+def test_settings_failures_preserve_old_configuration(settings_bridge,monkeypatch):
+    from backend.app.desktop_credentials import CredentialError
+    bridge,store=settings_bridge
+    assert bridge.save_desktop_settings({'mode':'mock','api_key':'synthetic-old'})['ok']
+    def fail(*args): raise CredentialError()
+    with monkeypatch.context() as patch:
+        patch.setattr(store,'write',fail)
+        assert not bridge.save_desktop_settings({'mode':'live','api_key':'synthetic-new'})['ok']
+    assert store.read()=='synthetic-old'
+    assert bridge.get_desktop_settings()['value']['mode']=='mock'
+    with monkeypatch.context() as patch:
+        patch.setattr(store,'clear',fail)
+        assert bridge.clear_desktop_key()['error']['error_code']=='DESKTOP_CREDENTIAL_UNAVAILABLE'
+        assert bridge.get_desktop_settings()['value']['key_configured'] is True
+        patch.setattr(store,'configured',fail)
+        assert not bridge.get_desktop_settings()['ok']
+    with monkeypatch.context() as patch:
+        patch.setattr(bridge,'_write',lambda state: (_ for _ in ()).throw(OSError('synthetic-private-path')))
+        result=bridge.save_desktop_settings({'mode':'live','api_key':'synthetic-new'})
+        assert result['error']['error_code']=='DESKTOP_DATA_UNAVAILABLE'
+        assert 'synthetic-private-path' not in str(result)
+    assert store.read()=='synthetic-old'
+
+
+def test_settings_corrupt_state_is_preserved(settings_bridge,monkeypatch):
+    from backend.app.desktop_credentials import CredentialError
+    bridge,store=settings_bridge
+    bridge._path.write_text('{broken')
+    assert bridge.get_desktop_settings()['error']['error_code']=='DESKTOP_STATE_INVALID'
+    assert bridge.save_desktop_settings({'mode':'mock'})['error']['error_code']=='DESKTOP_STATE_INVALID'
+    assert bridge._path.read_text()=='{broken'
+    # Clearing is independent of non-secret state corruption and preserves the file.
+    assert bridge.clear_desktop_key()['ok']
+    assert bridge._path.read_text()=='{broken'
+
+
+def test_startup_credential_error_keeps_stable_code(monkeypatch,tmp_path):
+    import ctypes
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from backend.app import desktop
+    from backend.app.desktop_credentials import CredentialError
+    from tools import desktop_verify
+    monkeypatch.setattr(desktop,'InstanceLock',Mock())
+    monkeypatch.setattr(desktop,'user_data_root',lambda:tmp_path)
+    monkeypatch.setattr(desktop_verify,'install_guard',lambda path:None)
+    monkeypatch.setattr(desktop_verify,'clean_environment',lambda:dict(desktop.os.environ))
+    monkeypatch.setattr(desktop,'create_desktop_app',Mock(side_effect=CredentialError()))
+    dialog=Mock()
+    monkeypatch.setattr(ctypes,'windll',SimpleNamespace(user32=SimpleNamespace(MessageBoxW=dialog)))
+    assert desktop.main()==1
+    assert 'DESKTOP_CREDENTIAL_UNAVAILABLE' in dialog.call_args.args[1]

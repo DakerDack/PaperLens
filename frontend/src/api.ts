@@ -1,4 +1,5 @@
 import type {
+  ModelMode,
   DesktopProjectApi,
   DesktopResult,
   DeepAuditRequest,
@@ -357,4 +358,17 @@ export function getRecentProject(): Promise<{ project_id: string | null }> {
 
 export function setRecentProject(projectId: string): Promise<{ saved: true }> {
   return desktopResult((api) => api.set_recent_project({ project_id: projectId }));
+}
+
+
+export function getDesktopSettings() {
+  return desktopResult((api) => api.get_desktop_settings());
+}
+
+export function saveDesktopSettings(input: { mode: ModelMode; api_key?: string }) {
+  return desktopResult((api) => api.save_desktop_settings(input));
+}
+
+export function clearDesktopKey() {
+  return desktopResult((api) => api.clear_desktop_key());
 }
