@@ -70,7 +70,7 @@ def test_main_reports_cleanup_failure_without_masking_startup(
     class Event:
         def __iadd__(self, handler):
             return self
-    window = SimpleNamespace(events=SimpleNamespace(before_show=Event()))
+    window = SimpleNamespace(events=SimpleNamespace(before_show=Event(), closing=Event()))
     webview = SimpleNamespace(settings={}, create_window=Mock(return_value=window), start=Mock())
     downloads_at_creation = []
     webview.create_window.side_effect = lambda *args, **kwargs: (downloads_at_creation.append(webview.settings.get('ALLOW_DOWNLOADS')), window)[1]
@@ -79,11 +79,13 @@ def test_main_reports_cleanup_failure_without_masking_startup(
     monkeypatch.setattr(desktop.os, 'environ', {})
     monkeypatch.setattr(desktop_verify, 'clean_environment', lambda: {})
     monkeypatch.setattr(desktop_verify, 'install_guard', lambda path: None)
-    monkeypatch.setattr(desktop.tempfile, 'mkdtemp', lambda **kwargs: str(tmp_path))
+    monkeypatch.setattr(desktop, 'user_data_root', lambda: tmp_path)
+    monkeypatch.setattr(desktop, 'InstanceLock', Mock())
     monkeypatch.setattr(desktop, 'create_desktop_app', Mock())
     monkeypatch.setattr(desktop, 'LocalServer', Mock(return_value=server))
     monkeypatch.setattr(ctypes, 'windll', SimpleNamespace(user32=SimpleNamespace(MessageBoxW=dialog)))
 
+    monkeypatch.setattr(desktop.tempfile, 'mkdtemp', lambda **kwargs: pytest.fail('main must not allocate disposable data'))
     assert desktop.main() == (1 if expected else 0)
     assert downloads_at_creation == ([] if startup_code else [True])
     server.stop.assert_called_once_with()
@@ -125,3 +127,209 @@ def test_resource_location_ignores_cwd(monkeypatch, tmp_path, frozen, present):
             desktop.create_desktop_app(desktop.frontend_resources(), tmp_path / 'data')
         assert not (tmp_path / 'data').exists()
 
+
+
+def test_data_root_uses_known_folder_not_environment(monkeypatch, tmp_path):
+    from backend.app import desktop
+    monkeypatch.setattr(desktop, 'local_app_data', lambda: tmp_path / '中文 user')
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path / 'decoy'))
+    assert desktop.user_data_root() == tmp_path / '中文 user' / 'PaperLens'
+
+
+def test_single_instance_releases_and_rejects_duplicate():
+    from backend.app.desktop import InstanceLock, DesktopError
+    from uuid import uuid4
+    name = 'PaperLens.Test.' + uuid4().hex
+    first = InstanceLock(name)
+    try:
+        with pytest.raises(DesktopError, match='^DESKTOP_ALREADY_RUNNING$'):
+            InstanceLock(name)
+    finally:
+        first.close()
+    replacement = InstanceLock(name)
+    replacement.close()
+
+
+def test_close_gate_waits_for_active_request_and_rejects_new_work():
+    import asyncio
+    from backend.app.desktop import RequestGate
+    gate = RequestGate()
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    messages = []
+    async def app(scope, receive, send):
+        entered.set()
+        await finish.wait()
+    async def send(message):
+        messages.append(message)
+    async def run():
+        task = asyncio.create_task(gate(app)({'type':'http','path':'/api/projects'}, None, send))
+        await entered.wait()
+        assert gate.begin_close() is False
+        await gate(app)({'type':'http','path':'/api/projects'}, None, send)
+        assert messages[0]['status'] == 403
+        assert b'DESKTOP_ACCESS_DENIED' in messages[1]['body']
+        finish.set()
+        await task
+        assert gate.begin_close() is True
+    asyncio.run(run())
+
+
+def test_window_close_retries_busy_and_timeout():
+    from unittest.mock import Mock
+    from backend.app.desktop import close_window, DesktopError
+    gate = Mock()
+    gate.begin_close.side_effect = [False, True, True]
+    server = Mock()
+    server.stop.side_effect = [DesktopError('DESKTOP_EXIT_TIMEOUT'), None]
+    notify = Mock()
+    assert close_window(gate, server, notify) is False
+    server.stop.assert_not_called()
+    assert close_window(gate, server, notify) is False
+    assert close_window(gate, server, notify) is True
+    assert server.stop.call_count == 2
+    assert notify.call_count == 2
+
+
+def test_instance_lock_released_after_process_termination():
+    import subprocess
+    import sys
+    from uuid import uuid4
+    from backend.app.desktop import InstanceLock, DesktopError
+    name = 'PaperLens.Test.' + uuid4().hex
+    code = f"from backend.app.desktop import InstanceLock;import sys,os;lock=InstanceLock({name!r});print('ready',flush=True);sys.stdin.readline();os._exit(17)"
+    child = subprocess.Popen([sys.executable, '-B', '-c', code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == 'ready'
+        with pytest.raises(DesktopError, match='DESKTOP_ALREADY_RUNNING'):
+            InstanceLock(name)
+        child.communicate('crash\n', timeout=10)
+        assert child.returncode == 17
+        replacement = InstanceLock(name)
+        replacement.close()
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=10)
+
+
+def test_desktop_project_survives_service_restart(tmp_path):
+    from backend.app.desktop import create_desktop_app
+    assets=tmp_path/'resources';assets.mkdir()
+    (assets/'index.html').write_text('<head>synthetic</head>')
+    data=tmp_path/'中文 user'/'data'
+    fixture=Path(__file__).parent/'fixtures/simple_2page.pdf'
+    with TestClient(create_desktop_app(assets,data)) as client:
+        uploaded=client.post('/api/projects',data={'rights_confirmed':'true'},files={'file':('synthetic.pdf',fixture.read_bytes(),'application/pdf')})
+        assert uploaded.status_code==201
+        project_id=uploaded.json()['project_id']
+        before=client.get('/api/projects/'+project_id).json()
+    with TestClient(create_desktop_app(assets,data)) as client:
+        assert client.get('/api/projects/'+project_id).json()==before
+        assert client.get('/api/projects/'+project_id+'/pdf').content==fixture.read_bytes()
+    assert not (assets/'paperlens.db').exists()
+
+
+def test_global_mutex_has_only_current_user_access():
+    import ctypes
+    from ctypes import wintypes
+    from uuid import uuid4
+    from backend.app.desktop import InstanceLock
+    lock=InstanceLock('PaperLens.Test.'+uuid4().hex)
+    api=ctypes.WinDLL('advapi32',use_last_error=True)
+    api.GetSecurityInfo.argtypes=[wintypes.HANDLE,ctypes.c_int,wintypes.DWORD,ctypes.c_void_p,ctypes.c_void_p,ctypes.c_void_p,ctypes.c_void_p,ctypes.POINTER(ctypes.c_void_p)]
+    api.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes=[ctypes.c_void_p,wintypes.DWORD,wintypes.DWORD,ctypes.POINTER(ctypes.c_wchar_p),ctypes.c_void_p]
+    descriptor=ctypes.c_void_p();text=ctypes.c_wchar_p()
+    try:
+        assert lock.name.startswith('Global\\PaperLens.Test.')
+        assert api.GetSecurityInfo(lock.handle,6,4,None,None,None,None,ctypes.byref(descriptor))==0
+        assert api.ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor,1,4,ctypes.byref(text),None)
+        assert text.value.startswith('D:P')
+        assert text.value.count('(A;')==1
+        assert lock.name.rsplit('.',1)[1] in text.value
+    finally:
+        if text: lock.kernel.LocalFree(text)
+        if descriptor: lock.kernel.LocalFree(descriptor)
+        lock.close()
+
+
+def test_known_folder_ignores_spoofed_environment(monkeypatch,tmp_path):
+    from backend.app.desktop import local_app_data
+    monkeypatch.setenv('LOCALAPPDATA',str(tmp_path/'spoofed'))
+    path=local_app_data()
+    assert path.is_absolute()
+    assert path != tmp_path/'spoofed'
+
+
+def test_abrupt_exit_preserves_commit_and_rolls_back_new_project(tmp_path):
+    import subprocess
+    import sys
+    from backend.app.desktop import create_desktop_app
+    assets=tmp_path/'assets';assets.mkdir();(assets/'index.html').write_text('<head>test</head>')
+    data=tmp_path/'data'
+    fixture=Path(__file__).parent/'fixtures/simple_2page.pdf'
+    with TestClient(create_desktop_app(assets,data)) as client:
+        saved=client.post('/api/projects',data={'rights_confirmed':'true'},files={'file':('synthetic.pdf',fixture.read_bytes(),'application/pdf')})
+        assert saved.status_code==201
+        saved_id=saved.json()['project_id']
+    code=f'''
+import os
+from pathlib import Path
+from contextlib import contextmanager
+from fastapi.testclient import TestClient
+from backend.app.desktop import create_desktop_app
+app=create_desktop_app(Path({str(assets)!r}),Path({str(data)!r}))
+with TestClient(app) as client:
+    original=app.state.project_store._transaction
+    @contextmanager
+    def crash_before_commit(*args,**kwargs):
+        with original(*args,**kwargs) as connection:
+            yield connection
+            os._exit(23)
+    app.state.project_store._transaction=crash_before_commit
+    app.state.project_id_factory=lambda: 'a'*32
+    client.post('/api/projects',data={{'rights_confirmed':'true'}},files={{'file':('synthetic.pdf',Path({str(fixture.resolve())!r}).read_bytes(),'application/pdf')}})
+'''
+    result=subprocess.run([sys.executable,'-B','-c',code],timeout=20,capture_output=True)
+    assert result.returncode==23
+    with TestClient(create_desktop_app(assets,data)) as client:
+        assert client.get('/api/projects/'+saved_id).status_code==200
+        assert client.get('/api/projects/'+saved_id+'/pdf').content==fixture.read_bytes()
+        assert client.get('/api/projects/'+'a'*32).status_code==404
+
+
+@pytest.mark.parametrize('nested_data', [True,False])
+def test_resource_and_data_roots_cannot_overlap(tmp_path,nested_data):
+    from backend.app.desktop import create_desktop_app,DesktopError
+    resources=tmp_path/'resources';resources.mkdir();(resources/'index.html').write_text('<head>test</head>')
+    data=resources/'data' if nested_data else tmp_path
+    with pytest.raises(DesktopError,match='^DESKTOP_DATA_UNAVAILABLE$'):
+        create_desktop_app(resources,data)
+
+
+@pytest.mark.parametrize('duplicate',[True,False])
+def test_main_preflight_failure_never_starts_service(monkeypatch,tmp_path,duplicate):
+    import ctypes
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from backend.app import desktop
+    from tools import desktop_verify
+    monkeypatch.setattr(desktop.os,'environ',{})
+    monkeypatch.setattr(desktop_verify,'clean_environment',lambda:{})
+    lock=Mock()
+    factory=Mock(return_value=lock)
+    if duplicate: factory.side_effect=desktop.DesktopError('DESKTOP_ALREADY_RUNNING')
+    monkeypatch.setattr(desktop,'InstanceLock',factory)
+    blocked=tmp_path/'blocked';blocked.write_text('synthetic')
+    root=Mock(return_value=blocked/'data')
+    monkeypatch.setattr(desktop,'user_data_root',root)
+    service=Mock();monkeypatch.setattr(desktop,'LocalServer',service)
+    dialog=Mock();monkeypatch.setattr(ctypes,'windll',SimpleNamespace(user32=SimpleNamespace(MessageBoxW=dialog)))
+    assert desktop.main()==1
+    service.assert_not_called()
+    if duplicate:
+        root.assert_not_called()
+        assert '已运行' in dialog.call_args.args[1]
+    else:
+        lock.close.assert_called_once()
+        assert 'DESKTOP_DATA_UNAVAILABLE' in dialog.call_args.args[1]
