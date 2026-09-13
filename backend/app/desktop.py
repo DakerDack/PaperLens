@@ -139,12 +139,53 @@ def close_window(gate, server, notify):
     return True
 
 
+class DesktopAccess:
+    def __init__(self, token):
+        self.token = token
+        self.origin = None
+
+    def __call__(self, app):
+        async def guarded(scope, receive, send):
+            if scope['type'] != 'http':
+                return await app(scope, receive, send)
+            import hmac
+            headers = {}
+            duplicates = False
+            for key, value in scope['headers']:
+                if key in headers and key in (b'host', b'origin', b'x-paperlens-token'):
+                    duplicates = True
+                headers[key] = value
+            origin = self.origin or ''
+            valid = bool(origin) and not duplicates and headers.get(b'host') == origin.removeprefix('http://').encode()
+            valid = valid and (b'origin' not in headers or headers[b'origin'] == origin.encode())
+            path = scope['path']
+            if path.startswith('/api/'):
+                valid = valid and hmac.compare_digest(headers.get(b'x-paperlens-token', b''), self.token.encode())
+            if scope['method'] == 'OPTIONS' or path in ('/api/docs', '/api/openapi.json', '/docs', '/redoc', '/openapi.json'):
+                valid = False
+            async def secured(message):
+                if message['type'] == 'http.response.start':
+                    message['headers'] = [(k,v) for k,v in message.get('headers',[]) if not k.lower().startswith(b'access-control-')]
+                    message['headers'] += [(b'x-frame-options',b'DENY'),(b'referrer-policy',b'no-referrer'),(b'content-security-policy',b"frame-ancestors 'none'"),(b'x-content-type-options',b'nosniff')]
+                await send(message)
+            if not valid:
+                from starlette.responses import JSONResponse
+                response = JSONResponse({'error_code':'DESKTOP_ACCESS_DENIED','message':'本机请求未获授权。','retryable':False}, status_code=403)
+                return await response(scope, receive, secured)
+            await app(scope, receive, secured)
+        return guarded
+
+
+def navigation_allowed(url, origin):
+    return url == origin + '/'
+
+
 def frontend_resources() -> Path:
     root = Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2]
     return root / "frontend/dist"
 
 
-def create_desktop_app(resources: Path, data_dir: Path):
+def create_desktop_app(resources: Path, data_dir: Path, *, token=None):
     resources = resources.resolve()
     data_dir = data_dir.resolve()
     if data_dir.is_relative_to(resources) or resources.is_relative_to(data_dir):
@@ -163,9 +204,13 @@ def create_desktop_app(resources: Path, data_dir: Path):
                         paperlens_data_dir=data_dir, hy3_api_key="")
     app = create_app(settings_override=settings,
                      document_service=DocumentService(settings, text_only=True))
+    import secrets
+    access = DesktopAccess(token or secrets.token_urlsafe(32))
+    app.state.desktop_access = access
     gate = RequestGate()
     app.state.desktop_gate = gate
     app.add_middleware(gate)
+    app.add_middleware(access)
     html = (resources / "index.html").read_text(encoding="utf-8")
     html = html.replace("<head>", '<head><meta name="paperlens-desktop" content="prototype">', 1)
 
@@ -184,6 +229,8 @@ class LocalServer:
         self.socket.bind(("127.0.0.1", 0))
         self.port = self.socket.getsockname()[1]
         self.url = f"http://127.0.0.1:{self.port}"
+        self.access = app.state.desktop_access
+        self.access.origin = self.url
         self.server = uvicorn.Server(uvicorn.Config(
             app, host="127.0.0.1", log_config=None, access_log=False,
             log_level="critical", timeout_graceful_shutdown=5,
@@ -201,7 +248,7 @@ class LocalServer:
                 raise DesktopError("DESKTOP_START_FAILED")
             if self.server.started:
                 try:
-                    with opener.open(self.url + "/api/health", timeout=0.5) as response:
+                    with opener.open(urllib.request.Request(self.url + "/api/health", headers={"X-PaperLens-Token":self.access.token}), timeout=0.5) as response:
                         if json.load(response) == {"status":"ok", "service":"paperlens-api", "version":"0.1.0"}:
                             return
                 except (OSError, ValueError):
@@ -238,7 +285,7 @@ def main() -> int:
             raise DesktopError('DESKTOP_DATA_UNAVAILABLE') from None
         install_guard(data)
         import webview
-        app = create_desktop_app(frontend_resources(), data / "data")
+        app = create_desktop_app(frontend_resources(), data / "data", token=webview.token)
         server = LocalServer(app)
         server.start()
         webview.settings["ALLOW_DOWNLOADS"] = True
@@ -250,9 +297,17 @@ def main() -> int:
             # pywebview 6.2.1's pinned Windows native surface, before first load.
             native = window.native.webview
             def navigating(sender, args):
-                if str(args.Uri) != server.url + "/":
+                if not navigation_allowed(str(args.Uri), server.url):
                     args.Cancel = True
             native.NavigationStarting += navigating
+            def initialized(sender, args):
+                if args.IsSuccess:
+                    core = native.CoreWebView2
+                    core.NewWindowRequested -= window.native.browser.on_new_window_request
+                    def refuse_new_window(sender, args):
+                        args.Handled = True
+                    core.NewWindowRequested += refuse_new_window
+            native.CoreWebView2InitializationCompleted += initialized
         window.events.before_show += restrict_navigation
         def notify(message):
             import ctypes

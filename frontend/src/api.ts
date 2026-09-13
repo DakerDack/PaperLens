@@ -77,6 +77,17 @@ function isErrorResponse(value: unknown): value is ErrorResponse {
 async function request(path: string, init?: RequestInit): Promise<Response> {
   try {
     const base = document.querySelector('meta[name="paperlens-desktop"]') ? "" : API_BASE_URL;
+    if (base === "" && document.querySelector('meta[name="paperlens-desktop"]')) {
+      const native = () => (window as Window & { pywebview?: { token?: string } }).pywebview?.token;
+      if (!native()) {
+        await new Promise<void>((resolve) => window.addEventListener("pywebviewready", () => resolve(), { once: true }));
+      }
+      const token = native();
+      if (!token) throw new Error("Desktop session unavailable");
+      const headers = new Headers(init?.headers);
+      headers.set("X-PaperLens-Token", token);
+      return await fetch(path, { ...init, headers });
+    }
     return await fetch(`${base}${path}`, init);
   } catch (error: unknown) {
     if (isRequestCancelled(error)) {

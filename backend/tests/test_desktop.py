@@ -2,7 +2,14 @@ from pathlib import Path
 import socket
 
 import pytest
-from fastapi.testclient import TestClient
+from fastapi.testclient import TestClient as RawTestClient
+
+
+def TestClient(app, **kwargs):
+    if hasattr(app, 'state') and hasattr(app.state, 'desktop_access'):
+        app.state.desktop_access.origin = 'http://testserver'
+        kwargs['headers'] = {'X-PaperLens-Token':app.state.desktop_access.token}
+    return RawTestClient(app, **kwargs)
 
 
 def test_desktop_missing_resources_fail_before_start(tmp_path):
@@ -71,7 +78,7 @@ def test_main_reports_cleanup_failure_without_masking_startup(
         def __iadd__(self, handler):
             return self
     window = SimpleNamespace(events=SimpleNamespace(before_show=Event(), closing=Event()))
-    webview = SimpleNamespace(settings={}, create_window=Mock(return_value=window), start=Mock())
+    webview = SimpleNamespace(token='synthetic-session', settings={}, create_window=Mock(return_value=window), start=Mock())
     downloads_at_creation = []
     webview.create_window.side_effect = lambda *args, **kwargs: (downloads_at_creation.append(webview.settings.get('ALLOW_DOWNLOADS')), window)[1]
     dialog = Mock()
@@ -279,7 +286,8 @@ from contextlib import contextmanager
 from fastapi.testclient import TestClient
 from backend.app.desktop import create_desktop_app
 app=create_desktop_app(Path({str(assets)!r}),Path({str(data)!r}))
-with TestClient(app) as client:
+app.state.desktop_access.origin='http://testserver'
+with TestClient(app,headers={{'X-PaperLens-Token':app.state.desktop_access.token}}) as client:
     original=app.state.project_store._transaction
     @contextmanager
     def crash_before_commit(*args,**kwargs):
@@ -333,3 +341,68 @@ def test_main_preflight_failure_never_starts_service(monkeypatch,tmp_path,duplic
     else:
         lock.close.assert_called_once()
         assert 'DESKTOP_DATA_UNAVAILABLE' in dialog.call_args.args[1]
+
+
+@pytest.mark.parametrize('path', ['/api/health','/api/projects/test/pdf','/api/projects/test/export','/api/missing'])
+def test_access_requires_token_on_every_api(tmp_path,path):
+    from backend.app.desktop import DesktopAccess
+    from starlette.responses import PlainTextResponse
+    async def app(scope,receive,send):
+        if scope['type']=='lifespan':
+            await receive();await send({'type':'lifespan.startup.complete'});await receive();await send({'type':'lifespan.shutdown.complete'});return
+        await PlainTextResponse('allowed')(scope,receive,send)
+    access=DesktopAccess('synthetic-token')
+    access.origin='http://127.0.0.1:43210'
+    with TestClient(access(app),base_url=access.origin) as client:
+        for headers in ({},{'X-PaperLens-Token':'wrong'},{'X-PaperLens-Token':'synthetic-token','Origin':'null'},{'X-PaperLens-Token':'synthetic-token','Host':'evil.invalid:43210'},{'X-PaperLens-Token':'synthetic-token','Origin':'https://evil.invalid'}):
+            response=client.get(path,headers=headers)
+            assert response.status_code==403
+            assert response.json()['error_code']=='DESKTOP_ACCESS_DENIED'
+        assert client.get(path,headers={'X-PaperLens-Token':'synthetic-token','Origin':access.origin}).text=='allowed'
+        assert client.options(path,headers={'X-PaperLens-Token':'synthetic-token'}).status_code==403
+        assert client.get(path+'?token=synthetic-token').status_code==403
+
+
+def test_access_static_headers_and_restart_token():
+    from backend.app.desktop import DesktopAccess
+    from starlette.responses import PlainTextResponse
+    async def app(scope,receive,send):
+        if scope['type']=='lifespan':
+            await receive();await send({'type':'lifespan.startup.complete'});await receive();await send({'type':'lifespan.shutdown.complete'});return
+        await PlainTextResponse('static')(scope,receive,send)
+    access=DesktopAccess('new-synthetic-token');access.origin='http://127.0.0.1:43210'
+    with TestClient(access(app),base_url=access.origin) as client:
+        response=client.get('/')
+        assert response.status_code==200
+        assert 'new-synthetic-token' not in response.text
+        assert response.headers['x-frame-options']=='DENY'
+        assert response.headers['referrer-policy']=='no-referrer'
+        assert client.get('/api/health',headers={'X-PaperLens-Token':'old-synthetic-token'}).status_code==403
+        for path in ('/api/docs','/api/openapi.json','/redoc'):
+            assert client.get(path,headers={'X-PaperLens-Token':'new-synthetic-token'}).status_code==403
+
+
+def test_real_desktop_denies_discovery_and_static_escape(tmp_path):
+    from backend.app.desktop import create_desktop_app
+    assets=tmp_path/'assets';assets.mkdir();(assets/'index.html').write_text('<head>public</head>')
+    (tmp_path/'private.txt').write_text('synthetic-private')
+    app=create_desktop_app(assets,tmp_path/'data',token='synthetic-token')
+    app.state.desktop_access.origin='http://testserver'
+    with RawTestClient(app) as client:
+        assert client.get('/').status_code==200
+        for path in ('/api/health','/api/projects/x/pdf','/api/projects/x/export','/api/missing'):
+            assert client.get(path).status_code==403
+        for content_type,body in [('application/json','{}'),('application/x-www-form-urlencoded','rights_confirmed=true')]:
+            assert client.post('/api/projects',content=body,headers={'Origin':'https://evil.invalid','Content-Type':content_type}).status_code==403
+        assert client.get('/api/health',headers={'X-PaperLens-Token':'synthetic-token'}).status_code==200
+        assert client.get('/api/missing',headers={'X-PaperLens-Token':'synthetic-token'}).status_code==404
+        assert client.get('/%2e%2e/private.txt').status_code==404
+        assert client.get('/api/docs',headers={'X-PaperLens-Token':'synthetic-token','Origin':'http://localhost:5173'}).status_code==403
+        assert 'access-control-allow-origin' not in client.get('/',headers={'Origin':'http://localhost:5173'}).headers
+
+
+@pytest.mark.parametrize('url',['https://example.invalid/','file:///C:/synthetic','http://127.0.0.1:1235/','http://127.0.0.1:1234/other','javascript:alert(1)'])
+def test_navigation_rejects_every_non_workbench_url(url):
+    from backend.app.desktop import navigation_allowed
+    assert not navigation_allowed(url,'http://127.0.0.1:1234')
+    assert navigation_allowed('http://127.0.0.1:1234/','http://127.0.0.1:1234')

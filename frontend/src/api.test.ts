@@ -36,7 +36,13 @@ describe("PaperLens API client", () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response("{}", {status: 200}));
     vi.stubGlobal("fetch", fetchMock);
     try {
-      await getProject("synthetic");
+      const pending = getProject("synthetic");
+      await Promise.resolve();
+      expect(fetchMock).not.toHaveBeenCalled();
+      vi.stubGlobal("pywebview", { token: "synthetic-session-token" });
+      window.dispatchEvent(new Event("pywebviewready"));
+      await pending;
+      expect(new Headers(fetchMock.mock.calls[0][1].headers).get("X-PaperLens-Token")).toBe("synthetic-session-token");
       expect(fetchMock.mock.calls[0][0]).toBe("/api/projects/synthetic");
     } finally {
       marker.remove();
