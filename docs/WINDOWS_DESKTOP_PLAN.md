@@ -119,6 +119,7 @@ PDF.js worker、cMaps、standard_fonts、wasm 从已锁定 pdfjs-dist 收集到 
 | D3a | 合成 Key 可安全存取与显式清除，失败无明文回退 | backend/app/desktop_credentials.py；backend/tests/test_desktop_credentials.py；backend/app/models.py；backend/tests/test_models.py | F desktop_credentials + models；本次专用合成目标的清除成功、ERROR_NOT_FOUND/重复清除、受控删除失败及错误信封；不操作其他目标 |
 | D3b | 设置/清除桥验证并接入下次启动 Settings | backend/app/desktop.py；backend/tests/test_desktop.py；frontend/src/api.ts；frontend/src/types.ts | F desktop；UI/API 类型构建；合成 Key 清除后持久化状态 false、当前实例配置不变、重启无 Key；删除失败保留状态/配置，查询失败不返回 false；无网络调用 |
 | D3c | 用户可保存或显式清除 Key 并看到结果与重启提示 | frontend/src/components/DesktopSettings.tsx；frontend/src/components/DesktopSettings.test.tsx；frontend/src/App.tsx；frontend/src/styles.css | UI；原生设置流程仅用本次专用合成目标，验证清除入口、成功/失败反馈、重复清除、重启后未配置状态及 live 缺 Key 错误；不回显 Key |
+| D4a-a | 离线验收入口隔离；正常入口保持 | docs/WINDOWS_DESKTOP_PLAN.md；backend/app/desktop.py；backend/tests/test_desktop.py | F desktop；backend；未知参数副作用前拒绝、随机临时根/合成凭据、强制 Mock；真实冻结入口由 D4a 复核 |
 | D4a | 可复现安装器生成且资源完整 | packaging/windows.iss；tools/build_desktop.ps1；backend/tests/test_desktop_package.py；docs/THIRD_PARTY_NOTICES.md | F desktop_package；B；ISCC |
 | D4b | 实际安装升级卸载保留合成数据 | tools/verify_windows_install.ps1；backend/tests/test_desktop_package.py；packaging/windows.iss；docs/WINDOWS_DESKTOP_ACCEPTANCE.md | I；失败/取消/重装实测 |
 | D5a | 产品/安装包/使用文档版本一致 | pyproject.toml；frontend/package.json；frontend/package-lock.json；README.md | 版本核对；R；B；I |
@@ -260,3 +261,10 @@ git diff --check
 git status --short
 ```
 模拟冻结路径及开关测试不代表实际 EXE 或下载成功。真实冻结包、PDF 渲染、保存及取消操作仍由原 D1e 验证。
+
+
+### D4a-a 已审查拆卡（2026-09-13）
+
+D3c 提交 c3edef880369179be86643417f66a3e8c136e307 后先做 D4a-a，独立 PASS 后提交再进入 D4a。--offline-test 在正式状态/凭据/用户目录访问前分流，使用随机临时数据根和随机 PaperLens.Test.<随机值>/Hy3 目标、独立互斥体；无参数保持正常入口，未知/重复参数先拒绝。离线实例强制 Mock/空 Key/text-only，即使设置保存 live 也不改变该实例。复用保护钩子禁止 Python 非回环网络和未授权子进程；正常退出仅清理本次合成凭据，保留临时数据作证据。窗口和页面明确标记离线验收；不是 OS 对同用户恶意程序的隔离沙箱。新的离线启动使用新的临时根，不提供任意指定目录或凭据目标参数。
+
+D1e 接受的 generation_valid.json、deep_audit_v3_valid.json、source_blocks.json 是 Mock 必需运行时资源，Release 可保留；“不嵌入测试数据”指验收输入、临时状态及用户材料，不要求移除上述三份资源。

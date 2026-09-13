@@ -563,3 +563,81 @@ def test_startup_credential_error_keeps_stable_code(monkeypatch,tmp_path):
     monkeypatch.setattr(ctypes,'windll',SimpleNamespace(user32=SimpleNamespace(MessageBoxW=dialog)))
     assert desktop.main()==1
     assert 'DESKTOP_CREDENTIAL_UNAVAILABLE' in dialog.call_args.args[1]
+
+
+@pytest.mark.parametrize('arguments', [['--unknown'], ['--offline-test','extra']])
+def test_unknown_arguments_precede_all_side_effects(monkeypatch,arguments):
+    from backend.app import desktop
+    from tools import desktop_verify
+    import ctypes
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    def forbidden(*args,**kwargs):pytest.fail('side effect before argument validation')
+    monkeypatch.setattr(desktop_verify,'clean_environment',forbidden)
+    monkeypatch.setattr(desktop,'user_data_root',forbidden)
+    monkeypatch.setattr(desktop,'InstanceLock',forbidden)
+    dialog=Mock()
+    monkeypatch.setattr(ctypes,'windll',SimpleNamespace(user32=SimpleNamespace(MessageBoxW=dialog)))
+    assert desktop.main(arguments)==1
+    assert 'DESKTOP_SETTINGS_INVALID' in dialog.call_args.args[1]
+
+
+def test_offline_profile_never_loads_production_state_and_stays_mock(monkeypatch,tmp_path):
+    from backend.app import desktop
+    def forbidden():pytest.fail('production user root accessed')
+    monkeypatch.setattr(desktop,'user_data_root',forbidden)
+    root,store=desktop.offline_profile()
+    try:
+        assert root != tmp_path
+        assert store._target.startswith('PaperLens.Test.')
+        bridge=desktop.RecentProjectBridge(root/'desktop-state.json','http://127.0.0.1:1',lambda:'http://127.0.0.1:1/',credentials=store)
+        assert bridge.save_desktop_settings({'mode':'live','api_key':'synthetic-only'})['ok']
+        resources=tmp_path/'assets';resources.mkdir();(resources/'index.html').write_text('<head></head>')
+        app=desktop.create_desktop_app(resources,root/'data',settings_bridge=bridge,offline_test=True)
+        assert app.state.settings.paperlens_model_mode=='mock'
+        assert app.state.settings.hy3_api_key==''
+        assert app.state.document_service.text_only
+        assert '离线验收' in TestClient(app).get('/').text
+    finally:
+        store.clear()
+
+
+def test_offline_main_routes_before_production_and_cleans_only_synthetic(monkeypatch,tmp_path):
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from backend.app import desktop
+    from tools import desktop_verify
+    from backend.app.desktop_credentials import CredentialStore
+    targets=[]
+    original=desktop.offline_profile
+    def profile():
+        root,store=original()
+        targets.append((root,store))
+        return root,store
+    monkeypatch.setattr(desktop,'offline_profile',profile)
+    monkeypatch.setattr(desktop,'user_data_root',lambda:pytest.fail('production root accessed'))
+    monkeypatch.setattr(desktop,'InstanceLock',Mock())
+    monkeypatch.setattr(desktop_verify,'install_guard',lambda path:None)
+    monkeypatch.setattr(desktop_verify,'clean_environment',lambda:dict(desktop.os.environ))
+    class Event:
+        def __iadd__(self,handler):return self
+    window=SimpleNamespace(events=SimpleNamespace(before_show=Event(),closing=Event()),get_current_url=lambda:'http://127.0.0.1:1/')
+    webview=SimpleNamespace(token='synthetic',settings={},create_window=Mock(return_value=window))
+    captured={}
+    def create(resources,data,**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(state=SimpleNamespace(settings=SimpleNamespace(paperlens_model_mode='mock')))
+    monkeypatch.setattr(desktop,'create_desktop_app',create)
+    monkeypatch.setattr(desktop,'LocalServer',Mock(return_value=Mock(url='http://127.0.0.1:1')))
+    def start(**kwargs):
+        bridge=captured['settings_bridge']
+        assert bridge.save_desktop_settings({'mode':'live','api_key':'synthetic-only'})['ok']
+        assert captured['offline_test'] is True
+    webview.start=start
+    monkeypatch.setitem(sys.modules,'webview',webview)
+    assert desktop.main(['--offline-test'])==0
+    assert '离线验收' in webview.create_window.call_args.args[0]
+    root,store=targets[0]
+    assert store.read() is None
+    assert root.exists()  # synthetic evidence retained, not recursively deleted

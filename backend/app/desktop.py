@@ -329,7 +329,7 @@ def frontend_resources() -> Path:
     return root / "frontend/dist"
 
 
-def create_desktop_app(resources: Path, data_dir: Path, *, token=None, settings_bridge=None):
+def create_desktop_app(resources: Path, data_dir: Path, *, token=None, settings_bridge=None, offline_test=False):
     resources = resources.resolve()
     data_dir = data_dir.resolve()
     if data_dir.is_relative_to(resources) or resources.is_relative_to(data_dir):
@@ -344,7 +344,7 @@ def create_desktop_app(resources: Path, data_dir: Path, *, token=None, settings_
     from backend.app.document_service import DocumentService
     from backend.app.settings import Settings
 
-    mode, key = settings_bridge._startup_configuration() if settings_bridge is not None else ("live", "")
+    mode, key = ("mock", "") if offline_test else (settings_bridge._startup_configuration() if settings_bridge is not None else ("live", ""))
     settings = Settings(paperlens_env="test", paperlens_model_mode=mode,
                         paperlens_data_dir=data_dir, hy3_api_key=key)
     app = create_app(settings_override=settings,
@@ -358,6 +358,11 @@ def create_desktop_app(resources: Path, data_dir: Path, *, token=None, settings_
     app.add_middleware(access)
     html = (resources / "index.html").read_text(encoding="utf-8")
     html = html.replace("<head>", '<head><meta name="paperlens-desktop" content="prototype">', 1)
+
+    if offline_test:
+        html = html.replace("<body>", '<body><div role="status">离线验收 · MOCK · 临时数据，非真实模型结果</div>', 1)
+        if "离线验收" not in html:
+            html += "<!-- 离线验收 MOCK -->"
 
     @app.get("/", include_in_schema=False)
     def index():
@@ -411,34 +416,51 @@ class LocalServer:
             raise DesktopError("DESKTOP_EXIT_TIMEOUT")
 
 
-def main() -> int:
-    # Settings remain explicit Mock with no key until D3.
+def offline_profile():
+    from uuid import uuid4
+    from backend.app.desktop_credentials import CredentialStore
+    data = Path(tempfile.mkdtemp(prefix='paperlens-offline-'))
+    return data, CredentialStore(target='PaperLens.Test.' + uuid4().hex + '/Hy3')
+
+
+def main(arguments=()) -> int:
+    # Validate before environment, user paths, locking, state or credentials.
+    if list(arguments) not in ([], ['--offline-test']):
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, '启动参数无效：DESKTOP_SETTINGS_INVALID', 'PaperLens', 0x10)
+        return 1
+    offline_test = bool(arguments)
     from tools.desktop_verify import clean_environment, install_guard
     environment = clean_environment()
     os.environ.clear()
     os.environ.update(environment)
     os.environ["PYTHONNET_RUNTIME"] = "netfx"
     instance = None
+    credentials = None
     server = None
     code = None
     try:
-        instance = InstanceLock()
-        data = user_data_root()
+        if offline_test:
+            data, credentials = offline_profile()
+            instance = InstanceLock('PaperLens.Offline.' + data.name)
+        else:
+            instance = InstanceLock()
+            data = user_data_root()
         try:
             data.mkdir(parents=True, exist_ok=True)
         except OSError:
             raise DesktopError('DESKTOP_DATA_UNAVAILABLE') from None
         install_guard(data)
         import webview
-        bridge = RecentProjectBridge(data / "desktop-state.json", None, lambda: window.get_current_url())
-        app = create_desktop_app(frontend_resources(), data / "data", token=webview.token, settings_bridge=bridge)
+        bridge = RecentProjectBridge(data / "desktop-state.json", None, lambda: window.get_current_url(), credentials=credentials)
+        app = create_desktop_app(frontend_resources(), data / "data", token=webview.token, settings_bridge=bridge, offline_test=offline_test)
         server = LocalServer(app)
         server.start()
         webview.settings["ALLOW_DOWNLOADS"] = True
         webview.settings["ALLOW_FILE_URLS"] = False
         webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = False
         bridge._origin = server.url
-        window = webview.create_window(f"PaperLens · {app.state.settings.paperlens_model_mode.upper()}", server.url,
+        window = webview.create_window(f"PaperLens · {'离线验收 · ' if offline_test else ''}{app.state.settings.paperlens_model_mode.upper()}", server.url,
                                        width=1280, height=850, js_api=bridge)
         def restrict_navigation():
             # pywebview 6.2.1's pinned Windows native surface, before first load.
@@ -473,6 +495,12 @@ def main() -> int:
             except Exception as error:
                 if code is None:
                     code = str(error) if isinstance(error, DesktopError) else "DESKTOP_EXIT_TIMEOUT"
+        if credentials is not None:
+            try:
+                credentials.clear()
+            except Exception:
+                if code is None:
+                    code = 'DESKTOP_CREDENTIAL_UNAVAILABLE'
         if instance is not None:
             instance.close()
     if code is not None:
@@ -484,5 +512,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
 
