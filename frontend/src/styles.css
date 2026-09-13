@@ -1111,3 +1111,18 @@ select:focus-visible {
     animation: none;
   }
 }
+
+
+.desktop-settings { padding: 0 24px 12px; }
+.desktop-settings > button,
+.desktop-settings-actions > button { min-height: 38px; padding: 8px 14px; border: 1px solid var(--line-strong); border-radius: 6px; }
+.desktop-settings-panel { margin-top: 12px; padding: 20px; max-width: 720px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+.desktop-settings-panel h2 { margin: 0 0 8px; font-size: 18px; }
+.desktop-settings-panel p { color: var(--muted); font-size: 14px; line-height: 1.6; }
+.desktop-settings-panel label { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; font-size: 14px; font-weight: 600; }
+.desktop-settings-panel input,
+.desktop-settings-panel select { width: 100%; min-height: 40px; padding: 8px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--surface); }
+.desktop-settings-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+.desktop-settings-panel .desktop-settings-error { color: var(--red); }
+.desktop-settings :focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+@media (max-width: 600px) { .desktop-settings { padding: 0 12px 12px; } .desktop-settings-panel { padding: 14px; } }

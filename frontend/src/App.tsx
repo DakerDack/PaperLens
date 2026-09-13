@@ -21,6 +21,7 @@ import {
   restoreProjectVersion,
   type RequestHandle,
 } from "./api";
+import { DesktopSettings } from "./components/DesktopSettings";
 import { DocumentPane } from "./components/DocumentPane";
 import { PdfPane, type PdfTarget } from "./components/PdfPane";
 import {
@@ -879,6 +880,7 @@ export function App() {
         </div>
       </header>
 
+      {desktop && <DesktopSettings />}
       {desktop && (
         <section className="command-bar" aria-label="打开已有项目">
           <label>已有项目 ID <input aria-label="已有项目 ID" value={projectIdInput} maxLength={100}
