@@ -1279,3 +1279,26 @@ def test_desktop_state_contract_has_only_non_secret_fields():
     assert models.DesktopState().model_dump()=={'project_id':None,'mode':'mock'}
     with pytest.raises(ValidationError):
         models.DesktopState.model_validate({'api_key':'synthetic-not-a-key'})
+
+
+@pytest.mark.parametrize('payload', [
+    {'mode':'other'}, {'mode':'live','api_key':''}, {'mode':'live','api_key':'   '},
+    {'mode':'live','api_key':None}, {'mode':'live','api_key':123},
+    {'mode':'live','api_key':'x'*2561}, {'mode':'live','api_key':'a\x00b'},
+    {'mode':'live','target':'anything'},
+])
+def test_desktop_settings_input_rejects_invalid(payload):
+    with pytest.raises(ValidationError):
+        models.DesktopSettingsRequest.model_validate(payload)
+
+
+def test_desktop_settings_omission_and_secret_redaction():
+    omitted = models.DesktopSettingsRequest(mode='live')
+    assert 'api_key' not in omitted.model_fields_set
+    request = models.DesktopSettingsRequest(mode='mock', api_key='synthetic-only')
+    assert request.api_key.get_secret_value() == 'synthetic-only'
+    assert 'synthetic-only' not in repr(request)
+    assert 'synthetic-only' not in request.model_dump_json()
+    assert models.DesktopSettingsStatus(mode='live',key_configured=False).model_dump() == {'mode':'live','key_configured':False}
+    with pytest.raises(ValidationError):
+        models.DesktopSettingsStatus(mode='live',key_configured=False,api_key='synthetic-only')
