@@ -180,6 +180,77 @@ def navigation_allowed(url, origin):
     return url == origin + '/'
 
 
+class RecentProjectBridge:
+    def __init__(self, path, origin, current_url):
+        self._path = path
+        self._origin = origin
+        self._current_url = current_url
+        self._lock = threading.Lock()
+
+    def _trusted(self):
+        return navigation_allowed(self._current_url(), self._origin)
+
+    def _read(self):
+        from backend.app.models import DesktopState
+        from pydantic import ValidationError
+        try:
+            return DesktopState.model_validate_json(self._path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            return DesktopState()
+        except (ValidationError, UnicodeError):
+            raise DesktopError('DESKTOP_STATE_INVALID') from None
+
+    @staticmethod
+    def _error(code):
+        messages = {'DESKTOP_ACCESS_DENIED':'当前窗口无权访问桌面状态。',
+                    'DESKTOP_STATE_INVALID':'桌面状态无效，请检查后重试。',
+                    'DESKTOP_DATA_UNAVAILABLE':'无法读写桌面状态，请重试。'}
+        return {'ok':False,'error':{'error_code':code,'message':messages[code],'retryable':code=='DESKTOP_DATA_UNAVAILABLE'}}
+
+    def get_recent_project(self):
+        try:
+            if not self._trusted():
+                return self._error('DESKTOP_ACCESS_DENIED')
+            with self._lock:
+                state = self._read()
+            return {'ok':True,'value':{'project_id':state.project_id}}
+        except DesktopError as error:
+            return self._error(str(error))
+        except Exception:
+            return self._error('DESKTOP_DATA_UNAVAILABLE')
+
+    def set_recent_project(self, payload):
+        from backend.app.models import DesktopRecentProjectRequest
+        from pydantic import ValidationError
+        try:
+            if not self._trusted():
+                return self._error('DESKTOP_ACCESS_DENIED')
+            request = DesktopRecentProjectRequest.model_validate(payload)
+            with self._lock:
+                state = self._read()
+                state.project_id = request.project_id
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=self._path.parent,
+                                                     prefix='.desktop-state-', suffix='.tmp', delete=False) as stream:
+                        temporary = Path(stream.name)
+                        stream.write(state.model_dump_json())
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, self._path)
+                finally:
+                    if temporary is not None and temporary.exists():
+                        temporary.unlink()
+            return {'ok':True,'value':{'saved':True}}
+        except ValidationError:
+            return self._error('DESKTOP_STATE_INVALID')
+        except DesktopError as error:
+            return self._error(str(error))
+        except Exception:
+            return self._error('DESKTOP_DATA_UNAVAILABLE')
+
+
 def frontend_resources() -> Path:
     root = Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2]
     return root / "frontend/dist"
@@ -291,8 +362,9 @@ def main() -> int:
         webview.settings["ALLOW_DOWNLOADS"] = True
         webview.settings["ALLOW_FILE_URLS"] = False
         webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = False
+        bridge = RecentProjectBridge(data / 'desktop-state.json', server.url, lambda: window.get_current_url())
         window = webview.create_window("PaperLens · 桌面原型 · MOCK", server.url,
-                                       width=1280, height=850)
+                                       width=1280, height=850, js_api=bridge)
         def restrict_navigation():
             # pywebview 6.2.1's pinned Windows native surface, before first load.
             native = window.native.webview

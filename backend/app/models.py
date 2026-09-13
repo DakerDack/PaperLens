@@ -926,3 +926,12 @@ class HealthResponse(StrictModel):
     status: str = Field(pattern="^ok$")
     service: str = Field(pattern="^paperlens-api$")
     version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+
+
+class DesktopRecentProjectRequest(StrictModel):
+    project_id: Identifier
+
+
+class DesktopState(StrictModel):
+    project_id: Identifier | None = None
+    mode: Literal['mock', 'live'] = 'mock'

@@ -1265,3 +1265,17 @@ def test_stage_four_deep_audit_response_requires_deep_audited_stage() -> None:
 
     with pytest.raises(ValidationError, match="stage"):
         DeepAuditResponse.model_validate(payload)
+
+
+@pytest.mark.parametrize('payload',[{'project_id':''},{'project_id':123},{'project_id':'x'*101},{'project_id':'valid','extra':True}])
+def test_desktop_recent_request_rejects_invalid_input(payload):
+    with pytest.raises(ValidationError):
+        models.DesktopRecentProjectRequest.model_validate(payload)
+
+
+def test_desktop_state_contract_has_only_non_secret_fields():
+    state=models.DesktopState.model_validate({'project_id':'project-1','mode':'live'})
+    assert state.model_dump()=={'project_id':'project-1','mode':'live'}
+    assert models.DesktopState().model_dump()=={'project_id':None,'mode':'mock'}
+    with pytest.raises(ValidationError):
+        models.DesktopState.model_validate({'api_key':'synthetic-not-a-key'})

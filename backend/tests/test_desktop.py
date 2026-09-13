@@ -406,3 +406,53 @@ def test_navigation_rejects_every_non_workbench_url(url):
     from backend.app.desktop import navigation_allowed
     assert not navigation_allowed(url,'http://127.0.0.1:1234')
     assert navigation_allowed('http://127.0.0.1:1234/','http://127.0.0.1:1234')
+
+
+def test_recent_bridge_persists_across_ports_and_restart(tmp_path):
+    from backend.app.desktop import RecentProjectBridge
+    path=tmp_path/'desktop-state.json'
+    first=RecentProjectBridge(path,'http://127.0.0.1:1234',lambda:'http://127.0.0.1:1234/')
+    assert first.get_recent_project()=={'ok':True,'value':{'project_id':None}}
+    assert first.set_recent_project({'project_id':'project-1'})=={'ok':True,'value':{'saved':True}}
+    second=RecentProjectBridge(path,'http://127.0.0.1:5678',lambda:'http://127.0.0.1:5678/')
+    assert second.get_recent_project()=={'ok':True,'value':{'project_id':'project-1'}}
+    assert set(__import__('json').loads(path.read_text()))=={'project_id','mode'}
+
+
+def test_recent_bridge_denies_untrusted_and_preserves_corruption(tmp_path):
+    from backend.app.desktop import RecentProjectBridge
+    path=tmp_path/'desktop-state.json';path.write_text('broken synthetic')
+    denied=RecentProjectBridge(path,'http://127.0.0.1:1234',lambda:'https://example.invalid/')
+    assert denied.get_recent_project()['error']['error_code']=='DESKTOP_ACCESS_DENIED'
+    bridge=RecentProjectBridge(path,'http://127.0.0.1:1234',lambda:'http://127.0.0.1:1234/')
+    assert bridge.get_recent_project()['error']['error_code']=='DESKTOP_STATE_INVALID'
+    assert bridge.set_recent_project({'project_id':'valid'})['error']['error_code']=='DESKTOP_STATE_INVALID'
+    assert path.read_text()=='broken synthetic'
+    assert bridge.set_recent_project({'project_id':123})['ok'] is False
+
+
+def test_recent_bridge_atomic_failure_preserves_previous_mode_and_id(tmp_path,monkeypatch):
+    import json
+    from backend.app import desktop
+    path=tmp_path/'desktop-state.json';path.write_text(json.dumps({'project_id':'old','mode':'live'}))
+    bridge=desktop.RecentProjectBridge(path,'http://127.0.0.1:1234',lambda:'http://127.0.0.1:1234/')
+    def fail(*args): raise OSError('synthetic private path must not escape')
+    monkeypatch.setattr(desktop.os,'replace',fail)
+    result=bridge.set_recent_project({'project_id':'new'})
+    assert result['error']['error_code']=='DESKTOP_DATA_UNAVAILABLE'
+    assert 'synthetic private' not in str(result)
+    assert json.loads(path.read_text())=={'project_id':'old','mode':'live'}
+
+
+def test_recent_bridge_preserves_live_mode_on_success_and_io_error(tmp_path,monkeypatch):
+    import json
+    from backend.app.desktop import RecentProjectBridge
+    path=tmp_path/'desktop-state.json';path.write_text(json.dumps({'project_id':'old','mode':'live'}))
+    bridge=RecentProjectBridge(path,'http://127.0.0.1:1234',lambda:'http://127.0.0.1:1234/')
+    assert bridge.set_recent_project({'project_id':'new'})=={'ok':True,'value':{'saved':True}}
+    assert json.loads(path.read_text())=={'project_id':'new','mode':'live'}
+    def fail(*args,**kwargs):raise PermissionError('synthetic private detail')
+    monkeypatch.setattr(Path,'read_text',fail)
+    result=bridge.get_recent_project()
+    assert result['error']['error_code']=='DESKTOP_DATA_UNAVAILABLE'
+    assert 'synthetic private' not in str(result)
