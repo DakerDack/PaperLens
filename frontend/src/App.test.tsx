@@ -13,6 +13,9 @@ import { App } from "./App";
 
 
 const apiMocks = vi.hoisted(() => ({
+  isDesktop: vi.fn(),
+  getRecentProject: vi.fn(),
+  setRecentProject: vi.fn(),
   acceptRevision: vi.fn(),
   auditProject: vi.fn(),
   createProject: vi.fn(),
@@ -227,6 +230,9 @@ const revisedProject: ProjectView = {
 
 beforeEach(() => {
   Object.values(apiMocks).forEach((mock) => mock.mockReset());
+  apiMocks.isDesktop.mockReturnValue(false);
+  apiMocks.getRecentProject.mockResolvedValue({ project_id: null });
+  apiMocks.setRecentProject.mockResolvedValue({ saved: true });
   apiMocks.getHealth.mockResolvedValue({
     status: "ok",
     service: "paperlens-api",
@@ -1741,4 +1747,113 @@ describe("PaperLens workbench", () => {
       ),
     );
   });
+});
+
+
+describe("desktop project recovery", () => {
+  it("restores the recent project and PDF without generation", async () => {
+    apiMocks.isDesktop.mockReturnValue(true);
+    apiMocks.getRecentProject.mockResolvedValue({ project_id: "p-1" });
+    apiMocks.getProject.mockResolvedValue(quickProject);
+    render(<App />);
+    await screen.findByText("实验组表现更好。");
+    expect(apiMocks.getProjectPdf).toHaveBeenCalledWith("p-1", expect.any(AbortSignal));
+    expect(apiMocks.generateProject).not.toHaveBeenCalled();
+    expect(apiMocks.setRecentProject).toHaveBeenCalledWith("p-1");
+  });
+
+  it("opens a specified project and retains it after a missing PDF failure", async () => {
+    apiMocks.isDesktop.mockReturnValue(true);
+    apiMocks.getProject.mockResolvedValue(quickProject);
+    render(<App />);
+    const open = await screen.findByRole("button", { name: "打开项目" });
+    await waitFor(() => expect((open as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.change(screen.getByLabelText("已有项目 ID"), { target: { value: "p-1" } });
+    fireEvent.click(open);
+    await screen.findByText("实验组表现更好。");
+    apiMocks.getProjectPdf.mockRejectedValueOnce(new ApiClientError(404, {
+      error_code: "PDF_NOT_FOUND", message: "PDF 不存在", retryable: false, details: null,
+    }));
+    fireEvent.change(screen.getByLabelText("已有项目 ID"), { target: { value: "p-2" } });
+    fireEvent.click(open);
+    await screen.findByText(/PDF_NOT_FOUND/);
+    expect(screen.getByText("实验组表现更好。")).toBeTruthy();
+    expect(apiMocks.setRecentProject).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports corrupt recent state and still permits manual opening", async () => {
+    apiMocks.isDesktop.mockReturnValue(true);
+    apiMocks.getRecentProject.mockRejectedValue(new ApiClientError(0, {
+      error_code: "DESKTOP_STATE_INVALID", message: "状态损坏", retryable: false, details: null,
+    }));
+    render(<App />);
+    await screen.findByText(/DESKTOP_STATE_INVALID/);
+    expect((screen.getByRole("button", { name: "打开项目" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("keeps an opened project when remembering it fails", async () => {
+    apiMocks.isDesktop.mockReturnValue(true);
+    apiMocks.getRecentProject.mockResolvedValue({ project_id: "p-1" });
+    apiMocks.getProject.mockResolvedValue(quickProject);
+    apiMocks.setRecentProject.mockRejectedValue(new ApiClientError(0, {
+      error_code: "DESKTOP_DATA_UNAVAILABLE", message: "无法保存", retryable: true, details: null,
+    }));
+    render(<App />);
+    await screen.findByText(/DESKTOP_DATA_UNAVAILABLE/);
+    expect(screen.getByText("实验组表现更好。")).toBeTruthy();
+  });
+
+  it("leaves browser startup unchanged", async () => {
+    render(<App />);
+    await screen.findByText("API 0.1.0");
+    expect(apiMocks.getRecentProject).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText("已有项目 ID")).toBeNull();
+  });
+});
+
+
+it("remembers a newly uploaded desktop project", async () => {
+  apiMocks.isDesktop.mockReturnValue(true);
+  apiMocks.getProject.mockResolvedValue(baseProject);
+  render(<App />);
+  await waitFor(() => expect((screen.getByLabelText("选择 PDF") as HTMLInputElement).disabled).toBe(false));
+  fireEvent.change(screen.getByLabelText("选择 PDF"), { target: { files: [new File(["%PDF-test"], "paper.pdf")] } });
+  fireEvent.click(screen.getByRole("checkbox", { name: /确认拥有处理权限/ }));
+  fireEvent.click(screen.getByRole("button", { name: "上传论文 PDF" }));
+  await waitFor(() => expect(apiMocks.setRecentProject).toHaveBeenCalledWith("p-1"));
+});
+
+it("reports a missing recent project without creating or replacing it", async () => {
+  apiMocks.isDesktop.mockReturnValue(true);
+  apiMocks.getRecentProject.mockResolvedValue({ project_id: "missing" });
+  apiMocks.getProject.mockRejectedValue(new ApiClientError(404, {
+    error_code: "PROJECT_NOT_FOUND", message: "项目不存在", retryable: false, details: null,
+  }));
+  render(<App />);
+  await screen.findByText(/PROJECT_NOT_FOUND/);
+  expect(apiMocks.setRecentProject).not.toHaveBeenCalled();
+  expect(apiMocks.createProject).not.toHaveBeenCalled();
+});
+
+it("uses the real typed bridge adapter and preserves stable errors", async () => {
+  const realApi = await vi.importActual<typeof import("./api")>("./api");
+  const meta = window.document.createElement("meta");
+  meta.name = "paperlens-desktop";
+  window.document.head.append(meta);
+  const host = window as Window & { pywebview?: unknown };
+  const previous = host.pywebview;
+  const save = vi.fn().mockResolvedValue({ ok: true, value: { saved: true } });
+  host.pywebview = { api: {
+    get_recent_project: () => Promise.resolve({ ok: false, error: {
+      error_code: "DESKTOP_STATE_INVALID", message: "状态损坏", retryable: false,
+    } }), set_recent_project: save,
+  } };
+  try {
+    await expect(realApi.setRecentProject("p-1")).resolves.toEqual({ saved: true });
+    expect(save).toHaveBeenCalledWith({ project_id: "p-1" });
+    await expect(realApi.getRecentProject()).rejects.toMatchObject({ errorCode: "DESKTOP_STATE_INVALID" });
+  } finally {
+    meta.remove();
+    host.pywebview = previous;
+  }
 });

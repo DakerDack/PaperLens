@@ -1,4 +1,6 @@
 import type {
+  DesktopProjectApi,
+  DesktopResult,
   DeepAuditRequest,
   DeepAuditResponse,
   EditPatch,
@@ -319,4 +321,40 @@ export async function exportProjectMarkdown(
     throw await readError(response);
   }
   return response.blob();
+}
+
+
+export function isDesktop(): boolean {
+  return Boolean(document.querySelector('meta[name="paperlens-desktop"]'));
+}
+
+async function desktopResult<T>(call: (api: DesktopProjectApi) => Promise<DesktopResult<T>>): Promise<T> {
+  try {
+    if (!isDesktop()) throw clientError(0, "DESKTOP_ACCESS_DENIED", "此操作仅适用于桌面窗口。", false);
+    const native = () => (window as Window & { pywebview?: { api?: DesktopProjectApi } }).pywebview?.api;
+    if (!native()) await new Promise<void>((resolve, reject) => {
+      const ready = () => { clearTimeout(timer); resolve(); };
+      const timer = window.setTimeout(() => {
+        window.removeEventListener("pywebviewready", ready);
+        reject(clientError(0, "DESKTOP_DATA_UNAVAILABLE", "桌面状态服务尚未就绪，请重新打开应用。", true));
+      }, 10000);
+      window.addEventListener("pywebviewready", ready, { once: true });
+    });
+    const api = native();
+    if (!api) throw new Error();
+    const result = await call(api);
+    if (!result.ok) throw new ApiClientError(0, { ...result.error, details: null });
+    return result.value;
+  } catch (error) {
+    if (error instanceof ApiClientError) throw error;
+    throw clientError(0, "DESKTOP_DATA_UNAVAILABLE", "无法读取或保存桌面状态。", true);
+  }
+}
+
+export function getRecentProject(): Promise<{ project_id: string | null }> {
+  return desktopResult((api) => api.get_recent_project());
+}
+
+export function setRecentProject(projectId: string): Promise<{ saved: true }> {
+  return desktopResult((api) => api.set_recent_project({ project_id: projectId }));
 }
