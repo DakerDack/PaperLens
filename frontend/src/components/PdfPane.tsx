@@ -1,7 +1,7 @@
 import { ChevronLeft, ChevronRight, ZoomIn, ZoomOut } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { GlobalWorkerOptions, TextLayer, getDocument } from "pdfjs-dist";
-import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?worker&url";
 
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -91,6 +91,10 @@ export function PdfPane({ pdfUrl, target, onFindStatus }: PdfPaneProps) {
     setErrorMessage(null);
     const loadingTask = getDocument({
       url: pdfUrl,
+      cMapUrl: "/pdfjs/cmaps/",
+      cMapPacked: true,
+      standardFontDataUrl: "/pdfjs/standard_fonts/",
+      wasmUrl: "/pdfjs/wasm/",
       isEvalSupported: false,
       stopAtErrors: false,
     });

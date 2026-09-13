@@ -101,7 +101,7 @@ describe("PdfPane", () => {
     expect(document.querySelector("canvas")?.dataset.renderedPage).toBe("2");
     expect(document.querySelectorAll(".text-highlight").length).toBeGreaterThan(0);
     expect(pdfMocks.getDocument).toHaveBeenCalledWith(
-      expect.objectContaining({ isEvalSupported: false }),
+      expect.objectContaining({ isEvalSupported: false, cMapUrl: "/pdfjs/cmaps/", cMapPacked: true, standardFontDataUrl: "/pdfjs/standard_fonts/", wasmUrl: "/pdfjs/wasm/" }),
     );
   });
 
