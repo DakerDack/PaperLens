@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Annotated, Any, Literal
 
-from pydantic import AwareDatetime, AfterValidator, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, AfterValidator, BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 
 Identifier = Annotated[str, Field(min_length=1, max_length=100)]
@@ -926,3 +926,36 @@ class HealthResponse(StrictModel):
     status: str = Field(pattern="^ok$")
     service: str = Field(pattern="^paperlens-api$")
     version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+
+
+class DesktopRecentProjectRequest(StrictModel):
+    project_id: Identifier
+
+
+class DesktopState(StrictModel):
+    project_id: Identifier | None = None
+    mode: Literal['mock', 'live'] = 'mock'
+
+
+class DesktopSettingsRequest(StrictModel):
+    model_config = ConfigDict(extra='forbid', hide_input_in_errors=True)
+    mode: Literal['mock', 'live']
+    api_key: SecretStr | None = None
+
+    @field_validator('api_key', mode='before')
+    @classmethod
+    def validate_key(cls, value):
+        if not isinstance(value, str) or not value.strip() or '\x00' in value:
+            raise ValueError('invalid API key')
+        try:
+            size = len(value.encode('utf-8'))
+        except UnicodeError:
+            raise ValueError('invalid API key') from None
+        if size > 2560:
+            raise ValueError('invalid API key')
+        return value
+
+
+class DesktopSettingsStatus(StrictModel):
+    mode: Literal['mock', 'live']
+    key_configured: bool

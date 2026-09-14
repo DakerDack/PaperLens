@@ -277,3 +277,16 @@ export interface DeepAuditResponse {
   stage: "deep_audited";
   audit_report: AuditReport;
 }
+
+
+export type DesktopResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: Omit<ErrorResponse, "details"> };
+
+export interface DesktopProjectApi {
+  get_desktop_settings(): Promise<DesktopResult<{ mode: ModelMode; key_configured: boolean }>>;
+  save_desktop_settings(input: { mode: ModelMode; api_key?: string }): Promise<DesktopResult<{ restart_required: true }>>;
+  clear_desktop_key(): Promise<DesktopResult<{ key_configured: false; restart_required: true }>>;
+  get_recent_project(): Promise<DesktopResult<{ project_id: string | null }>>;
+  set_recent_project(input: { project_id: string }): Promise<DesktopResult<{ saved: true }>>;
+}

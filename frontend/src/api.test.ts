@@ -28,6 +28,26 @@ afterEach(() => {
 
 
 describe("PaperLens API client", () => {
+  it("uses the window origin for the desktop workbench", async () => {
+    const marker = document.createElement("meta");
+    marker.name = "paperlens-desktop";
+    marker.content = "prototype";
+    document.head.append(marker);
+    const fetchMock = vi.fn().mockResolvedValue(new Response("{}", {status: 200}));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const pending = getProject("synthetic");
+      await Promise.resolve();
+      expect(fetchMock).not.toHaveBeenCalled();
+      vi.stubGlobal("pywebview", { token: "synthetic-session-token" });
+      window.dispatchEvent(new Event("pywebviewready"));
+      await pending;
+      expect(new Headers(fetchMock.mock.calls[0][1].headers).get("X-PaperLens-Token")).toBe("synthetic-session-token");
+      expect(fetchMock.mock.calls[0][0]).toBe("/api/projects/synthetic");
+    } finally {
+      marker.remove();
+    }
+  });
   it("owns every stage-four project URL and request shape", async () => {
     const pdf = new File(["%PDF-test"], "paper.pdf", { type: "application/pdf" });
     const fetchMock = vi

@@ -11,6 +11,9 @@ import {
   exportProjectMarkdown,
   generateProject,
   getHealth,
+  isDesktop,
+  getRecentProject,
+  setRecentProject,
   getProject,
   getProjectPdf,
   isRequestCancelled,
@@ -18,6 +21,7 @@ import {
   restoreProjectVersion,
   type RequestHandle,
 } from "./api";
+import { DesktopSettings } from "./components/DesktopSettings";
 import { DocumentPane } from "./components/DocumentPane";
 import { PdfPane, type PdfTarget } from "./components/PdfPane";
 import {
@@ -36,7 +40,7 @@ import type {
 } from "./types";
 
 
-type ProjectOperation = "idle" | "parsing" | "generating";
+type ProjectOperation = "idle" | "parsing" | "generating" | "opening";
 type RetryAction = "upload" | "generate";
 type MobilePanel = "pdf" | "document" | "evidence";
 type RevisionRefreshReason = "completed_write" | "target_stale";
@@ -163,6 +167,10 @@ function toUncertainWriteError(
 
 
 export function App() {
+  const [desktop] = useState(isDesktop);
+  const [recovering, setRecovering] = useState(desktop);
+  const [projectIdInput, setProjectIdInput] = useState("");
+  const [recoveryError, setRecoveryError] = useState<AuditUiError | null>(null);
   const requestRef = useRef<RequestHandle | null>(null);
   const pdfUrlRef = useRef<string | null>(null);
   const [serviceState, setServiceState] = useState<"checking" | "online" | "offline">(
@@ -266,6 +274,53 @@ export function App() {
     [resetSelection],
   );
 
+  const rememberProject = useCallback(async (id: string) => {
+    if (!desktop) return;
+    try { await setRecentProject(id); }
+    catch (error) {
+      setRecoveryError({ ...toUiError(error), message: `项目已打开，但最近项目未保存。${toUiError(error).message}` });
+    }
+  }, [desktop]);
+
+  const openProject = useCallback(async (id: string) => {
+    const projectId = id.trim();
+    if (!projectId || projectId.length > 100) {
+      setRecoveryError({ code: "DESKTOP_STATE_INVALID", message: "请输入 1 至 100 个字符的项目 ID。", retryable: false });
+      return;
+    }
+    const request = beginRequest();
+    setOperation("opening");
+    setRecoveryError(null);
+    try {
+      const [nextProject, blob] = await Promise.all([
+        getProject(projectId, request.signal), getProjectPdf(projectId, request.signal),
+      ]);
+      if (request.signal.aborted) return;
+      replacePdfUrl(blob);
+      applyRefreshedProject(nextProject);
+      setWorkflowError(null);
+      setFile(null);
+      setProjectIdInput(projectId);
+      await rememberProject(projectId);
+    } catch (error) {
+      if (!isRequestCancelled(error)) setRecoveryError(toUiError(error));
+    } finally {
+      if (!request.signal.aborted) setOperation("idle");
+      finishRequest(request);
+    }
+  }, [applyRefreshedProject, beginRequest, finishRequest, rememberProject, replacePdfUrl]);
+
+  useEffect(() => {
+    if (!desktop) return;
+    let active = true;
+    getRecentProject().then(async ({ project_id }) => {
+      if (active && project_id !== null) await openProject(project_id);
+    }).catch((error: unknown) => {
+      if (active) setRecoveryError(toUiError(error));
+    }).finally(() => { if (active) setRecovering(false); });
+    return () => { active = false; };
+  }, [desktop, openProject]);
+
   const runUpload = useCallback(async () => {
     if (!file || !rightsConfirmed) {
       return;
@@ -292,6 +347,7 @@ export function App() {
       ]);
       applyRefreshedProject(nextProject);
       replacePdfUrl(pdfBlob);
+      await rememberProject(created.project_id);
       setOperation("idle");
     } catch (error: unknown) {
       if (isRequestCancelled(error)) {
@@ -309,6 +365,7 @@ export function App() {
     finishRequest,
     replacePdfUrl,
     rightsConfirmed,
+    rememberProject,
   ]);
 
   const runGeneration = useCallback(async () => {
@@ -753,6 +810,8 @@ export function App() {
   );
   const modelMode = project?.model_mode ?? null;
 
+  const projectSwitchLocked = recovering || operation !== "idle" || auditState === "running" || revisionState !== "idle";
+
   let statusTitle = "未上传";
   let statusDetail = "选择单篇文本型 PDF，并确认拥有处理权限。";
   let statusTone = "neutral";
@@ -821,6 +880,18 @@ export function App() {
         </div>
       </header>
 
+      {desktop && <DesktopSettings />}
+      {desktop && (
+        <section className="command-bar" aria-label="打开已有项目">
+          <label>已有项目 ID <input aria-label="已有项目 ID" value={projectIdInput} maxLength={100}
+            disabled={projectSwitchLocked} onChange={(event) => setProjectIdInput(event.target.value)} /></label>
+          <button type="button" disabled={projectSwitchLocked} onClick={() => void openProject(projectIdInput)}>打开项目</button>
+          {project && <label>当前项目 ID <input aria-label="当前项目 ID" readOnly value={project.project_id}
+            onFocus={(event) => event.target.select()} /></label>}
+          {(recovering || operation === "opening") && <span role="status">正在恢复项目…</span>}
+          {recoveryError && <span role="alert">项目恢复提示：{recoveryError.message}（{recoveryError.code}）</span>}
+        </section>
+      )}
       <section className="command-bar" aria-label="项目操作">
         <div className="upload-controls">
           {!project ? (
@@ -832,7 +903,7 @@ export function App() {
                   type="file"
                   accept="application/pdf,.pdf"
                   aria-label="选择 PDF"
-                  disabled={operation !== "idle"}
+                  disabled={recovering || operation !== "idle"}
                   onChange={(event) => setFile(event.target.files?.[0] ?? null)}
                 />
               </label>
@@ -840,7 +911,7 @@ export function App() {
                 <input
                   type="checkbox"
                   checked={rightsConfirmed}
-                  disabled={operation !== "idle"}
+                  disabled={recovering || operation !== "idle"}
                   onChange={(event) => setRightsConfirmed(event.target.checked)}
                 />
                 <span>确认拥有处理权限</span>
@@ -848,7 +919,7 @@ export function App() {
               <button
                 className="primary-button"
                 type="button"
-                disabled={!file || !rightsConfirmed || operation !== "idle"}
+                disabled={recovering || !file || !rightsConfirmed || operation !== "idle"}
                 onClick={() => void runUpload()}
               >
                 {operation === "parsing" ? (
@@ -875,7 +946,7 @@ export function App() {
               <button
                 className="primary-button"
                 type="button"
-                disabled={operation !== "idle"}
+                disabled={recovering || operation !== "idle"}
                 onClick={() => void runGeneration()}
               >
                 {operation === "generating" ? (
@@ -924,7 +995,7 @@ export function App() {
         ))}
       </nav>
 
-      <section className="workspace" aria-label="三栏学术工作台">
+      <section className="workspace" aria-label="三栏学术工作台" inert={recovering || operation === "opening"}>
         <div
           className={`workspace-column workspace-column--pdf${
             mobilePanel === "pdf" ? " workspace-column--active" : ""

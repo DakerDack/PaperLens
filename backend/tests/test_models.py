@@ -1265,3 +1265,40 @@ def test_stage_four_deep_audit_response_requires_deep_audited_stage() -> None:
 
     with pytest.raises(ValidationError, match="stage"):
         DeepAuditResponse.model_validate(payload)
+
+
+@pytest.mark.parametrize('payload',[{'project_id':''},{'project_id':123},{'project_id':'x'*101},{'project_id':'valid','extra':True}])
+def test_desktop_recent_request_rejects_invalid_input(payload):
+    with pytest.raises(ValidationError):
+        models.DesktopRecentProjectRequest.model_validate(payload)
+
+
+def test_desktop_state_contract_has_only_non_secret_fields():
+    state=models.DesktopState.model_validate({'project_id':'project-1','mode':'live'})
+    assert state.model_dump()=={'project_id':'project-1','mode':'live'}
+    assert models.DesktopState().model_dump()=={'project_id':None,'mode':'mock'}
+    with pytest.raises(ValidationError):
+        models.DesktopState.model_validate({'api_key':'synthetic-not-a-key'})
+
+
+@pytest.mark.parametrize('payload', [
+    {'mode':'other'}, {'mode':'live','api_key':''}, {'mode':'live','api_key':'   '},
+    {'mode':'live','api_key':None}, {'mode':'live','api_key':123},
+    {'mode':'live','api_key':'x'*2561}, {'mode':'live','api_key':'a\x00b'},
+    {'mode':'live','target':'anything'},
+])
+def test_desktop_settings_input_rejects_invalid(payload):
+    with pytest.raises(ValidationError):
+        models.DesktopSettingsRequest.model_validate(payload)
+
+
+def test_desktop_settings_omission_and_secret_redaction():
+    omitted = models.DesktopSettingsRequest(mode='live')
+    assert 'api_key' not in omitted.model_fields_set
+    request = models.DesktopSettingsRequest(mode='mock', api_key='synthetic-only')
+    assert request.api_key.get_secret_value() == 'synthetic-only'
+    assert 'synthetic-only' not in repr(request)
+    assert 'synthetic-only' not in request.model_dump_json()
+    assert models.DesktopSettingsStatus(mode='live',key_configured=False).model_dump() == {'mode':'live','key_configured':False}
+    with pytest.raises(ValidationError):
+        models.DesktopSettingsStatus(mode='live',key_configured=False,api_key='synthetic-only')

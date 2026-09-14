@@ -13,7 +13,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)](backend/app/main.py)
 [![License: MIT](https://img.shields.io/badge/License-MIT-8B5CF6?style=flat-square)](LICENSE)
 
-[快速开始](#快速开始) · [功能亮点](#功能亮点) · [观看演示](reports/stage8_demo.webm) · [项目资料](#项目资料)
+[Windows 桌面版](#windows-桌面版候选-010) · [源码快速开始](#快速开始) · [功能亮点](#功能亮点) · [项目资料](#项目资料)
 
 </div>
 
@@ -53,9 +53,39 @@ flowchart LR
 
 > 🎬 [观看约 50 秒的工作台演示](reports/stage8_demo.webm) · 演示采用本地 API 与 Mock 预置示例。
 
+## Windows 桌面版（候选 0.1.0）
+
+当前为 **待完成安装验收的候选包，尚未最终放行或公开发布**。安装器生成、资源完整性和验收脚本审查已通过；实际安装、升级、卸载及没有 Python/Node 的 Windows 环境验证均为 **PENDING**。最新状态、产物摘要及验证边界见 [桌面验收记录](docs/WINDOWS_DESKTOP_ACCEPTANCE.md)。历史浏览器演示与 Mock 结果不能替代这些验证。
+
+候选包面向 Windows 10 22H2 / Windows 11 x64，包含 Python 解释器和已构建前端，设计上无需用户安装 Python、Node 或打开终端。需要 .NET Framework 4.8 及 WebView2；安装器会检测前者，复用已有 WebView2 或尝试安装随包运行时。上述安装分支仍待目标机器实测。首版采用文本 PDF 解析，不含 OCR/MinerU 模型，扫描 PDF 可能无法提取文本。
+
+### 安装与首次使用
+
+以下是候选版操作说明，当前只供指定测试环境验证：
+
+1. 从交付者取得 `PaperLens-0.1.0-windows-x64-setup.exe`，核对交付记录中的 SHA256。当前没有公开 Release 下载入口；候选安装包未做 PaperLens 发布者代码签名，不能宣称受信任发布者。出现安全提示时先核实来源，不关闭系统防护。
+2. 关闭已运行的 PaperLens，双击安装器，选择安装位置及是否创建桌面快捷方式。默认安装到当前用户的 `%LOCALAPPDATA%\Programs\PaperLens`。安装失败时保留完整错误，不能以出现目录或图标判断成功。
+3. 安装完成后双击桌面或开始菜单图标，进入独立窗口。
+4. 离线体验时打开“模型设置”，选择“Mock · 离线演示数据”，保存并关闭、重新打开应用。普通入口默认 Live；未配置 Key 时真实模型请求会失败，不会自动退回 Mock。
+5. 导入有权处理的文本 PDF，生成解读、定位证据、检查与审计、预览并应用修订、回退和导出 Markdown。Mock 是预置结果，用来检查流程，不代表对任意论文的真实理解或模型质量。
+
+### 配置自己的 Hy3 Key
+
+桌面版在“模型设置”中选择 Live 并输入自己的 Key；凭据保存在当前 Windows 用户的系统凭据存储中，**不需要创建或修改 `.env`**。保存成功不代表 Key 已通过供应商验证；当前桌面候选包尚未验证真实模型调用。使用 Live 会把相关论文内容及上下文发送给服务商，并可能产生费用，当前离线验收不执行此操作。
+
+Key 输入框留空表示保留已有 Key；删除须点击“清除 Key”。保存、替换和清除均在重启后生效，当前实例继续使用已加载的配置，因此清除后应关闭整个窗口再重新打开。界面只显示是否配置，不回显已保存 Key；读取失败显示“状态未知”，应重新读取，不要当成已经清除。清除 Key 不删除论文或项目。
+
+### 数据、升级与卸载
+
+正常桌面入口的数据根为当前用户 `%LOCALAPPDATA%\PaperLens`：`data` 保存项目文件和数据库，`desktop-state.json` 保存最近项目及运行模式，`webview` 保存 WebView 缓存。路径由 Windows Known Folder 定位，与安装目录分离。迁移或备份应先正常关闭应用，再备份数据根；Key 不在此目录，换 Windows 账户或电脑须重新配置。
+
+升级前关闭应用；卸载使用 Windows“已安装的应用”中的 PaperLens。安装器按保留数据及系统凭据设计，卸载不会替用户清除 Key 或移除共享 WebView2。**升级、卸载后重装及数据保留尚未实测，暂不能作为已验证保证**。首版不提供自动更新，最终交付前必须补齐这些检查。
+
+遇到重复启动提示时切换到已有窗口；启动或退出失败时保存错误码和截图，不删除数据目录排障。`--offline-test` 仅供开发验收，每次使用新临时数据和合成凭据，不能用它验证项目跨启动保留。桌面验证步骤见 [验收记录](docs/WINDOWS_DESKTOP_ACCEPTANCE.md)，第三方声明与随包许可证说明见 [许可说明](docs/THIRD_PARTY_NOTICES.md)。
+
 ## 快速开始
 
-以下命令适用于 **Windows PowerShell**。准备 Python 3.13、Node.js 24 和 Git，在本地启动工作台。
+以下是**开发者源码／浏览器模式**，与上方桌面安装方式分开。命令适用于 Windows PowerShell；准备 Python 3.13、Node.js 24 和 Git，在本地启动工作台。
 
 ### 1. 获取项目
 
@@ -114,7 +144,7 @@ npm.cmd run dev -- --host 127.0.0.1 --port 5173 --strictPort
 
 两个终端分别按 `Ctrl+C` 即可停止服务；项目数据保存在 `PAPERLENS_DATA_DIR` 指定的本地目录。
 
-## 连接 Hy3
+## 源码／浏览器模式连接 Hy3
 
 **Live 模式**通过腾讯云 TokenHub 调用 Hy3，用于真实模型生成、审计与修订。在本机 `.env` 中配置：
 
