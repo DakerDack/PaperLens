@@ -53,3 +53,138 @@ TokenHub 的 API 概览首次访问失败后，已通过官方协议入口核验
 项目开发、文档和测试使用 Codex 等 AI 编程辅助；人类项目维护者负责需求、权限、审查及最终交付，AI 不列为学术作者。运行时 Live 使用 Hy3 生成和语义判断；引用、页码、分数和门槛由确定性代码核验/计算。模型可能遗漏风险、误判或生成无依据内容，不能代替专家和论文原文。
 
 Mock 和演示预置结果只用于交互与错误路径验证；视频和画面必须持续标识。不得以预置结果证明模型效果。导出保留来源、AI 辅助及模型模式说明；用户对后续引用、许可、公开披露和学术诚信负责。应用为本机单用户原型，不声称满足公开在线运营的全部义务。
+
+
+## Windows 桌面打包（D4a）
+
+桌面发行含 Python 3.13、pywebview 6.2.1（BSD-3-Clause）、pythonnet 3.1.0、clr_loader 0.3.1 和其原生桥。构建通过 PyInstaller 6.22.2（GPL 分发例外），安装器通过 Inno Setup 6.7.3；完整发行许可文件随包保存在 licenses，前端文本保留 THIRD_PARTY_LICENSES.md。原有“不分发 Python 环境”说明仅适用于先前源码交付，桌面包包含解释器。
+
+WebView2 Evergreen x64 离线安装器来自微软，构建前核验微软 Authenticode 签名。已有运行时复用，缺失时安装；其更新由微软运行时管理，不是 PaperLens 自动更新功能。运行时再分发遵守微软随包许可；共享运行时卸载时保留。
+
+Inno Setup Copyright (C) 1997-2026 Jordan Russell; Portions Copyright (C) 2000-2026 Martijn Laan. https://jrsoftware.org/ 。官方许可：https://jrsoftware.org/files/is/license.txt 。安装包未经 PaperLens 发布者代码签名，不宣称受信任发布者。
+
+proxy_tools 0.1.0 的发行元数据标 MIT，但上游固定提交 db43f1e35d4f90a65c5a4d56d9e9af88212ec6e6 的 LICENSE.txt 为 BSD；应随包保留该原文（含原有重复句），SHA256 a428fb8a2e762af3eb0a6edbbb88e9b42ccfee80fd9b423958bcacf9b9abbfe4，不能用元数据替代。尚未收集该正文或任一必要原生附属许可时不得交付。
+
+
+### WebView2 SDK 1.0.3856.49 原始许可及声明
+
+来源：https://www.nuget.org/packages/Microsoft.Web.WebView2/1.0.3856.49 。Core/WinForms DLL 已与官方归档逐字节核对。以下为该版本 LICENSE.txt 和 NOTICE.txt 正文（仅去除行尾空白以符合仓库差异检查）。
+
+```text
+Copyright (C) Microsoft Corporation. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * The name of Microsoft Corporation, or the names of its contributors
+may not be used to endorse or promote products derived from this
+software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+```text
+NOTICES AND INFORMATION
+Do Not Translate or Localize
+
+This software incorporates material from third parties. Microsoft makes certain
+open source code available at https://3rdpartysource.microsoft.com, or you may
+send a check or money order for US $5.00, including the product name, the open
+source component name, and version number, to:
+
+Source Code Compliance Team
+Microsoft Corporation
+One Microsoft Way
+Redmond, WA 98052
+USA
+
+Notwithstanding any other terms, you may reverse engineer this software to the
+extent required to debug changes to any libraries licensed under the GNU Lesser
+General Public License.
+
+----------------------------------------------------------------
+
+Antlr3.Runtime 3.5.2-rc1 - BSD 3-Clause
+
+[The "BSD license"]
+Copyright (c) 2011 The ANTLR Project
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+ 1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+ 3. Neither the name of the copyright holder nor the names of its
+    contributors may be used to endorse or promote products derived from
+    this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+---------------------------------------------------------
+
+---------------------------------------------------------
+
+StringTemplate4 4.0.9-rc1 - BSD 3-Clause
+
+[The "BSD license"]
+Copyright (c) 2011 The ANTLR Project
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+ 1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+ 3. Neither the name of the copyright holder nor the names of its
+    contributors may be used to endorse or promote products derived from
+    this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+---------------------------------------------------------
+
+```
