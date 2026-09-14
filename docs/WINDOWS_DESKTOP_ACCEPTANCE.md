@@ -5,10 +5,40 @@
 - D4a 已独立 PASS，提交 `64f2c41466fa48a15d1f2b690e54a8634123c43e`。
 - D4b 安装脚本及 P2 返修独立审查 **PASS**，三文件以“验收脚本准备”提交 `c723ed1f6b52a1ab5dfea1b40cb193211be0e769`；**D4b 整卡验收 PENDING，实际安装执行 NOT_RUN**。
 - 用户批准先完成 D5a-prep 材料准备，实际安装、升级、卸载及干净 Windows 环境验证暂缓；最终放行前补齐。用户计划在另一台电脑手工测试，目前尚未收到安装证据；本机没有创建 PaperLens 测试账户。
-- **D5a-prep 独立验收 PENDING，最终交付放行 PENDING**。本卡不推送、不创建 PR、不合并或公开 Release。
+- **D5a-prep 独立验收 PASS，D5a-sync 独立验收 PENDING，最终交付放行 PENDING**。本卡不推送、不创建 PR、不合并或公开 Release。
 - 未安装、升级、卸载 PaperLens；未执行 WebView2 安装器。开发 Windows 环境不能替代没有 Python/Node 的干净机器。
 
-## 已冻结的 D4a 输入
+## D5a-sync 当前候选材料（等待独立复核）
+
+D5a-prep 已独立 PASS 并提交 `df7b47793f9f0567c80181b974abf6891d6a4fb0`。本次基于该提交的运行时与构建配置重新生成 0.1.0 候选包，仅修改开发计划和本验收记录。以下为开发者构建证据，不能视为安装、升级或最终交付通过。
+
+| 对象 | 当前候选值 |
+| --- | --- |
+| 安装包路径 | `D:\PaperLens\dist\installer\ee7945a068564515a9806922455ba455\PaperLens-0.1.0-windows-x64-setup.exe` |
+| 安装包大小 / SHA256 | 257652828 字节 / `DBB4AEDE7425EC86CA00FE870ECAF5FA4327D8E8C6FE3F911AE47C60D939ECD4` |
+| onedir | `D:\PaperLens\dist\Release-8cecd2d374254de39eaa9a3bced9b4c8\PaperLens` |
+| 同级 PaperLens-manifest.json SHA256 | `C9D3D99A76ECCF0FC4F3F5B25F4EE8DD0FA4BDD6D369A36F38A48377ACD9F01A` |
+| 资源集合 | 762 文件、117902313 字节；包含 129 个 licenses 文件 |
+| PaperLens.exe SHA256 | `D51B09026ED2B69EB45F08F8F600C64FB53DCDB466C63D41C6A02BFA9D409B76` |
+| 新版随包 THIRD_PARTY_NOTICES.md SHA256 | `1F95F9E22D8563AFDA6FADF39FB1C2FF68D60E7CD57C2FA0F16D5EACEE63A180`，与仓库文件一致 |
+| 配套材料目录 | `D:\PaperLens\dist\candidate-d5a-sync-ee7945a0` |
+
+配套目录包含安装包、资源清单、已审查验收脚本、项目 LICENSE、docs 下许可与本验收记录，以及 `WINDOWS_DESKTOP_GUIDE.md`。指南从已验收 README 的桌面章节原样提取，避免把源码开发步骤作为普通用户安装步骤；它是安装包旁的材料，不宣称安装器内置了 README 或本验收记录。目录 `SHA256.json` 记录除清单自身外所有配套文件大小和摘要，避免自引用哈希。旧 D4a 包和旧测试材料目录均保留，不能混用其摘要验证新包。
+
+本次 Release 构建退出 0，前端保护探针、Vitest 91 passed、构建、预置接口 Playwright 6 passed 四步退出码均为 0；PyInstaller 与 ISCC 编译成功。日志在 `build/d5a-sync-evidence/build.log` 和 `frontend-0.log` 至 `frontend-3.log`。未重复后端回归：对比 D4a 至本次基线，应用代码、前端源码/锁、desktop.spec、安装器配置及构建脚本均无差异。EXE 摘要与旧包一致，仍不继承旧包的实际安装证据（旧包本来就未安装验证）。
+
+新旧 762 项清单有三处字节差异：新版 `THIRD_PARTY_NOTICES.md`；`UNINSTALL-NOTE.txt` 的 UTF-8 BOM（解码文本一致）；`_internal/base_library.zip` 的封装字节（154 个成员名称及逐个解压内容完全一致）。首次配套核验对“只有许可说明变化”的假设断言失败，记录保留为 `prepare.log`；随后实际比较并将上述限定差异纳入核验，没有修改产品文件来掩盖差异。
+
+```powershell
+powershell.exe -NoProfile -File tools/build_desktop.ps1 -Configuration Release -WebView2Installer D:\Download\MicrosoftEdgeWebView2RuntimeInstallerX64.exe
+powershell.exe -NoProfile -File build/d5a-sync-evidence/verify_sync.ps1
+git diff --check
+git status --short
+```
+
+再次构建会生成新的 GUID 目录，不保证安装包摘要逐次相同；上述核验脚本针对本表冻结候选值。当前没有执行安装包、GUI、升级、卸载或新建测试账户；没有推送、创建 PR 或公开 Release。D4b 实机验收和无 Python/Node 的干净 Windows 验证继续 PENDING，最终放行前须补齐。本节仅登记新候选材料，独立审查待交接后决定。
+
+## 已冻结的 D4a 输入（历史包，保留追溯）
 
 - 安装包：`D:\PaperLens\dist\installer\71079916bc464a17abea8d944e4eb947\PaperLens-0.1.0-windows-x64-setup.exe`
 - 安装包 SHA256：`E46F2E79DE87F31029690C4316EA9FC4A0C544AC1C28D4276A1EE67266C2573D`
@@ -17,7 +47,9 @@
 - 对应 onedir EXE：上述清单同级 `PaperLens\PaperLens.exe`；SHA256 `D51B09026ED2B69EB45F08F8F600C64FB53DCDB466C63D41C6A02BFA9D409B76`。
 - 安装器版本 0.1.0；修改验收脚本不改变该包内容。后续若修改产品或安装器，须重新构建、核验资源并更新本节，不能继续引用旧包作为新实现证据。
 
-## D5a-prep 版本与材料核对
+## D5a-prep 版本与材料核对（历史卡记录）
+
+以下记录对应 D5a-prep 冻结时点；其中旧包与新说明不一致的问题由上方 D5a-sync 候选同步处理。旧核验命令应在其对应基线复现，当前候选使用 `verify_sync.ps1`，不要用旧包摘要替代新包摘要。
 
 本卡基线为 `c723ed1f6b52a1ab5dfea1b40cb193211be0e769`。仅核对已有 D4a 产物，不重新构建、不执行安装器；核验脚本和日志在 `build/d5a-prep-evidence`，不进入产品。
 
@@ -57,9 +89,9 @@ PaperLens 原先需要用户准备 Python/Node 并在浏览器中运行。本分
 
 桌面模式将资源与用户数据分离，加入单实例及退出处理、回环接口保护、最近项目恢复，以及 Windows 系统凭据存储和模型设置界面。基础包使用文本 PDF 解析；离线验收入口强制 Mock 与临时数据隔离，不读取正式配置。提供安装资源清单、许可材料和已独立审查的安装验收脚本。
 
-验证状态：D4a 安装器生成与资源完整性独立 PASS；D4b 脚本及链接拒绝修复独立 PASS，18 项合成路径测试中的 12 个链接场景均在启动前拒绝，启动计数为 0。开发者后端最近结果 1426 passed, 1 skipped；跳过真实 MinerU。D5a-prep 材料独立验收仍 PENDING；本卡的只读材料核对不等于安装测试。
+验证状态：D4a 安装器生成与资源完整性独立 PASS；D4b 脚本及链接拒绝修复独立 PASS，18 项合成路径测试中的 12 个链接场景均在启动前拒绝，启动计数为 0。开发者后端最近结果 1426 passed, 1 skipped；跳过真实 MinerU。D5a-prep 材料独立验收 PASS；D5a-sync 新候选材料的独立验收仍 PENDING，材料核对不等于安装测试。
 
-合并与最终交付仍受以下门槛阻断：实际安装、不同版本升级、卸载/重装数据保留、安装后完整原生工作流、WebView2 安装分支及无 Python/Node 的干净 Win10/Win11 验证均 PENDING。当前 D4a 包尚未包含最新文档说明，最终产物及摘要须同步。真实 Hy3/MinerU 未验证，Mock 不代表模型效果；候选安装包未做发布者代码签名。
+合并与最终交付仍受以下门槛阻断：实际安装、不同版本升级、卸载/重装数据保留、安装后完整原生工作流、WebView2 安装分支及无 Python/Node 的干净 Win10/Win11 验证均 PENDING。D4a 历史包未包含新版说明；D5a-sync 已重建候选包并同步随附材料，新摘要与发行内容仍待独立复核。真实 Hy3/MinerU 未验证，Mock 不代表模型效果；候选安装包未做发布者代码签名。
 
 本分支不包含自动更新、账号、付费系统、跨平台或内置 MinerU 模型，不变更历史 Prompt、业务 Schema、评分及实验结果。当前仅准备本地 PR 材料，没有推送、创建 PR、合并 main 或公开 Release；最终操作等待明确放行。
 
