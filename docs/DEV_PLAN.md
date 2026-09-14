@@ -1460,7 +1460,7 @@ C2 开发验证记录（非独立验收）：
 
 ### Windows 桌面阶段 D0–D5（2026-09-12）
 
-本阶段由用户明确授权，工作区固定为 `D:\PaperLens`，开发分支为 `codex/windows-desktop`；不修改历史工作区。当前唯一执行卡为 **D0：现状核查和具体方案**。桌面授权仅在本节及 [WINDOWS_DESKTOP_PLAN.md](WINDOWS_DESKTOP_PLAN.md) 定义的范围覆盖旧版浏览器交付限制，不改变历史实验、业务 Prompt、Schema、评分及规则。
+本阶段由用户明确授权，工作区固定为 `D:\PaperLens`，开发分支为 `codex/windows-desktop`；不修改历史工作区。当前唯一执行卡为 **D5a-prep：交付材料准备**（用户批准调整顺序，详见下文）。桌面授权仅在本节及 [WINDOWS_DESKTOP_PLAN.md](WINDOWS_DESKTOP_PLAN.md) 定义的范围覆盖旧版浏览器交付限制，不改变历史实验、业务 Prompt、Schema、评分及规则。下方 D0 条目保留为历史卡记录，其 PENDING 不表示当前门槛。
 
 - D0 唯一目标：形成可由独立验收会话决定 PASS/FAIL 的桌面方案。
 - D0 白名单：`docs/DEV_PLAN.md`、`docs/WINDOWS_DESKTOP_PLAN.md`、`docs/WINDOWS_DESKTOP_D0_HANDOFF.md`。
@@ -1469,6 +1469,15 @@ C2 开发验证记录（非独立验收）：
 - D0 状态：`DEVELOPMENT=COMPLETE`，`INDEPENDENT_ACCEPTANCE=PENDING`，`DESKTOP_COMPATIBILITY=NOT_VERIFIED`。
 - D0 PASS 后方可提交 D0 并执行 D1a；每张子卡独立 PASS 后提交，才能进入下一卡。验收期间开发停止修改共享工作区，Git 写操作仅由开发执行。
 - 用户选择手动转发交接单；当前工具不提供跨任务通信，不声称已通知。范围内方案经独立验收通过后无须用户重复批准；真实付费调用、读取旧凭据/私有论文、真实 MinerU、合并 main、公开 Release、删除用户数据及强推仍不授权。
+
+#### 用户批准的顺序调整：D4b 准备提交 → D5a-prep
+
+- D4b 脚本及链接时序返修独立 PASS，三文件以“验收脚本准备”提交 `c723ed1f6b52a1ab5dfea1b40cb193211be0e769`。**D4b 整卡仍 PENDING**，不能把脚本审查当作实际安装通过。
+- 当前 D5a-prep 唯一目标：形成版本、既有候选产物、使用说明、许可归属与 PR 草稿可相互核对的交付材料。不是最终交付放行，也不替代原 D5a/D5b 的实际构建安装和干净机器检查。
+- 本卡白名单（最多四文件）：`docs/DEV_PLAN.md`、`README.md`、`docs/THIRD_PARTY_NOTICES.md`、`docs/WINDOWS_DESKTOP_ACCEPTANCE.md`。PR 标题/正文草稿保存在验收记录内，不新增正式 PR。版本文件核对一致后不做无意义修改。
+- 固定契约：仅文档，不改变运行时、接口、Schema、错误码或历史业务规则。安装、升级、卸载和干净 Windows 验证暂缓，登记 PENDING；真实模型未验证。最终放行前补齐。
+- 验证：`powershell.exe -NoProfile -File build/d5a-prep-evidence/verify_materials.ps1`（版本、既有包 SHA256、762 项清单、许可原文和本卡 Markdown 本地链接）；`git diff --check`；`git status --short`。文档卡不制造失败测试或重跑无关业务回归；不构建替换已冻结候选包。
+- 本卡完成后冻结交独立审查；当前明确禁止推送、创建正式 PR、合并或公开 Release。后续卡仍逐卡执行，最多四文件。
 
 ## 9. AI 开发约束
 

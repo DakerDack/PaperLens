@@ -4,7 +4,7 @@
 
 ## 核心组件
 
-前端运行时包的完整许可文本保存在 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。若单独交付 `frontend/dist`，必须同时附带该文件、本说明及根目录 LICENSE；仅有项目 MIT 不能替代组件许可证。本次交付是源码和审计材料，不是独立二进制安装包。
+前端运行时包的完整许可文本保存在 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。若单独交付 `frontend/dist`，必须同时附带该文件、本说明及根目录 LICENSE；仅有项目 MIT 不能替代组件许可证。历史浏览器阶段交付为源码和审计材料；Windows 桌面候选包的额外运行时与许可范围见下方“Windows 桌面打包”。候选包尚未最终放行。
 
 | 组件 / 实测版本 | 归属和许可 | 使用边界 |
 | --- | --- | --- |
@@ -55,7 +55,11 @@ TokenHub 的 API 概览首次访问失败后，已通过官方协议入口核验
 Mock 和演示预置结果只用于交互与错误路径验证；视频和画面必须持续标识。不得以预置结果证明模型效果。导出保留来源、AI 辅助及模型模式说明；用户对后续引用、许可、公开披露和学术诚信负责。应用为本机单用户原型，不声称满足公开在线运营的全部义务。
 
 
-## Windows 桌面打包（D4a）
+## Windows 桌面打包（D4a 候选包）
+
+候选版 0.1.0 随包保留项目 `LICENSE`、本说明、`THIRD_PARTY_LICENSES.md` 和 `licenses` 目录中的组件原始声明，包括 Python、proxy_tools、Inno Setup 及 Python/原生传递依赖。WebView2 SDK 的 LICENSE/NOTICE 正文保留在本文件下方。复制或分发应用目录时须一并保留这些文件，不能只取 EXE。此处记录已有归属与文本，不替用户授予第三方模型、服务或论文的使用权。
+
+D5 材料准备仅澄清交付范围，不改下方原始许可证正文。D4a 冻结包仍含 D4a 时点的本文件；最终交付须重建或重新整理对应发行材料并核对新的摘要，不能声称当前包已包含本次文档更新。安装与干净环境验证仍为 PENDING，见 [验收记录](WINDOWS_DESKTOP_ACCEPTANCE.md)。
 
 桌面发行含 Python 3.13、pywebview 6.2.1（BSD-3-Clause）、pythonnet 3.1.0、clr_loader 0.3.1 和其原生桥。构建通过 PyInstaller 6.22.2（GPL 分发例外），安装器通过 Inno Setup 6.7.3；完整发行许可文件随包保存在 licenses，前端文本保留 THIRD_PARTY_LICENSES.md。原有“不分发 Python 环境”说明仅适用于先前源码交付，桌面包包含解释器。
 
